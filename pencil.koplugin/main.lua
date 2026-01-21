@@ -10,6 +10,7 @@ local DataStorage = require("datastorage")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
 local Geom = require("ui/geometry")
+local PencilGeometry = require("lib/geometry")
 local Screen = Device.screen
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
@@ -1739,27 +1740,11 @@ end
 
 -- Calculate bounding box for a stroke
 function Pencil:getStrokeBounds(stroke)
-    if not stroke.points or #stroke.points == 0 then
+    local bounds = PencilGeometry.getStrokeBounds(stroke)
+    if not bounds then
         return nil
     end
-
-    local min_x, min_y = math.huge, math.huge
-    local max_x, max_y = -math.huge, -math.huge
-
-    for _, p in ipairs(stroke.points) do
-        min_x = math.min(min_x, p.x)
-        min_y = math.min(min_y, p.y)
-        max_x = math.max(max_x, p.x)
-        max_y = math.max(max_y, p.y)
-    end
-
-    local w = stroke.width or 3
-    return Geom:new{
-        x = min_x - w,
-        y = min_y - w,
-        w = max_x - min_x + w * 2,
-        h = max_y - min_y + w * 2,
-    }
+    return Geom:new(bounds)
 end
 
 -- Render a line segment using rectangles (since BlitBuffer has no native line drawing)
@@ -1815,15 +1800,7 @@ end
 
 -- Check if a point is near a stroke (for eraser)
 function Pencil:isPointNearStroke(px, py, stroke, threshold)
-    threshold = threshold or 20
-    for _, point in ipairs(stroke.points) do
-        local dx = px - point.x
-        local dy = py - point.y
-        if dx * dx + dy * dy <= threshold * threshold then
-            return true
-        end
-    end
-    return false
+    return PencilGeometry.isPointNearStroke(px, py, stroke, threshold)
 end
 
 -- Erase strokes at a given point
