@@ -1,0 +1,15 @@
+-- LuaCov configuration
+return {
+  -- Only measure coverage for testable library code
+  -- main.lua is excluded because it has KOReader dependencies
+  -- that can't be loaded in a standalone test environment
+  include = {
+    "pencil%.koplugin/lib/",
+  },
+
+  -- Exclude test files and external dependencies
+  exclude = {
+    "spec/",
+    "luarocks/",
+  },
+}
