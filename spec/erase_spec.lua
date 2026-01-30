@@ -47,10 +47,16 @@ local function createMockPencil(strokes, eraser_width)
         local eraser_width = self.tool_settings.eraser.width
         local deleted = {}
         local indices_to_remove = {}
+        local page_str = tostring(page)
+
+        -- Helper to check if stroke belongs to current page (handles type mismatches)
+        local function isOnCurrentPage(stroke)
+            return stroke.page == page or tostring(stroke.page) == page_str
+        end
 
         -- Find strokes on the current page that intersect with eraser point
         for i, stroke in ipairs(self.strokes) do
-            if stroke and stroke.page == page and self:isPointNearStroke(x, y, stroke, eraser_width) then
+            if stroke and isOnCurrentPage(stroke) and self:isPointNearStroke(x, y, stroke, eraser_width) then
                 table.insert(deleted, stroke)
                 table.insert(indices_to_remove, i)
             end
@@ -160,6 +166,45 @@ describe("eraseAtPoint", function()
             -- Second page stroke should remain
             assert.equals(1, #pencil.strokes)
             assert.equals("/body/div[2]", pencil.strokes[1].page)
+        end)
+
+        it("handles type mismatches between number and string page identifiers", function()
+            -- Simulate strokes that might have been saved with numeric page
+            local strokes = {
+                createStroke(5, {{ x = 100, y = 100 }}),   -- Numeric page
+                createStroke(10, {{ x = 100, y = 100 }}),  -- Numeric page
+            }
+
+            local pencil = createMockPencil(strokes, 20)
+
+            -- Erase with string page (simulates potential type mismatch after serialization)
+            local deleted = pencil:eraseAtPoint(100, 100, "5")
+
+            assert.is_not_nil(deleted)
+            assert.equals(1, #deleted)
+
+            -- Only page 10 stroke should remain
+            assert.equals(1, #pencil.strokes)
+            assert.equals(10, pencil.strokes[1].page)
+        end)
+
+        it("handles reverse type mismatch (string stored, number queried)", function()
+            local strokes = {
+                createStroke("5", {{ x = 100, y = 100 }}),  -- String page
+                createStroke("10", {{ x = 100, y = 100 }}), -- String page
+            }
+
+            local pencil = createMockPencil(strokes, 20)
+
+            -- Erase with numeric page
+            local deleted = pencil:eraseAtPoint(100, 100, 5)
+
+            assert.is_not_nil(deleted)
+            assert.equals(1, #deleted)
+
+            -- Only page "10" stroke should remain
+            assert.equals(1, #pencil.strokes)
+            assert.equals("10", pencil.strokes[1].page)
         end)
 
     end)
