@@ -1818,8 +1818,7 @@ end
 -- Erase strokes at a given point
 -- Returns array of deleted strokes (for undo), or nil if none
 function Pencil:eraseAtPoint(x, y, page)
-    -- Search ALL strokes by position, ignoring page keys
-    -- This ensures eraser works regardless of how strokes were indexed
+    -- Only erase strokes on the current page
     if self.input_debug_mode then
         self:writeDebugLog(string.format("ERASE: searching %d strokes at (%d, %d)",
             #self.strokes, x, y))
@@ -1836,7 +1835,7 @@ function Pencil:eraseAtPoint(x, y, page)
     local deleted = {}
     local indices_to_remove = {}
 
-    -- Find strokes that intersect with eraser point (search ALL strokes)
+    -- Find strokes on the current page that intersect with eraser point
     for i, stroke in ipairs(self.strokes) do
         -- Debug: log stroke bounds
         if self.input_debug_mode and stroke.points and #stroke.points > 0 then
@@ -1850,7 +1849,7 @@ function Pencil:eraseAtPoint(x, y, page)
             self:writeDebugLog(string.format("ERASE: stroke %d bounds: (%d-%d, %d-%d), eraser at (%d,%d) threshold=%d",
                 i, min_x, max_x, min_y, max_y, x, y, eraser_width))
         end
-        if stroke and self:isPointNearStroke(x, y, stroke, eraser_width) then
+        if stroke and stroke.page == page and self:isPointNearStroke(x, y, stroke, eraser_width) then
             table.insert(deleted, stroke)
             table.insert(indices_to_remove, i)
             if self.input_debug_mode then
