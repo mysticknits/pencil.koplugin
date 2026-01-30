@@ -1834,6 +1834,12 @@ function Pencil:eraseAtPoint(x, y, page)
     local eraser_width = self.tool_settings[TOOL_ERASER].width
     local deleted = {}
     local indices_to_remove = {}
+    local page_str = tostring(page)
+
+    -- Helper to check if stroke belongs to current page (handles type mismatches)
+    local function isOnCurrentPage(stroke)
+        return stroke.page == page or tostring(stroke.page) == page_str
+    end
 
     -- Find strokes on the current page that intersect with eraser point
     for i, stroke in ipairs(self.strokes) do
@@ -1849,7 +1855,7 @@ function Pencil:eraseAtPoint(x, y, page)
             self:writeDebugLog(string.format("ERASE: stroke %d bounds: (%d-%d, %d-%d), eraser at (%d,%d) threshold=%d",
                 i, min_x, max_x, min_y, max_y, x, y, eraser_width))
         end
-        if stroke and stroke.page == page and self:isPointNearStroke(x, y, stroke, eraser_width) then
+        if stroke and isOnCurrentPage(stroke) and self:isPointNearStroke(x, y, stroke, eraser_width) then
             table.insert(deleted, stroke)
             table.insert(indices_to_remove, i)
             if self.input_debug_mode then
