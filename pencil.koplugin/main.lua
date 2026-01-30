@@ -84,6 +84,12 @@ local Pencil = InputContainer:extend{
 }
 
 function Pencil:init()
+    -- CRITICAL: Add plugin to ReaderUI widget tree so it receives ALL key events
+    -- This ensures we catch Eraser button press/release events
+    -- Technique borrowed from eraser.koplugin by SimonLiu <simonliu423@gmail.com>
+    table.insert(self.ui, self)                -- Add to widget children for event propagation
+    table.insert(self.ui.active_widgets, self) -- Always receive events even when hidden
+
     self.ui.menu:registerToMainMenu(self)
     self.strokes = {}
     self.page_strokes = {}  -- Index: page -> array of stroke indices
@@ -246,7 +252,36 @@ end
 -- slot = {slot=N, id=N, x=N, y=N, tool=N, timev=timestamp}
 -- id >= 0 means contact active, id == -1 means contact lifted
 function Pencil:handleStylusSlot(input, slot)
-    -- Hardware eraser button mode - works even if pencil disabled
+    -- Tool types from Linux input subsystem
+    local TOOL_TYPE_PEN = 1
+    local TOOL_TYPE_ERASER = 2
+
+    -- Debug logging at the very start to see slot.tool
+    if self.input_debug_mode then
+        self:writeDebugLog(string.format("STYLUS SLOT: id=%d x=%d y=%d tool=%d eraser_active=%s",
+            slot.id or -1, slot.x or 0, slot.y or 0, slot.tool or -1,
+            tostring(self.eraser_button_active)))
+    end
+
+    -- Detect eraser end via slot.tool BEFORE key events arrive
+    -- This handles the timing issue where stylus callback fires before key events
+    if slot.tool == TOOL_TYPE_ERASER and not self.eraser_button_active then
+        logger.info("Pencil: Eraser end detected via slot.tool, activating eraser mode")
+        self.eraser_button_active = true
+        self.eraser_button_deleted = {}
+    elseif slot.tool == TOOL_TYPE_PEN and self.eraser_button_active then
+        -- Switched from eraser end to pen tip
+        logger.info("Pencil: Pen tip detected via slot.tool, deactivating eraser mode")
+        if self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
+            table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
+            self:saveStrokes()
+        end
+        self.eraser_button_active = false
+        self.eraser_button_deleted = nil
+        UIManager:setDirty(self.view, "ui")
+    end
+
+    -- Eraser mode (from eraser end or hardware button) - works even if pencil disabled
     if self.eraser_button_active then
         if slot.id and slot.id >= 0 then
             local raw_x = slot.x or self.pen_x
@@ -278,11 +313,16 @@ function Pencil:handleStylusSlot(input, slot)
     end
 
     -- Determine effective tool:
-    -- 1. Physical eraser end (BTN_TOOL_RUBBER) takes priority
-    -- 2. Otherwise use selected tool (user can toggle via gesture)
+    -- 1. Physical eraser end via slot.tool (TOOL_TYPE_ERASER = 2) takes priority
+    -- 2. Physical eraser end via BTN_TOOL_RUBBER key event (eraser_tool_active) as backup
+    -- 3. Otherwise use selected tool (user can toggle via gesture)
+    local TOOL_TYPE_ERASER = 2
     local effective_tool
-    if self.eraser_tool_active then
+    if slot.tool == TOOL_TYPE_ERASER or self.eraser_tool_active then
         effective_tool = TOOL_ERASER
+        if self.input_debug_mode and slot.tool == TOOL_TYPE_ERASER then
+            self:writeDebugLog(string.format("ERASER END detected via slot.tool=%d", slot.tool))
+        end
     else
         effective_tool = self.current_tool
     end
@@ -957,7 +997,7 @@ function Pencil:onKeyPress(key)
 
     -- Always log key events when debug mode is on (even if not enabled)
     if self.input_debug_mode then
-        self:writeDebugLog(string.format("KEY PRESS: %s", key_str))
+        self:writeDebugLog(string.format("KEY PRESS: %s key.key=%s", key_str, tostring(key.key)))
     end
 
     -- Hardware Eraser button - works regardless of pencil enabled state
@@ -968,25 +1008,34 @@ function Pencil:onKeyPress(key)
         return true
     end
 
-    if not self:isEnabled() then return false end
-
-    -- BTN_TOOL_RUBBER - physical eraser end (if device supports it)
+    -- BTN_TOOL_RUBBER - physical eraser end - works regardless of pencil enabled state
     if key_str:match("BTN_TOOL_RUBBER") or key_str:match("ToolRubber") then
-        logger.dbg("Pencil: BTN_TOOL_RUBBER press detected")
+        logger.info("Pencil: BTN_TOOL_RUBBER press - activating eraser mode")
+        self.eraser_button_active = true
+        self.eraser_button_deleted = {}
         self.eraser_tool_active = true
         return true
     end
 
-    -- BTN_TOOL_PEN - pen tip
+    -- BTN_TOOL_PEN - pen tip - deactivate eraser mode
     if key_str:match("BTN_TOOL_PEN") or key_str:match("ToolPen") then
-        logger.dbg("Pencil: BTN_TOOL_PEN press detected")
+        logger.info("Pencil: BTN_TOOL_PEN press - deactivating eraser mode")
+        if self.eraser_button_active and self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
+            -- Save any pending eraser deletions before switching to pen
+            table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
+            self:saveStrokes()
+        end
+        self.eraser_button_active = false
+        self.eraser_button_deleted = nil
         self.eraser_tool_active = false
         return true
     end
 
+    if not self:isEnabled() then return false end
+
     -- BTN_STYLUS (331) - side button on stylus (mapped to "Eraser" on Kobo)
     -- BTN_STYLUS2 (332) - second side button (mapped to "Highlighter" on Kobo)
-    if key_str:match("Eraser") or key_str:match("Highlighter") or key_str:match("Stylus") then
+    if key_str:match("Highlighter") or key_str:match("Stylus") then
         logger.dbg("Pencil: Stylus button press detected:", key_str)
         return self:onStylusButtonPress()
     end
@@ -998,7 +1047,7 @@ function Pencil:onKeyRelease(key)
 
     -- Always log key events when debug mode is on (even if not enabled)
     if self.input_debug_mode then
-        self:writeDebugLog(string.format("KEY RELEASE: %s", key_str))
+        self:writeDebugLog(string.format("KEY RELEASE: %s key.key=%s", key_str, tostring(key.key)))
     end
 
     -- Hardware Eraser button released
@@ -1014,12 +1063,17 @@ function Pencil:onKeyRelease(key)
         return true
     end
 
-    if not self:isEnabled() then return false end
-
-    -- BTN_TOOL_RUBBER released
+    -- BTN_TOOL_RUBBER released (eraser end moved away) - works regardless of pencil enabled state
     if key_str:match("BTN_TOOL_RUBBER") or key_str:match("ToolRubber") then
-        logger.dbg("Pencil: BTN_TOOL_RUBBER release detected")
+        logger.info("Pencil: BTN_TOOL_RUBBER release - deactivating eraser mode")
+        if self.eraser_button_active and self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
+            table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
+            self:saveStrokes()
+        end
+        self.eraser_button_active = false
+        self.eraser_button_deleted = nil
         self.eraser_tool_active = false
+        UIManager:setDirty(self.view, "ui")
         return true
     end
 
@@ -1029,8 +1083,10 @@ function Pencil:onKeyRelease(key)
         return true
     end
 
+    if not self:isEnabled() then return false end
+
     -- Side button released
-    if key_str:match("Eraser") or key_str:match("Highlighter") or key_str:match("Stylus") then
+    if key_str:match("Highlighter") or key_str:match("Stylus") then
         logger.dbg("Pencil: Stylus button release detected:", key_str)
         return self:onStylusButtonRelease()
     end
