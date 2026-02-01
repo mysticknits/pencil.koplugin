@@ -354,8 +354,8 @@ function Pencil:handleStylusSlot(input, slot)
     -- Log in debug mode
     if self.input_debug_mode then
         self:writeDebugLog(string.format("STYLUS: slot=%d id=%d x=%d y=%d tool=%d pen_down=%s tool=%s",
-                slot.slot or -1, slot.id or -1, slot.x or 0, slot.y or 0, slot.tool or -1,
-                tostring(self.pen_down), self.current_tool))
+            slot.slot or -1, slot.id or -1, slot.x or 0, slot.y or 0, slot.tool or -1,
+            tostring(self.pen_down), self.current_tool))
     end
 
     -- Determine effective tool:
@@ -377,7 +377,7 @@ function Pencil:handleStylusSlot(input, slot)
     if effective_tool == TOOL_ERASER then
         if self.input_debug_mode and not self.erasing then
             self:writeDebugLog(string.format("ERASER MODE: pen_down=%s slot.id=%d",
-                    tostring(self.pen_down), slot.id or -1))
+                tostring(self.pen_down), slot.id or -1))
         end
         if slot.id and slot.id >= 0 then
             -- Eraser is touching - erase at this position
@@ -400,7 +400,7 @@ function Pencil:handleStylusSlot(input, slot)
                 local page = self:getCurrentPage()
                 if self.input_debug_mode then
                     self:writeDebugLog(string.format("ERASE ATTEMPT at (%d, %d) page=%s erasing=%s",
-                            x, y, tostring(page), tostring(self.erasing)))
+                        x, y, tostring(page), tostring(self.erasing)))
                 end
                 local deleted = self:eraseAtPoint(x, y, page)
                 if deleted then
@@ -622,8 +622,8 @@ end
 function Pencil:endRawStroke()
     if self.input_debug_mode then
         self:writeDebugLog(string.format("endRawStroke: current_stroke=%s points=%d",
-                tostring(self.current_stroke ~= nil),
-                self.current_stroke and #self.current_stroke.points or 0))
+            tostring(self.current_stroke ~= nil),
+            self.current_stroke and #self.current_stroke.points or 0))
     end
     if self.current_stroke and #self.current_stroke.points >= 1 then
         table.insert(self.strokes, self.current_stroke)
@@ -632,7 +632,7 @@ function Pencil:endRawStroke()
         table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
         if self.input_debug_mode then
             self:writeDebugLog(string.format("endRawStroke: SAVED stroke #%d with %d points, total strokes=%d",
-                    #self.strokes, #self.current_stroke.points, #self.strokes))
+                #self.strokes, #self.current_stroke.points, #self.strokes))
         end
         logger.dbg("Pencil: raw stroke ended with", #self.current_stroke.points, "points")
     else
@@ -972,17 +972,17 @@ Side button: tap to toggle pen/eraser, hold+drag to highlight.
 Enable "Input debug mode" to log raw events for diagnosis.
 
 Pages with strokes:%8]]),
-            self.current_tool,
-            #self.strokes,
-            page_strokes,
-            tostring(page),
-            type(page),
-            filepath,
-            self:isEnabled() and _("Yes") or _("No"),
-            pages_info,
-            stylus_callback_status,
-            tostring(pen_slot),
-            pen_down_status
+        self.current_tool,
+        #self.strokes,
+        page_strokes,
+        tostring(page),
+        type(page),
+        filepath,
+        self:isEnabled() and _("Yes") or _("No"),
+        pages_info,
+        stylus_callback_status,
+        tostring(pen_slot),
+        pen_down_status
     )
 
     UIManager:show(InfoMessage:new{
@@ -1828,13 +1828,13 @@ function Pencil:isPenInput(ges)
         if pen_slot_data then
             if self.input_debug_mode then
                 logger.info("Pencil: isPenInput check - pen_slot=", Input.pen_slot,
-                        "tool=", pen_slot_data.tool, "id=", pen_slot_data.id,
-                        "x=", pen_slot_data.x, "y=", pen_slot_data.y,
-                        "ges.pos=", ges.pos.x, ",", ges.pos.y)
+                           "tool=", pen_slot_data.tool, "id=", pen_slot_data.id,
+                           "x=", pen_slot_data.x, "y=", pen_slot_data.y,
+                           "ges.pos=", ges.pos.x, ",", ges.pos.y)
             else
                 logger.dbg("Pencil: isPenInput check - pen_slot=", Input.pen_slot,
-                        "tool=", pen_slot_data.tool, "id=", pen_slot_data.id,
-                        "x=", pen_slot_data.x, "y=", pen_slot_data.y)
+                           "tool=", pen_slot_data.tool, "id=", pen_slot_data.id,
+                           "x=", pen_slot_data.x, "y=", pen_slot_data.y)
             end
 
             -- Check if pen slot has tool type and is actively being tracked (id ~= -1)
@@ -1871,7 +1871,7 @@ function Pencil:isPenInput(ges)
         if cur_slot_data then
             if self.input_debug_mode then
                 logger.info("Pencil: current slot data - slot=", Input.cur_slot,
-                        "tool=", cur_slot_data.tool, "id=", cur_slot_data.id)
+                           "tool=", cur_slot_data.tool, "id=", cur_slot_data.id)
             end
             if cur_slot_data.tool == TOOL_TYPE_PEN then
                 logger.dbg("Pencil: isPenInput - current slot has pen tool type")
@@ -1939,7 +1939,7 @@ function Pencil:onDrawTap(ges)
     -- Log to debug file for analysis
     self:writeDebugLog(string.format("=== TAP at (%d, %d) ===", ges.pos.x, ges.pos.y))
     self:writeDebugLog(string.format("  is_eraser_end=%s eraser_tool_active=%s effective_tool=%s",
-            tostring(is_eraser_end), tostring(self.eraser_tool_active), effective_tool))
+        tostring(is_eraser_end), tostring(self.eraser_tool_active), effective_tool))
 
     if effective_tool == TOOL_ERASER then
         -- Eraser: delete strokes near tap point
@@ -2095,7 +2095,7 @@ function Pencil:onDrawPanRelease(ges)
     -- Log pan end to debug file
     self:writeDebugLog(string.format("=== PAN END at (%d, %d) ===", ges.pos.x, ges.pos.y))
     self:writeDebugLog(string.format("  is_eraser_end=%s eraser_tool_active=%s effective_tool=%s",
-            tostring(is_eraser_end), tostring(self.eraser_tool_active), effective_tool))
+        tostring(is_eraser_end), tostring(self.eraser_tool_active), effective_tool))
 
     -- Handle eraser pan release (raw input doesn't handle eraser)
     if effective_tool == TOOL_ERASER then
@@ -2272,7 +2272,7 @@ function Pencil:clearPageStrokes()
     self:rebuildPageIndex()
     self:saveStrokes()
 
-    UIManager:show(InfoMessage:new {
+    UIManager:show(InfoMessage:new{
         text = T(_("Cleared %1 annotation(s) from page."), #deleted_strokes),
         timeout = 1,
     })
@@ -2359,7 +2359,7 @@ function Pencil:eraseAtPoint(x, y, page)
     -- Only erase strokes on the current page
     if self.input_debug_mode then
         self:writeDebugLog(string.format("ERASE: searching %d strokes at (%d, %d)",
-                #self.strokes, x, y))
+            #self.strokes, x, y))
     end
 
     if #self.strokes == 0 then
@@ -2391,7 +2391,7 @@ function Pencil:eraseAtPoint(x, y, page)
                 if pt.y > max_y then max_y = pt.y end
             end
             self:writeDebugLog(string.format("ERASE: stroke %d bounds: (%d-%d, %d-%d), eraser at (%d,%d) threshold=%d",
-                    i, min_x, max_x, min_y, max_y, x, y, eraser_width))
+                i, min_x, max_x, min_y, max_y, x, y, eraser_width))
         end
         if stroke and isOnCurrentPage(stroke) and self:isPointNearStroke(x, y, stroke, eraser_width) then
             table.insert(deleted, stroke)
@@ -2855,7 +2855,7 @@ function Pencil:exportToText()
                 local time_str = stroke.datetime and os.date("%Y-%m-%d %H:%M", stroke.datetime) or "unknown"
                 local tool = stroke.tool or "pen"
                 file:write(string.format("  - Stroke %d: %s, %d points, width %d, created %s\n",
-                        j, tool, #stroke.points, stroke.width or 3, time_str))
+                    j, tool, #stroke.points, stroke.width or 3, time_str))
             end
             file:write("\n")
         end
