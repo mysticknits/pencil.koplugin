@@ -27,6 +27,7 @@ local KEY_RELEASE = 0
 -- Based on ABS_MT_TOOL_TYPE values on Elan panels
 local TOOL_TYPE_FINGER = 0
 local TOOL_TYPE_PEN    = 1
+local TOOL_TYPE_ERASER = 2
 
 -- For debug logging of ev.type
 local linux_evdev_type_map = {
@@ -480,14 +481,24 @@ function Input:routeStylusEvents()
     local dominated_indices = {}
 
     for i, slot in ipairs(self.MTSlots) do
-        -- Identify stylus by tool type OR pen slot
+        -- Identify stylus by tool type OR pen slot (pen tip or eraser end)
+        -- On Kobo, ABS_MT_TOOL_TYPE is sent: 0=finger, 1=stylus
         local is_stylus = (slot.tool == TOOL_TYPE_PEN) or
-                          (slot.slot == self.pen_slot)
+                          (slot.tool == TOOL_TYPE_ERASER) or
+                          (self.pen_slot and slot.slot == self.pen_slot)
 
         if is_stylus then
+            -- On Kobo, eraser END still reports tool=1 (PEN) via ABS_MT_TOOL_TYPE,
+            -- but also sends BTN_STYLUS. Override to ERASER when that's active.
+            -- Only do this for tool=PEN to avoid affecting fingers (tool=0)
+            -- Based on eraser detection pattern from eraser.koplugin by SimonLiu
+            if self.kobo_eraser_active and slot.tool == TOOL_TYPE_PEN then
+                slot.tool = TOOL_TYPE_ERASER
+            end
+
             logger.dbg("Input:routeStylusEvents: stylus detected in slot", slot.slot,
                        "tool=", slot.tool, "id=", slot.id, "x=", slot.x, "y=", slot.y,
-                       "pen_slot=", self.pen_slot)
+                       "pen_slot=", self.pen_slot, "kobo_eraser=", self.kobo_eraser_active)
             local dominated = self.stylus_callback(self, slot)
             if dominated then
                 table.insert(dominated_indices, i)
@@ -690,6 +701,36 @@ function Input:resetState()
 end
 
 function Input:handleKeyBoardEv(ev)
+    -- Track eraser end state via BTN_STYLUS (code 331) on Kobo
+    -- When eraser end touches screen, Kobo sends BTN_STYLUS press
+    -- This is mapped to "Eraser" in Kobo's event_map
+    -- Discovery based on eraser.koplugin by SimonLiu <simonliu423@gmail.com>
+    -- We just track the state here; routeStylusEvents will use it
+    if ev.code == C.BTN_STYLUS then
+        self.kobo_eraser_active = (ev.value == 1)
+    end
+
+    -- Handle stylus tool type for all protocols (pen tip vs eraser end)
+    if ev.code == C.BTN_TOOL_PEN then
+        self:setupSlotData(self.pen_slot)
+        if ev.value == 1 then
+            self:setCurrentMtSlot("tool", TOOL_TYPE_PEN)
+        else
+            self:setCurrentMtSlot("tool", TOOL_TYPE_FINGER)
+            self.cur_slot = self.main_finger_slot
+        end
+        return
+    elseif ev.code == C.BTN_TOOL_RUBBER then
+        self:setupSlotData(self.pen_slot)
+        if ev.value == 1 then
+            self:setCurrentMtSlot("tool", TOOL_TYPE_ERASER)
+        else
+            self:setCurrentMtSlot("tool", TOOL_TYPE_FINGER)
+            self.cur_slot = self.main_finger_slot
+        end
+        return
+    end
+
     -- Detect loss of contact for the "snow" protocol, as we *never* get EV_ABS:ABS_MT_TRACKING_ID:-1 on those...
     -- NOTE: The same logic *could* be used on *some* ST devices to detect contact states,
     --       but we instead prefer using EV_ABS:ABS_PRESSURE on those,
@@ -723,21 +764,10 @@ function Input:handleKeyBoardEv(ev)
             return
         end
     elseif self.wacom_protocol then
-        if ev.code == C.BTN_TOOL_PEN then
-            -- Switch to the dedicated pen slot, and make sure it's active, as this can come in a dedicated input frame
-            self:setupSlotData(self.pen_slot)
-            if ev.value == 1 then
-                self:setCurrentMtSlot("tool", TOOL_TYPE_PEN)
-            else
-                self:setCurrentMtSlot("tool", TOOL_TYPE_FINGER)
-                -- Switch back to our main finger slot
-                self.cur_slot = self.main_finger_slot
-            end
-
-            return
-        elseif ev.code == C.BTN_TOUCH then
-            -- BTN_TOUCH is bracketed by BTN_TOOL_PEN, so we can limit this to pens, to avoid stomping on panel slots.
-            if self:getCurrentMtSlotData("tool") == TOOL_TYPE_PEN then
+        if ev.code == C.BTN_TOUCH then
+            -- BTN_TOUCH is bracketed by BTN_TOOL_PEN/BTN_TOOL_RUBBER, so we can limit this to styluses, to avoid stomping on panel slots.
+            local tool = self:getCurrentMtSlotData("tool")
+            if tool == TOOL_TYPE_PEN or tool == TOOL_TYPE_ERASER then
                 -- Make sure the pen slot is active, as this can come in a dedicated input frame
                 -- (i.e., we need it to be referenced by self.MTSlots for the lift to be picked up in the EV_SYN:SYN_REPORT handler).
                 -- (Conversely, getCurrentMtSlotData pokes at the *persistent* slot data in self.ev_slots,
@@ -1762,5 +1792,6 @@ end
 -- Export tool type constants for plugins
 Input.TOOL_TYPE_FINGER = TOOL_TYPE_FINGER  -- 0
 Input.TOOL_TYPE_PEN = TOOL_TYPE_PEN        -- 1
+Input.TOOL_TYPE_ERASER = TOOL_TYPE_ERASER  -- 2
 
 return Input

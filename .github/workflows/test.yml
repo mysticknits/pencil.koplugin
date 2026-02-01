@@ -1,0 +1,71 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches-ignore:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Lua
+        uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: "5.1"
+
+      - name: Setup LuaRocks
+        uses: leafo/gh-actions-luarocks@v4
+
+      - name: Install dependencies
+        run: |
+          luarocks install busted
+          luarocks install luacov
+          luarocks install luacov-reporter-lcov
+
+      - name: Run tests with coverage
+        run: |
+          busted --coverage spec/
+
+      - name: Generate coverage report
+        run: |
+          luacov
+          # Display coverage summary
+          cat luacov.report.out
+
+      - name: Check coverage threshold
+        run: |
+          # Extract total coverage percentage and check against threshold
+          # Note: Coverage only measures lib/ files since main.lua has KOReader dependencies
+          COVERAGE=$(grep -E "^Total" luacov.report.out | grep -oE "[0-9]+\.[0-9]+" | head -1)
+          THRESHOLD=80
+
+          echo "Coverage: ${COVERAGE}%"
+          echo "Threshold: ${THRESHOLD}%"
+
+          if [ -z "$COVERAGE" ]; then
+            echo "Could not determine coverage"
+            exit 1
+          fi
+
+          # Compare using bc for floating point
+          PASS=$(echo "$COVERAGE >= $THRESHOLD" | bc -l)
+          if [ "$PASS" -eq 0 ]; then
+            echo "Coverage ${COVERAGE}% is below threshold ${THRESHOLD}%"
+            exit 1
+          fi
+
+          echo "Coverage check passed!"
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: luacov.report.out
