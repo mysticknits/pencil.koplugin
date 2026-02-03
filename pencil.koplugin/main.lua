@@ -6,15 +6,22 @@ Enables freehand drawing and annotation with stylus on supported devices.
 --]]--
 
 local Blitbuffer = require("ffi/blitbuffer")
+local CenterContainer = require("ui/widget/container/centercontainer")
 local DataStorage = require("datastorage")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
+local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
+local GestureRange = require("ui/gesturerange")
+local HorizontalGroup = require("ui/widget/horizontalgroup")
+local HorizontalSpan = require("ui/widget/horizontalspan")
 local PencilGeometry = require("lib/geometry")
 local Screen = Device.screen
+local Size = require("ui/size")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local UIManager = require("ui/uimanager")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local json = require("json")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
@@ -33,6 +40,10 @@ end
 local TOOL_PEN = "pen"
 local TOOL_HIGHLIGHTER = "highlighter"
 local TOOL_ERASER = "eraser"
+
+-- Color picker trigger settings
+local COLOR_PICKER_DELAY_MS = 500  -- How long pen must be held still (milliseconds)
+local COLOR_PICKER_TOLERANCE_PIXELS = 15  -- How many pixels pen can move while "still"
 
 local Pencil = InputContainer:extend{
     name = "pencil_annotation",
@@ -65,7 +76,8 @@ local Pencil = InputContainer:extend{
     tool_settings = {
         [TOOL_PEN] = {
             width = 3,
-            color = Blitbuffer.COLOR_BLACK,
+            color = nil,  -- Blitbuffer color, set in init
+            color_name = "Black",  -- For persistence and display
             alpha = 255,
         },
         [TOOL_HIGHLIGHTER] = {
@@ -81,6 +93,16 @@ local Pencil = InputContainer:extend{
     -- Side button state
     side_button_down = false,
     side_button_used_for_highlight = false,  -- Track if button was used during a stroke
+
+    -- Color picker state (triggered by holding pen within 5 pixels for 5 seconds)
+    color_picker_start_x = nil,  -- Initial X position when pen touched down
+    color_picker_start_y = nil,  -- Initial Y position when pen touched down
+    color_picker_start_time = nil,  -- Timestamp when pen touched down (nil if moved too far)
+    color_picker_check_pending = nil,  -- Scheduled periodic check
+    color_picker_showing = false,  -- Whether color picker is currently displayed
+
+    -- Available colors for the pen (initialized in init() with actual Blitbuffer colors)
+    available_colors = {},
 }
 
 function Pencil:init()
@@ -98,8 +120,32 @@ function Pencil:init()
     -- Initialize highlighter color (yellow)
     self.tool_settings[TOOL_HIGHLIGHTER].color = Blitbuffer.Color8(0xDD)  -- Light gray for e-ink
 
+    -- Calculate gray value from highlight_lighten_factor setting
+    local lighten_factor = G_reader_settings:readSetting("highlight_lighten_factor") or 0.2
+    local gray_value = math.floor(255 * (1 - lighten_factor))
+
+    -- Available colors for color picker (Blitbuffer color values)
+    self.available_colors = {
+        { name = "Black", color = Blitbuffer.COLOR_BLACK },
+        { name = "Red", color = Blitbuffer.ColorRGB32(0xFF, 0x33, 0x00, 0xFF) },
+        { name = "Orange", color = Blitbuffer.ColorRGB32(0xFF, 0x88, 0x00, 0xFF) },
+        { name = "Yellow", color = Blitbuffer.ColorRGB32(0xFF, 0xFF, 0x33, 0xFF) },
+        { name = "Green", color = Blitbuffer.ColorRGB32(0x00, 0xAA, 0x66, 0xFF) },
+        { name = "Olive", color = Blitbuffer.ColorRGB32(0x88, 0xFF, 0x77, 0xFF) },
+        { name = "Cyan", color = Blitbuffer.ColorRGB32(0x00, 0xFF, 0xEE, 0xFF) },
+        { name = "Blue", color = Blitbuffer.ColorRGB32(0x00, 0x66, 0xFF, 0xFF) },
+        { name = "Purple", color = Blitbuffer.ColorRGB32(0xEE, 0x00, 0xFF, 0xFF) },
+        { name = "Gray", color = Blitbuffer.Color8(gray_value) },
+    }
+
     -- Load tool and stylus button settings
     self:loadSettings()
+
+    -- Ensure pen color has a default value (black) if not set
+    if not self.tool_settings[TOOL_PEN].color then
+        self.tool_settings[TOOL_PEN].color = Blitbuffer.COLOR_BLACK
+        self.tool_settings[TOOL_PEN].color_name = "Black"
+    end
 
     -- Register as view module to render strokes
     self.view = self.ui.view
@@ -364,7 +410,7 @@ function Pencil:handleStylusSlot(input, slot)
                     -- Immediately repaint view and our strokes overlay, then refresh
                     self.view:paintTo(Screen.bb, 0, 0)
                     self:paintTo(Screen.bb, 0, 0)
-                    Screen:refreshFast(0, 0, Screen:getWidth(), Screen:getHeight())
+                    Screen:refreshUI(0, 0, Screen:getWidth(), Screen:getHeight())
                     if self.input_debug_mode then
                         self:writeDebugLog(string.format("ERASED %d strokes at (%d, %d)", #deleted, x, y))
                     end
@@ -395,29 +441,62 @@ function Pencil:handleStylusSlot(input, slot)
     if slot.id and slot.id >= 0 then
         -- Pen down or moving
         if not self.pen_down then
+            -- Check if color picker is showing - route pen tap to it
+            if self.color_picker_showing and self.color_picker_widget then
+                local raw_x = slot.x or 0
+                local raw_y = slot.y or 0
+                local x, y = self:transformCoordinates(raw_x, raw_y)
+                if self.color_picker_widget:handlePenTap(x, y) then
+                    -- Color picker handled the tap, don't start a stroke
+                    return true
+                end
+            end
+
             -- Start new stroke
             self.pen_down = true
             self.erasing = false
             self:cancelPendingRefresh()
+            self:cancelColorPickerTimer()
             self:startRawStroke()
+            -- Record initial position and timestamp for color picker trigger
+            local raw_x = slot.x or 0
+            local raw_y = slot.y or 0
+            local x, y = self:transformCoordinates(raw_x, raw_y)
+            self.pen_x = x
+            self.pen_y = y
+            self.color_picker_start_x = x
+            self.color_picker_start_y = y
+            self.color_picker_start_time = time.now()
+            -- Schedule periodic check for color picker trigger
+            self:scheduleColorPickerCheck()
             if self.input_debug_mode then
                 self:writeDebugLog("=== PEN DOWN ===")
             end
-        end
-
-        -- Add point if position changed
-        local raw_x = slot.x or self.pen_x
-        local raw_y = slot.y or self.pen_y
-        local x, y = self:transformCoordinates(raw_x, raw_y)
-        if x ~= self.pen_x or y ~= self.pen_y then
-            self:addRawPoint(x, y)
-            self.pen_x = x
-            self.pen_y = y
+        else
+            -- Pen is moving
+            local raw_x = slot.x or self.pen_x
+            local raw_y = slot.y or self.pen_y
+            local x, y = self:transformCoordinates(raw_x, raw_y)
+            if x ~= self.pen_x or y ~= self.pen_y then
+                -- Check if pen moved more than tolerance from start position
+                if self.color_picker_start_x and self.color_picker_start_y then
+                    local dx = math.abs(x - self.color_picker_start_x)
+                    local dy = math.abs(y - self.color_picker_start_y)
+                    if dx > COLOR_PICKER_TOLERANCE_PIXELS or dy > COLOR_PICKER_TOLERANCE_PIXELS then
+                        -- Pen moved too far - reset tracking (no color picker)
+                        self:resetColorPickerTracking()
+                    end
+                end
+                self:addRawPoint(x, y)
+                self.pen_x = x
+                self.pen_y = y
+            end
         end
     else
         -- Pen lifted (id == -1)
         if self.pen_down and not self.erasing then
             self.pen_down = false
+            self:cancelColorPickerTimer()
             self:endRawStroke()
             if self.input_debug_mode then
                 self:writeDebugLog("=== PEN UP ===")
@@ -458,6 +537,7 @@ function Pencil:startRawStroke()
         points = {},
         width = tool_settings.width,
         color = tool_settings.color,
+        color_name = tool_settings.color_name,
         alpha = tool_settings.alpha,
         datetime = os.time(),
     }
@@ -474,8 +554,9 @@ function Pencil:addRawPoint(x, y)
     table.insert(self.current_stroke.points, point)
 
     local n = #self.current_stroke.points
+
     local width = self.current_stroke.width
-    local color = self.current_stroke.color or Blitbuffer.COLOR_BLACK
+    local color = self.current_stroke.color
     local half_w = math.floor(width / 2) + 2  -- padding for antialiasing
 
     -- Draw to framebuffer and track dirty region
@@ -483,7 +564,7 @@ function Pencil:addRawPoint(x, y)
     if n == 1 then
         -- Draw first point same size as line segments for consistency
         local half_w_draw = math.floor(width / 2)
-        Screen.bb:paintRect(x - half_w_draw, y - half_w_draw, width, width, color)
+        Screen.bb:paintRectRGB32(x - half_w_draw, y - half_w_draw, width, width, color)
         -- Use slightly larger dirty region for refresh padding
         dirty_x = x - half_w
         dirty_y = y - half_w
@@ -530,8 +611,8 @@ function Pencil:addRawPoint(x, y)
             local ry = math.max(0, math.floor(r.y))
             local rw = math.min(Screen:getWidth() - rx, math.ceil(r.w))
             local rh = math.min(Screen:getHeight() - ry, math.ceil(r.h))
-            -- Use A2 mode for fastest possible refresh (no grayscale)
-            Screen:refreshA2(rx, ry, rw, rh)
+            -- Use UI refresh mode for proper color rendering on color e-ink
+            Screen:refreshUI(rx, ry, rw, rh)
             self.dirty_region = nil
         end
     end
@@ -701,12 +782,24 @@ function Pencil:loadSettings()
     self.current_tool = TOOL_PEN
     -- Input debug mode: log all input details
     self.input_debug_mode = settings.input_debug_mode or false
+    -- Load pen color by name and look up the actual color value
+    local color_name = settings.pen_color_name
+    if color_name then
+        self.tool_settings[TOOL_PEN].color_name = color_name
+        for _, color_info in ipairs(self.available_colors) do
+            if color_info.name == color_name then
+                self.tool_settings[TOOL_PEN].color = color_info.color
+                break
+            end
+        end
+    end
 end
 
 -- Save plugin settings
 function Pencil:saveSettings()
     G_reader_settings:saveSetting("pencil_annotation_settings", {
         input_debug_mode = self.input_debug_mode,
+        pen_color_name = self.tool_settings[TOOL_PEN].color_name,
     })
 end
 
@@ -1262,6 +1355,386 @@ function Pencil:cancelPendingRefresh()
     end
 end
 
+-- Reset color picker tracking (called when pen moves too far)
+function Pencil:resetColorPickerTracking()
+    self.color_picker_start_x = nil
+    self.color_picker_start_y = nil
+    self.color_picker_start_time = nil
+end
+
+-- Check if color picker should be shown (called periodically while pen is down)
+function Pencil:checkColorPickerTrigger()
+    if not self.color_picker_start_time then return end
+    if self.color_picker_showing then return end
+
+    local elapsed_ms = time.to_ms(time.now() - self.color_picker_start_time)
+    if elapsed_ms >= COLOR_PICKER_DELAY_MS then
+        -- Time elapsed without moving too far - show color picker
+        self:showColorPicker(self.pen_x, self.pen_y)
+        self:resetColorPickerTracking()
+    end
+end
+
+-- Schedule periodic check for color picker trigger
+function Pencil:scheduleColorPickerCheck()
+    if self.color_picker_check_pending then
+        UIManager:unschedule(self.color_picker_check_pending)
+    end
+
+    local plugin = self
+    -- Check every 100ms for trigger
+    self.color_picker_check_pending = UIManager:scheduleIn(0.1, function()
+        plugin.color_picker_check_pending = nil
+        if plugin.pen_down and plugin.color_picker_start_time and not plugin.color_picker_showing then
+            plugin:checkColorPickerTrigger()
+            -- Schedule next check if still waiting
+            if plugin.color_picker_start_time then
+                plugin:scheduleColorPickerCheck()
+            end
+        end
+    end)
+end
+
+-- Cancel color picker check
+function Pencil:cancelColorPickerTimer()
+    if self.color_picker_check_pending then
+        UIManager:unschedule(self.color_picker_check_pending)
+        self.color_picker_check_pending = nil
+    end
+    self:resetColorPickerTracking()
+end
+
+-- Color picker widget for selecting pen color
+local ColorPickerWidget = InputContainer:extend {
+    width = nil,
+    height = nil,
+    colors = nil, -- Array of {color, name} objects
+    current_color_name = nil, -- Currently selected color name (for comparison)
+    callback = nil,
+    close_callback = nil,
+}
+
+function ColorPickerWidget:init()
+    local button_size = Screen:scaleBySize(36)
+    local spacing = Screen:scaleBySize(8)
+    local padding = Screen:scaleBySize(10)
+    local selection_border = Size.border.thick * 3  -- Thicker border for selected color
+
+    -- Calculate width dynamically based on number of colors
+    local num_colors = #self.colors
+    local buttons_width = num_colors * button_size + (num_colors - 1) * spacing
+    -- Width is just buttons - FrameContainer adds padding on all sides
+    self.width = buttons_width
+    self.height = button_size  -- FrameContainer adds equal padding all sides
+
+    -- Store button info for later position update
+    self.color_buttons_info = {}
+
+    -- Create color buttons
+    local color_buttons = HorizontalGroup:new{ align = "center" }
+
+    for i, color_info in ipairs(self.colors) do
+        if i > 1 then
+            table.insert(color_buttons, HorizontalSpan:new{ width = spacing })
+        end
+
+        -- Check if this color is currently selected (compare by name)
+        local is_selected = (color_info.name == self.current_color_name)
+        local border_size = is_selected and selection_border or Size.border.thick
+
+        -- Use dark gray border for Black color so selection is visible, true black for others
+        local border_color = Blitbuffer.COLOR_BLACK
+        if color_info.name == "Black" then
+            border_color = Blitbuffer.Color8(0x44)
+        end
+
+        -- Create a color swatch button
+        local color_swatch = FrameContainer:new{
+            width = button_size,
+            height = button_size,
+            padding = 0,
+            margin = 0,
+            bordersize = border_size,
+            color = border_color,
+            background = color_info.color,
+            WidgetContainer:new{
+                dimen = Geom:new{ w = button_size - border_size * 2, h = button_size - border_size * 2 },
+            },
+        }
+
+        -- Wrap in InputContainer to handle taps
+        local color_button = InputContainer:new{
+            dimen = Geom:new{ w = button_size, h = button_size },
+            color_swatch,
+            color_value = color_info.color,  -- Store Blitbuffer color
+            color_name = color_info.name,    -- Store name for display/persistence
+        }
+
+        color_button.ges_events = {
+            TapSelectColor = {
+                GestureRange:new{
+                    ges = "tap",
+                    range = function() return color_button.dimen end,
+                },
+            },
+        }
+
+        local widget = self
+        color_button.onTapSelectColor = function(btn)
+            if widget.callback then
+                widget.callback(btn.color_value, btn.color_name)
+            end
+            if widget.close_callback then
+                widget.close_callback()
+            end
+            return true
+        end
+
+        table.insert(color_buttons, color_button)
+        table.insert(self.color_buttons_info, color_button)
+    end
+
+    -- Create the frame - FrameContainer adds equal padding on all sides
+    local content = CenterContainer:new{
+        dimen = Geom:new{ w = self.width, h = button_size },
+        color_buttons,
+    }
+
+    self.frame = FrameContainer:new{
+        background = Blitbuffer.COLOR_WHITE,
+        bordersize = Size.border.window,
+        padding = padding,
+        content,
+    }
+
+    self[1] = self.frame
+    self.dimen = self.frame:getSize()
+
+    -- Register gesture to close when tapping outside
+    self.ges_events = {
+        TapCloseOutside = {
+            GestureRange:new{
+                ges = "tap",
+                range = function() return Geom:new{
+                    x = 0, y = 0,
+                    w = Screen:getWidth(),
+                    h = Screen:getHeight(),
+                } end,
+            },
+        },
+    }
+end
+
+-- Handle pen/stylus tap on color picker
+-- Returns true if the tap was handled (hit a color button or was inside picker)
+function ColorPickerWidget:handlePenTap(x, y)
+    if not self.dimen then
+        return false
+    end
+
+    -- Check if tap is inside the widget
+    local inside = x >= self.dimen.x and x < self.dimen.x + self.dimen.w
+            and y >= self.dimen.y and y < self.dimen.y + self.dimen.h
+
+    if not inside then
+        -- Tap outside - close the picker
+        if self.close_callback then
+            self.close_callback()
+        end
+        return true  -- Consume the event to prevent drawing
+    end
+
+    -- Calculate button positions directly from scratch
+    local button_size = Screen:scaleBySize(36)
+    local spacing = Screen:scaleBySize(8)
+    local padding = Screen:scaleBySize(10)
+    local border = Size.border.window
+
+    local num_buttons = #self.color_buttons_info
+    local total_buttons_width = num_buttons * button_size + (num_buttons - 1) * spacing
+
+    -- The buttons are centered within the widget
+    -- Frame adds border + padding on each side
+    -- Then CenterContainer centers the buttons
+    -- buttons_start_x = widget_x + (widget_width - total_buttons_width) / 2
+    local buttons_start_x = self.dimen.x + (self.dimen.w - total_buttons_width) / 2
+
+    -- Vertical position: border + padding (frame only, no VerticalSpans)
+    local buttons_y = self.dimen.y + border + padding
+
+    -- Check if tap is in the button row vertically
+    if y >= buttons_y and y < buttons_y + button_size then
+        -- Find which button was tapped based on x position
+        local relative_x = x - buttons_start_x
+        if relative_x >= 0 and relative_x < total_buttons_width then
+            -- Calculate which button index this falls into
+            local button_with_spacing = button_size + spacing
+            local button_index = math.floor(relative_x / button_with_spacing) + 1
+            -- Check if we're actually on the button and not in the spacing
+            local pos_in_slot = relative_x - (button_index - 1) * button_with_spacing
+            if pos_in_slot < button_size and button_index >= 1 and button_index <= num_buttons then
+                local btn = self.color_buttons_info[button_index]
+                if btn and self.callback then
+                    self.callback(btn.color_value, btn.color_name)
+                end
+                if self.close_callback then
+                    self.close_callback()
+                end
+                return true
+            end
+        end
+    end
+
+    -- Inside picker but didn't hit a button - still consume the event
+    return true
+end
+
+-- Handle tap - close if outside the widget
+function ColorPickerWidget:onTapCloseOutside(_, ges)
+    if ges and ges.pos and self.dimen then
+        -- Check if tap is inside the widget using coordinate comparison
+        local x, y = ges.pos.x, ges.pos.y
+        local inside = x >= self.dimen.x and x < self.dimen.x + self.dimen.w
+                and y >= self.dimen.y and y < self.dimen.y + self.dimen.h
+        if inside then
+            -- Tap is inside, let the color buttons handle it
+            return false
+        end
+    end
+    -- Tap is outside, close the widget without changing color
+    if self.close_callback then
+        self.close_callback()
+    end
+    return true
+end
+
+function ColorPickerWidget:paintTo(bb, x, y)
+    -- Use absolute position from dimen if set, otherwise use passed coordinates
+    local paint_x = self.dimen and self.dimen.x or x
+    local paint_y = self.dimen and self.dimen.y or y
+
+    -- Paint the frame at the absolute position
+    self.frame:paintTo(bb, paint_x, paint_y)
+
+    -- Update button dimens for tap detection at absolute positions
+    if self.color_buttons_info then
+        local button_size = Screen:scaleBySize(36)
+        local spacing = Screen:scaleBySize(8)
+        local padding = Screen:scaleBySize(10)
+        local border = Size.border.window
+
+        -- Calculate button positions within the frame
+        local total_buttons_width = #self.color_buttons_info * button_size + (#self.color_buttons_info - 1) * spacing
+        local frame_inner_width = self.dimen.w - 2 * padding - 2 * border
+        local buttons_start_x = paint_x + border + padding + (frame_inner_width - total_buttons_width) / 2
+        local buttons_y = paint_y + border + padding  -- just FrameContainer padding
+
+        for i, btn in ipairs(self.color_buttons_info) do
+            local btn_x = buttons_start_x + (i - 1) * (button_size + spacing)
+            btn.dimen.x = btn_x
+            btn.dimen.y = buttons_y
+        end
+    end
+end
+
+function ColorPickerWidget:onCloseWidget()
+    UIManager:setDirty(nil, "ui", self.dimen)
+end
+
+-- Show color picker popup near the pen position
+function Pencil:showColorPicker(x, y)
+    if self.color_picker_showing then return end
+
+    -- Discard any current stroke that was made while holding still
+    -- The user was holding still to trigger color picker, not intentionally drawing
+    if self.current_stroke then
+        self.current_stroke = nil
+        -- Repaint to remove the stroke from screen immediately
+        self.view:paintTo(Screen.bb, 0, 0)
+        self:paintTo(Screen.bb, 0, 0)
+        Screen:refreshUI(0, 0, Screen:getWidth(), Screen:getHeight())
+    end
+
+    self.color_picker_showing = true
+
+    local plugin = self
+
+    -- Calculate picker size based on number of colors
+    local button_size = Screen:scaleBySize(36)
+    local spacing = Screen:scaleBySize(8)
+    local padding = Screen:scaleBySize(10)
+    local border = Size.border.window
+    local num_colors = #self.available_colors
+    -- Width/height = buttons + FrameContainer padding (equal on all sides) + borders
+    local buttons_width = num_colors * button_size + (num_colors - 1) * spacing
+    local picker_width = buttons_width + padding * 2 + border * 2
+    local picker_height = button_size + padding * 2 + border * 2
+    local margin_above = Screen:scaleBySize(30)  -- Gap between picker and pen
+    local screen_margin = 10  -- Minimum margin from screen edges
+
+    -- Try to position above the pen first, centered horizontally
+    local picker_x = x - picker_width / 2
+    local picker_y = y - picker_height - margin_above
+
+    -- Adjust horizontal position to keep picker fully on screen
+    if picker_x < screen_margin then
+        picker_x = screen_margin
+    end
+    if picker_x + picker_width > Screen:getWidth() - screen_margin then
+        picker_x = Screen:getWidth() - picker_width - screen_margin
+    end
+
+    -- If no room above, position below the pen
+    if picker_y < screen_margin then
+        picker_y = y + margin_above
+    end
+
+    -- Final check: ensure it fits on screen vertically
+    if picker_y + picker_height > Screen:getHeight() - screen_margin then
+        picker_y = Screen:getHeight() - picker_height - screen_margin
+    end
+
+    local color_picker = ColorPickerWidget:new{
+        colors = self.available_colors,
+        current_color_name = self.tool_settings[TOOL_PEN].color_name,
+        callback = function(color_value, color_name)
+            plugin:setPenColor(color_value, color_name)
+            UIManager:show(InfoMessage:new{
+                text = T(_("Pen color: %1"), color_name),
+                timeout = 1,
+            })
+        end,
+        close_callback = function()
+            plugin.color_picker_showing = false
+            UIManager:close(plugin.color_picker_widget)
+            plugin.color_picker_widget = nil
+            -- Refresh to clean up
+            UIManager:setDirty(plugin.view, "ui")
+        end,
+    }
+
+    -- Position the widget at the calculated coordinates
+    -- Set dimen with absolute position before showing
+    color_picker.dimen = color_picker.dimen or Geom:new{}
+    color_picker.dimen.x = picker_x
+    color_picker.dimen.y = picker_y
+
+    self.color_picker_widget = color_picker
+
+    UIManager:show(self.color_picker_widget)
+    UIManager:setDirty(self.color_picker_widget, "ui")
+
+    logger.dbg("Pencil: color picker shown at", picker_x, picker_y)
+end
+
+-- Set pen color
+function Pencil:setPenColor(color, color_name)
+    self.tool_settings[TOOL_PEN].color = color
+    self.tool_settings[TOOL_PEN].color_name = color_name
+    logger.info("Pencil: setPenColor - color_name =", color_name)
+    self:saveSettings()
+end
+
 -- Handle initial touch - fires IMMEDIATELY on first contact
 -- This is critical for capturing the start of strokes without delay
 -- NOTE: For pen/highlighter, raw input hook handles drawing directly for lowest latency
@@ -1313,6 +1786,7 @@ function Pencil:onDrawTouch(ges)
         points = { { x = ges.pos.x, y = ges.pos.y } },
         width = tool_settings.width,
         color = tool_settings.color,
+        color_name = tool_settings.color_name,
         alpha = tool_settings.alpha,
         datetime = os.time(),
     }
@@ -1321,9 +1795,9 @@ function Pencil:onDrawTouch(ges)
     -- E-ink displays show "ghost" pixels when framebuffer changes, providing visual feedback
     -- Refresh only happens after user stops writing (delayed refresh)
     local width = tool_settings.width
-    local color = tool_settings.color or Blitbuffer.COLOR_BLACK
+    local color = tool_settings.color
     local half_w = math.floor(width / 2)
-    Screen.bb:paintRect(ges.pos.x - half_w, ges.pos.y - half_w, width, width, color)
+    Screen.bb:paintRectRGB32(ges.pos.x - half_w, ges.pos.y - half_w, width, width, color)
 
     return true
 end
@@ -1567,6 +2041,7 @@ function Pencil:onDrawPan(ges)
             points = {},
             width = tool_settings.width,
             color = tool_settings.color,
+            color_name = tool_settings.color_name,
             alpha = tool_settings.alpha,
             datetime = os.time(),
         }
@@ -1584,7 +2059,7 @@ function Pencil:onDrawPan(ges)
     -- E-ink shows ghost pixels, refresh happens on pan_release
     local n = #self.current_stroke.points
     local width = self.current_stroke.width
-    local color = self.current_stroke.color or Blitbuffer.COLOR_BLACK
+    local color = self.current_stroke.color
 
     if n >= 2 then
         local p1 = self.current_stroke.points[n - 1]
@@ -1598,7 +2073,7 @@ function Pencil:onDrawPan(ges)
     elseif n == 1 then
         local p = self.current_stroke.points[1]
         local half_w = math.floor(width / 2)
-        Screen.bb:paintRect(p.x - half_w, p.y - half_w, width, width, color)
+        Screen.bb:paintRectRGB32(p.x - half_w, p.y - half_w, width, width, color)
     end
 
     return true
@@ -1831,7 +2306,7 @@ function Pencil:drawLineSegment(bb, x1, y1, x2, y2, width, color)
     if dist < 1 then
         -- Just draw a single point
         local half_w = math.floor(width / 2)
-        bb:paintRect(x1 - half_w, y1 - half_w, width, width, color)
+        bb:paintRectRGB32(x1 - half_w, y1 - half_w, width, width, color)
         return
     end
 
@@ -1843,7 +2318,7 @@ function Pencil:drawLineSegment(bb, x1, y1, x2, y2, width, color)
         local t = i / steps
         local x = math.floor(x1 + dx * t)
         local y = math.floor(y1 + dy * t)
-        bb:paintRect(x - half_w, y - half_w, width, width, color)
+        bb:paintRectRGB32(x - half_w, y - half_w, width, width, color)
     end
 end
 
@@ -1858,7 +2333,7 @@ function Pencil:drawHighlighterSegment(bb, x1, y1, x2, y2, width, color)
 
     if dist < 1 then
         local half_w = math.floor(width / 2)
-        bb:paintRect(x1 - half_w, y1 - half_w, width, width, highlight_color)
+        bb:paintRectRGB32(x1 - half_w, y1 - half_w, width, width, highlight_color)
         return
     end
 
@@ -1869,7 +2344,7 @@ function Pencil:drawHighlighterSegment(bb, x1, y1, x2, y2, width, color)
         local t = i / steps
         local x = math.floor(x1 + dx * t)
         local y = math.floor(y1 + dy * t)
-        bb:paintRect(x - half_w, y - half_w, width, width, highlight_color)
+        bb:paintRectRGB32(x - half_w, y - half_w, width, width, highlight_color)
     end
 end
 
@@ -1951,11 +2426,14 @@ function Pencil:renderStroke(bb, stroke)
 
     local tool = stroke.tool or TOOL_PEN
     local width = stroke.width or self.tool_settings[tool].width or 3
+
+    -- Get color directly (it's already a Blitbuffer color)
     local color = stroke.color or self.tool_settings[tool].color or Blitbuffer.COLOR_BLACK
 
     -- Highlighter uses lighter color
     local is_highlighter = (tool == TOOL_HIGHLIGHTER)
     if is_highlighter then
+        -- For highlighter, use stored color or default gray
         color = stroke.color or Blitbuffer.Color8(0xDD)
     end
 
@@ -1963,7 +2441,7 @@ function Pencil:renderStroke(bb, stroke)
         -- Single point (dot)
         local p = stroke.points[1]
         local half_w = math.floor(width / 2)
-        bb:paintRect(p.x - half_w, p.y - half_w, width, width, color)
+        bb:paintRectRGB32(p.x - half_w, p.y - half_w, width, width, color)
     else
         -- Multiple points - draw line segments
         for i = 2, #stroke.points do
@@ -2055,7 +2533,7 @@ function Pencil:strokeToSaveable(stroke)
         alpha = stroke.alpha,
         datetime = stroke.datetime,
         points = stroke.points,
-        -- Don't save color (it's a Blitbuffer object), we'll reconstruct from tool
+        color_name = stroke.color_name,  -- Save color name for persistence
     }
 end
 
@@ -2063,11 +2541,24 @@ end
 function Pencil:strokeFromSaved(saved)
     local tool = saved.tool or TOOL_PEN
     local tool_settings = self.tool_settings[tool] or self.tool_settings[TOOL_PEN]
+
+    -- Look up color from color_name
+    local color = tool_settings.color
+    if saved.color_name then
+        for _, color_info in ipairs(self.available_colors) do
+            if color_info.name == saved.color_name then
+                color = color_info.color
+                break
+            end
+        end
+    end
+
     return {
         page = saved.page,
         tool = saved.tool,
         width = saved.width or tool_settings.width,
-        color = tool_settings.color,
+        color = color,
+        color_name = saved.color_name,
         alpha = saved.alpha or tool_settings.alpha,
         datetime = saved.datetime,
         points = saved.points,
