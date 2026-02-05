@@ -836,6 +836,23 @@ function Pencil:addToMainMenu(menu_items)
         sorting_hint = "more_tools",
         sub_item_table = {
             {
+                text = _("Enable"),
+                help_text = _("Enable or disable stylus annotation. When enabled, stylus input will draw on the page instead of triggering gestures."),
+                checked_func = function()
+                    return self:isEnabled()
+                end,
+                callback = function()
+                    local enabled = self:isEnabled()
+                    self:setEnabled(not enabled)
+                    if self:isEnabled() then
+                        self:setupPenInput()
+                    else
+                        self:teardownPenInput()
+                    end
+                end,
+                separator = true,
+            },
+            {
                 text = _("Tool"),
                 help_text = _("Select pencil or eraser."),
                 sub_item_table = {
