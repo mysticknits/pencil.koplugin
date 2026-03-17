@@ -138,6 +138,10 @@ function Pencil:init()
         { name = "Blue", color = Blitbuffer.ColorRGB32(0x00, 0x66, 0xFF, 0xFF) },
         { name = "Purple", color = Blitbuffer.ColorRGB32(0xEE, 0x00, 0xFF, 0xFF) },
         { name = "Gray", color = Blitbuffer.Color8(gray_value) },
+		{ name = "3", color = Blitbuffer.COLOR_BLACK }, -- Available pen widths
+		{ name = "5", color = Blitbuffer.COLOR_BLACK },
+		{ name = "7", color = Blitbuffer.COLOR_BLACK },
+		{ name = "9", color = Blitbuffer.COLOR_BLACK },
     }
 
     -- Load tool and stylus button settings
@@ -1689,7 +1693,20 @@ function Pencil:showColorPicker(x, y)
     local color_picker = ColorPickerWidget:new{
         colors = self.available_colors,
         current_color_name = self.tool_settings[TOOL_PEN].color_name,
+
         callback = function(color_value, color_name)
+			-- Catch width selections first
+			if color_name == "3" or color_name == "5" or color_name == "7" or color_name == "9" then
+				local width = tonumber(color_name)
+				plugin:setPenWidth(width)
+
+				UIManager:show(InfoMessage:new({
+					text = T(_("Pen width: %1"), width),
+					timeout = 1,
+				}))
+				return
+			end
+
             plugin:setPenColor(color_value, color_name)
 
             -- Display white as the color name if black is picked in night mode
@@ -1731,6 +1748,13 @@ function Pencil:setPenColor(color, color_name)
     self.tool_settings[TOOL_PEN].color_name = color_name
     logger.info("Pencil: setPenColor - color_name =", color_name)
     self:saveSettings()
+end
+
+-- Set pen width
+function Pencil:setPenWidth(width)
+	self.tool_settings[TOOL_PEN].width = width
+	logger.info("Pencil: setPenWidth - width =", width)
+	self:saveSettings()
 end
 
 -- Handle initial touch - fires IMMEDIATELY on first contact
