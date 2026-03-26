@@ -10,7 +10,7 @@ This has been tested on:
 
 If you resize your book while reading it, your annotations will be WONKY. This is something I will eventually address but for now, get your book set before you start writing.
 
-### Compatible with Koreader - Ghost
+### Compatible with Koreader - Snowflake
 
 ## Features
 
