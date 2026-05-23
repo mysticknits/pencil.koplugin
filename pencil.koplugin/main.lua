@@ -1482,7 +1482,6 @@ function Pencil:onKeyPress(key)
 end
 
 function Pencil:onKeyRelease(key)
-    if key == nil then return false end
     local key_str = tostring(key)
 
     -- Always log key events when debug mode is on (even if not enabled)
