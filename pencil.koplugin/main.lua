@@ -2741,13 +2741,7 @@ function Pencil:screenToPageStroke(stroke)
         if i == 1 then
             page_stroke.page = page_point.page
         end
-        if page_point.page == stroke.page then
-            table.insert(page_stroke.page_points, page_point)
-        else
-            -- Point is on a different page than the stroke's assigned page - drop it
-            logger.info("Pencil: Dropping point on", stroke.page,
-                "point (", page_point.x, ",", page_point.y, ")")
-        end
+        table.insert(page_stroke.page_points, page_point)
     end
     logger.info("Pencil: transformed stroke with", #stroke.points,
         "screen points to", #page_stroke.page_points, "page points on page", page_stroke.page)
@@ -2764,7 +2758,7 @@ function Pencil:pageToScreenPoints(stroke)
     local screen_points = {}
     for _, page_point in ipairs(stroke.page_points) do
         local page_rect = {x = page_point.x, y = page_point.y, w = 1,  h = 1}
-        local screen_rect = self.ui.view:pageToScreenTransform(stroke.page, page_rect)
+        local screen_rect = self.ui.view:pageToScreenTransform(page_point.page, page_rect)
         if screen_rect ~= nil then
             table.insert(screen_points, { x = screen_rect.x, y = screen_rect.y })
         else
@@ -3958,13 +3952,16 @@ function Pencil:paintTo(bb, x, y)
         }
     end
 
-    -- Render saved strokes for current page (skipping stale ones).
-    local indices = self.page_strokes[page] or {}
-    for _, idx in ipairs(indices) do
-        if not (stale_indices and stale_indices[idx]) then
-            local stroke = self.strokes[idx]
-            if stroke then
-                self:renderStroke(bb, stroke)
+
+    for _, p in ipairs(self.view:getCurrentPageList()) do
+        -- Render saved strokes for current page (skipping stale ones).
+        local indices = self.page_strokes[p] or {}
+        for _, idx in ipairs(indices) do
+            if not (stale_indices and stale_indices[idx]) then
+                local stroke = self.strokes[idx]
+                if stroke then
+                    self:renderStroke(bb, stroke)
+                end
             end
         end
     end
