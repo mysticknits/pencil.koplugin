@@ -2761,7 +2761,7 @@ function Pencil:pageToScreenPoints(stroke)
         if screen_rect ~= nil then
             table.insert(screen_points, { x = screen_rect.x, y = screen_rect.y })
         else
-            logger.dbg("Pencil: pageToScreenTransform returned nil for page", stroke.page,
+            logger.dbg("Pencil: pageToScreenTransform returned nil for page", page_point.page,
                 "point (", page_point.x, ",", page_point.y, ")")
         end
     end
@@ -3756,8 +3756,11 @@ function Pencil:drawHighlighterSegment(bb, x1, y1, x2, y2, width, color)
 end
 
 -- Check if a point is near a stroke (for eraser)
-function Pencil:isPointNearStroke(px, py, stroke, threshold)
-    return PencilGeometry.isPointNearStroke(px, py, stroke, threshold)
+function Pencil:isPointNearStroke(px, py, stroke, screen_points, threshold)
+    if not screen_points then
+        screen_points = self:pageToScreenPoints(stroke)
+    end
+    return PencilGeometry.isPointNearPoints(px, py, screen_points, threshold)
 end
 
 -- Erase strokes at a given point
@@ -3780,29 +3783,32 @@ function Pencil:eraseAtPoint(x, y, page)
     local deleted = {}
     local indices_to_remove = {}
 
-    -- Iterate only strokes on the current page via the page index. Keeps the
-    -- per-sample erase cost O(strokes-on-page) instead of O(total-strokes).
-    local page_indices = self.page_strokes and self.page_strokes[page] or nil
-    if page_indices then
-        for _, i in ipairs(page_indices) do
-            local stroke = self.strokes[i]
-            if stroke then
-                if self.input_debug_mode and stroke.points and #stroke.points > 0 then
-                    local min_x, max_x, min_y, max_y = stroke.points[1].x, stroke.points[1].x, stroke.points[1].y, stroke.points[1].y
-                    for _, pt in ipairs(stroke.points) do
-                        if pt.x < min_x then min_x = pt.x end
-                        if pt.x > max_x then max_x = pt.x end
-                        if pt.y < min_y then min_y = pt.y end
-                        if pt.y > max_y then max_y = pt.y end
+    -- Iterate only strokes on the current visible pages via the page index. 
+    -- Keeps the per-sample erase cost O(strokes-on-page) instead of O(total-strokes).
+    for _, p in ipairs(self.ui.view:getCurrentPageList()) do
+        local page_indices = self.page_strokes and self.page_strokes[p] or nil
+        if page_indices then
+            for _, i in ipairs(page_indices) do
+                local stroke = self.strokes[i]
+                if stroke then
+                    local points = self:pageToScreenPoints(stroke)
+                    if self.input_debug_mode and points and #points > 0 then
+                        local min_x, max_x, min_y, max_y = points[1].x, points[1].x, points[1].y, points[1].y
+                        for _, pt in ipairs(points) do
+                            if pt.x < min_x then min_x = pt.x end
+                            if pt.x > max_x then max_x = pt.x end
+                            if pt.y < min_y then min_y = pt.y end
+                            if pt.y > max_y then max_y = pt.y end
+                        end
+                        self:writeDebugLog(string.format("ERASE: stroke %d bounds: (%d-%d, %d-%d), eraser at (%d,%d) threshold=%d",
+                            i, min_x, max_x, min_y, max_y, x, y, eraser_width))
                     end
-                    self:writeDebugLog(string.format("ERASE: stroke %d bounds: (%d-%d, %d-%d), eraser at (%d,%d) threshold=%d",
-                        i, min_x, max_x, min_y, max_y, x, y, eraser_width))
-                end
-                if self:isPointNearStroke(x, y, stroke, eraser_width) then
-                    table.insert(deleted, stroke)
-                    table.insert(indices_to_remove, i)
-                    if self.input_debug_mode then
-                        self:writeDebugLog(string.format("ERASE: found stroke %d to delete", i))
+                    if self:isPointNearStroke(x, y, stroke, points, eraser_width) then
+                        table.insert(deleted, stroke)
+                        table.insert(indices_to_remove, i)
+                        if self.input_debug_mode then
+                            self:writeDebugLog(string.format("ERASE: found stroke %d to delete", i))
+                        end
                     end
                 end
             end

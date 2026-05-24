@@ -68,8 +68,11 @@ local function createMockPencil(strokes, options)
     end
 
     -- Use real geometry function for point-near-stroke check
-    function mock:isPointNearStroke(px, py, stroke, threshold)
-        return Geometry.isPointNearStroke(px, py, stroke, threshold)
+    function mock:isPointNearStroke(px, py, stroke, screen_points, threshold)
+        if not screen_points then
+            screen_points = stroke.points
+        end
+        return Geometry.isPointNearPoints(px, py, screen_points, threshold)
     end
 
     -- Mock getCurrentPage
@@ -108,7 +111,7 @@ local function createMockPencil(strokes, options)
         end
 
         for i, stroke in ipairs(self.strokes) do
-            if stroke and isOnCurrentPage(stroke) and self:isPointNearStroke(x, y, stroke, eraser_width) then
+            if stroke and isOnCurrentPage(stroke) and self:isPointNearStroke(x, y, stroke, nil, eraser_width) then
                 table.insert(deleted, stroke)
                 table.insert(indices_to_remove, i)
             end
