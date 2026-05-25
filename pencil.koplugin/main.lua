@@ -3785,7 +3785,11 @@ function Pencil:eraseAtPoint(x, y, page)
 
     -- Iterate only strokes on the current visible pages via the page index. 
     -- Keeps the per-sample erase cost O(strokes-on-page) instead of O(total-strokes).
-    for _, p in ipairs(self.ui.view:getCurrentPageList()) do
+    local page_list = self.view:getCurrentPageList()
+    if not page_list or #page_list < 1 then
+        page_list = { page }
+    end
+    for _, p in ipairs(page_list) do
         local page_indices = self.page_strokes and self.page_strokes[p] or nil
         if page_indices then
             for _, i in ipairs(page_indices) do
@@ -3958,7 +3962,11 @@ function Pencil:paintTo(bb, x, y)
     end
 
 
-    for _, p in ipairs(self.view:getCurrentPageList()) do
+    local page_list = self.view:getCurrentPageList()
+    if not page_list or #page_list < 1 then
+        page_list = { page }
+    end
+    for _, p in ipairs(page_list) do
         -- Render saved strokes for current page (skipping stale ones).
         local indices = self.page_strokes[p] or {}
         for _, idx in ipairs(indices) do
