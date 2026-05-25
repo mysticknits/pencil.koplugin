@@ -714,8 +714,9 @@ function Pencil:endRawStroke()
             self.current_stroke and #self.current_stroke.points or 0))
     end
     if self.current_stroke and #self.current_stroke.points >= 1 then
-        table.insert(self.strokes, self.current_stroke)
-        self:indexStroke(#self.strokes, self.current_stroke.page)
+        local stroke = self:screenToPageStroke(self.current_stroke)
+        table.insert(self.strokes, stroke)
+        self:indexStroke(#self.strokes, stroke.page)
         table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
         self:assignStrokeToGroup(#self.strokes)
         self:scheduleDeferredWork()
@@ -2535,11 +2536,10 @@ function Pencil:onDrawTap(ges)
         alpha = tool_settings.alpha,
         datetime = os.time(),
     }
-
+    stroke = self:screenToPageStroke(stroke)
     table.insert(self.strokes, stroke)
-    self:indexStroke(#self.strokes, page)
+    self:indexStroke(#self.strokes, stroke.page)
     self:saveStrokes()
-
     -- Add to undo stack
     table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
 
@@ -2687,15 +2687,15 @@ function Pencil:onDrawPanRelease(ges)
     -- Fallback: finalize stroke via gesture system
     if #self.current_stroke.points >= 1 then
         -- Finalize the stroke
-        table.insert(self.strokes, self.current_stroke)
-        self:indexStroke(#self.strokes, self.current_stroke.page)
+        local stroke = self:screenToPageStroke(self.current_stroke)
+        table.insert(self.strokes, stroke)
+        self:indexStroke(#self.strokes, stroke.page)
         self:saveStrokes()
-
         -- Add to undo stack
         table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
         self:assignStrokeToGroup(#self.strokes)
 
-        logger.dbg("Pencil: stroke completed with", #self.current_stroke.points, "points")
+        logger.dbg("Pencil: stroke completed with", #stroke.points, "points")
     end
 
     self.current_stroke = nil
@@ -2720,6 +2720,56 @@ function Pencil:getCurrentPage()
         -- Fallback to XPointer if conversion not available
         return xp
     end
+end
+
+-- Transforms a stroke in screen coordinates to page coordinates
+-- Only applies to paging documents (pdfs), otherwise returns stroke
+-- A stroke may span multiple pages
+-- If it does, points outside the first point's page will be dropped
+function Pencil:screenToPageStroke(stroke)
+    if not self.ui.paging or #stroke.points < 1 then
+        return stroke
+    end
+    local page_stroke = {}
+    for k, v in pairs(stroke) do
+        page_stroke[k] = v
+    end
+    page_stroke.page_points = {}
+    for i, point in ipairs(stroke.points) do
+        local page_point = self.ui.view:screenToPageTransform(point)
+        if i == 1 then
+            page_stroke.page = page_point.page
+        end
+        table.insert(page_stroke.page_points, page_point)
+    end
+    logger.info("Pencil: transformed stroke with", #stroke.points,
+        "screen points to", #page_stroke.page_points, "page points on page", page_stroke.page)
+    return page_stroke
+end
+
+-- Transforms the page points of a stroke to screen coordinates
+-- Only applies to paging documents (pdfs), otherwise returns stroke.points
+-- Handle clipping of invidiual line segments to current view box
+function Pencil:pageToScreenPoints(stroke)
+    if not self.ui.paging or not stroke.page_points or #stroke.page_points < 1 then
+        return stroke.points
+    end
+    local screen_points = {}
+    for _, page_point in ipairs(stroke.page_points) do
+        local page_rect = {x = page_point.x, y = page_point.y, w = 1,  h = 1}
+        local screen_rect = self.ui.view:pageToScreenTransform(page_point.page, page_rect)
+        if screen_rect ~= nil then
+            table.insert(screen_points, { x = screen_rect.x, y = screen_rect.y })
+        else
+            logger.dbg("Pencil: pageToScreenTransform returned nil for page", page_point.page,
+                "point (", page_point.x, ",", page_point.y, ")")
+        end
+    end
+    if #screen_points < #stroke.page_points then
+        logger.info("Pencil: Only transformed", #screen_points, "of", #stroke.page_points,
+            "page points to screen points for stroke on page", stroke.page)
+    end
+    return screen_points
 end
 
 -- Index a stroke by page for quick lookup
@@ -3706,8 +3756,11 @@ function Pencil:drawHighlighterSegment(bb, x1, y1, x2, y2, width, color)
 end
 
 -- Check if a point is near a stroke (for eraser)
-function Pencil:isPointNearStroke(px, py, stroke, threshold)
-    return PencilGeometry.isPointNearStroke(px, py, stroke, threshold)
+function Pencil:isPointNearStroke(px, py, stroke, screen_points, threshold)
+    if not screen_points then
+        screen_points = self:pageToScreenPoints(stroke)
+    end
+    return PencilGeometry.isPointNearPoints(px, py, screen_points, threshold)
 end
 
 -- Erase strokes at a given point
@@ -3730,29 +3783,36 @@ function Pencil:eraseAtPoint(x, y, page)
     local deleted = {}
     local indices_to_remove = {}
 
-    -- Iterate only strokes on the current page via the page index. Keeps the
-    -- per-sample erase cost O(strokes-on-page) instead of O(total-strokes).
-    local page_indices = self.page_strokes and self.page_strokes[page] or nil
-    if page_indices then
-        for _, i in ipairs(page_indices) do
-            local stroke = self.strokes[i]
-            if stroke then
-                if self.input_debug_mode and stroke.points and #stroke.points > 0 then
-                    local min_x, max_x, min_y, max_y = stroke.points[1].x, stroke.points[1].x, stroke.points[1].y, stroke.points[1].y
-                    for _, pt in ipairs(stroke.points) do
-                        if pt.x < min_x then min_x = pt.x end
-                        if pt.x > max_x then max_x = pt.x end
-                        if pt.y < min_y then min_y = pt.y end
-                        if pt.y > max_y then max_y = pt.y end
+    -- Iterate only strokes on the current visible pages via the page index. 
+    -- Keeps the per-sample erase cost O(strokes-on-page) instead of O(total-strokes).
+    local page_list = self.view:getCurrentPageList()
+    if not page_list or #page_list < 1 then
+        page_list = { page }
+    end
+    for _, p in ipairs(page_list) do
+        local page_indices = self.page_strokes and self.page_strokes[p] or nil
+        if page_indices then
+            for _, i in ipairs(page_indices) do
+                local stroke = self.strokes[i]
+                if stroke then
+                    local points = self:pageToScreenPoints(stroke)
+                    if self.input_debug_mode and points and #points > 0 then
+                        local min_x, max_x, min_y, max_y = points[1].x, points[1].x, points[1].y, points[1].y
+                        for _, pt in ipairs(points) do
+                            if pt.x < min_x then min_x = pt.x end
+                            if pt.x > max_x then max_x = pt.x end
+                            if pt.y < min_y then min_y = pt.y end
+                            if pt.y > max_y then max_y = pt.y end
+                        end
+                        self:writeDebugLog(string.format("ERASE: stroke %d bounds: (%d-%d, %d-%d), eraser at (%d,%d) threshold=%d",
+                            i, min_x, max_x, min_y, max_y, x, y, eraser_width))
                     end
-                    self:writeDebugLog(string.format("ERASE: stroke %d bounds: (%d-%d, %d-%d), eraser at (%d,%d) threshold=%d",
-                        i, min_x, max_x, min_y, max_y, x, y, eraser_width))
-                end
-                if self:isPointNearStroke(x, y, stroke, eraser_width) then
-                    table.insert(deleted, stroke)
-                    table.insert(indices_to_remove, i)
-                    if self.input_debug_mode then
-                        self:writeDebugLog(string.format("ERASE: found stroke %d to delete", i))
+                    if self:isPointNearStroke(x, y, stroke, points, eraser_width) then
+                        table.insert(deleted, stroke)
+                        table.insert(indices_to_remove, i)
+                        if self.input_debug_mode then
+                            self:writeDebugLog(string.format("ERASE: found stroke %d to delete", i))
+                        end
                     end
                 end
             end
@@ -3778,7 +3838,8 @@ end
 
 -- Render a complete stroke
 function Pencil:renderStroke(bb, stroke)
-    if not stroke.points or #stroke.points < 1 then
+    local points = self:pageToScreenPoints(stroke)
+    if not points or #points < 1 then
         return
     end
 
@@ -3800,16 +3861,16 @@ function Pencil:renderStroke(bb, stroke)
         color = stroke.color or Blitbuffer.Color8(0xDD)
     end
 
-    if #stroke.points == 1 then
+    if #points == 1 then
         -- Single point (dot)
-        local p = stroke.points[1]
+        local p = points[1]
         local half_w = math.floor(width / 2)
         bb:paintRectRGB32(p.x - half_w, p.y - half_w, width, width, color)
     else
         -- Multiple points - draw line segments
-        for i = 2, #stroke.points do
-            local p1 = stroke.points[i - 1]
-            local p2 = stroke.points[i]
+        for i = 2, #points do
+            local p1 = points[i - 1]
+            local p2 = points[i]
             if is_highlighter then
                 self:drawHighlighterSegment(bb, p1.x, p1.y, p2.x, p2.y, width, color)
             else
@@ -3900,13 +3961,20 @@ function Pencil:paintTo(bb, x, y)
         }
     end
 
-    -- Render saved strokes for current page (skipping stale ones).
-    local indices = self.page_strokes[page] or {}
-    for _, idx in ipairs(indices) do
-        if not (stale_indices and stale_indices[idx]) then
-            local stroke = self.strokes[idx]
-            if stroke then
-                self:renderStroke(bb, stroke)
+
+    local page_list = self.view:getCurrentPageList()
+    if not page_list or #page_list < 1 then
+        page_list = { page }
+    end
+    for _, p in ipairs(page_list) do
+        -- Render saved strokes for current page (skipping stale ones).
+        local indices = self.page_strokes[p] or {}
+        for _, idx in ipairs(indices) do
+            if not (stale_indices and stale_indices[idx]) then
+                local stroke = self.strokes[idx]
+                if stroke then
+                    self:renderStroke(bb, stroke)
+                end
             end
         end
     end
@@ -4010,6 +4078,7 @@ function Pencil:strokeToSaveable(stroke)
         datetime = stroke.datetime,
         points = stroke.points,
         color_name = stroke.color_name,  -- Save color name for persistence
+        page_points = stroke.page_points
     }
 end
 
@@ -4038,6 +4107,7 @@ function Pencil:strokeFromSaved(saved)
         alpha = saved.alpha or tool_settings.alpha,
         datetime = saved.datetime,
         points = saved.points,
+        page_points = saved.page_points
     }
 end
 
@@ -4105,8 +4175,9 @@ function Pencil:onCloseDocument()
     -- Save any in-progress stroke
     if self.current_stroke and #self.current_stroke.points >= 2 then
         logger.info("Pencil: saving in-progress stroke before close")
-        table.insert(self.strokes, self.current_stroke)
-        self:indexStroke(#self.strokes, self.current_stroke.page)
+        local stroke = self:screenToPageStroke(self.current_stroke)
+        table.insert(self.strokes, stroke)
+        self:indexStroke(#self.strokes, stroke.page)
         self.current_stroke = nil
     end
 
@@ -4186,8 +4257,9 @@ function Pencil:onPageUpdate(pageno)
         -- Save the stroke before clearing. The inline saveStrokes below covers
         -- everything in self.strokes, so drop any queued debounced save first.
         self:cancelPendingSave()
-        table.insert(self.strokes, self.current_stroke)
-        self:indexStroke(#self.strokes, self.current_stroke.page)
+        local stroke = self:screenToPageStroke(self.current_stroke)
+        table.insert(self.strokes, stroke)
+        self:indexStroke(#self.strokes, stroke.page)
         table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
         self:flushDirtyGroups()
         self:saveStrokes()
@@ -4209,8 +4281,9 @@ function Pencil:onUpdatePos()
     -- Clear any in-progress stroke when position changes
     if self.current_stroke and #self.current_stroke.points >= 2 then
         self:cancelPendingSave()
-        table.insert(self.strokes, self.current_stroke)
-        self:indexStroke(#self.strokes, self.current_stroke.page)
+        local stroke = self:screenToPageStroke(self.current_stroke)
+        table.insert(self.strokes, stroke)
+        self:indexStroke(#self.strokes, stroke.page)
         table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
         self:flushDirtyGroups()
         self:saveStrokes()

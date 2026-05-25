@@ -13,24 +13,24 @@ describe("Geometry", function()
     describe("isPointNearStroke", function()
 
         it("returns false for nil stroke", function()
-            assert.is_false(Geometry.isPointNearStroke(0, 0, nil, 10))
+            assert.is_false(Geometry.isPointNearPoints(0, 0, nil, 10))
         end)
 
         it("returns false for stroke with nil points", function()
             local stroke = { points = nil }
-            assert.is_false(Geometry.isPointNearStroke(0, 0, stroke, 10))
+            assert.is_false(Geometry.isPointNearPoints(0, 0, stroke.points, 10))
         end)
 
         it("returns false for stroke with empty points", function()
             local stroke = { points = {} }
-            assert.is_false(Geometry.isPointNearStroke(0, 0, stroke, 10))
+            assert.is_false(Geometry.isPointNearPoints(0, 0, stroke.points, 10))
         end)
 
         it("returns true when point is exactly on stroke point", function()
             local stroke = {
                 points = { { x = 100, y = 200 } },
             }
-            assert.is_true(Geometry.isPointNearStroke(100, 200, stroke, 10))
+            assert.is_true(Geometry.isPointNearPoints(100, 200, stroke.points, 10))
         end)
 
         it("returns true when point is within threshold", function()
@@ -38,8 +38,8 @@ describe("Geometry", function()
                 points = { { x = 100, y = 200 } },
             }
             -- Point at distance 5 from stroke point
-            assert.is_true(Geometry.isPointNearStroke(105, 200, stroke, 10))
-            assert.is_true(Geometry.isPointNearStroke(100, 205, stroke, 10))
+            assert.is_true(Geometry.isPointNearPoints(105, 200, stroke.points, 10))
+            assert.is_true(Geometry.isPointNearPoints(100, 205, stroke.points, 10))
         end)
 
         it("returns false when point is outside threshold", function()
@@ -47,8 +47,8 @@ describe("Geometry", function()
                 points = { { x = 100, y = 200 } },
             }
             -- Point at distance > 10 from stroke point
-            assert.is_false(Geometry.isPointNearStroke(120, 200, stroke, 10))
-            assert.is_false(Geometry.isPointNearStroke(100, 220, stroke, 10))
+            assert.is_false(Geometry.isPointNearPoints(120, 200, stroke.points, 10))
+            assert.is_false(Geometry.isPointNearPoints(100, 220, stroke.points, 10))
         end)
 
         it("uses default threshold of 20", function()
@@ -56,9 +56,9 @@ describe("Geometry", function()
                 points = { { x = 100, y = 100 } },
             }
             -- Within default threshold of 20
-            assert.is_true(Geometry.isPointNearStroke(115, 100, stroke))
+            assert.is_true(Geometry.isPointNearPoints(115, 100, stroke.points))
             -- Outside default threshold of 20
-            assert.is_false(Geometry.isPointNearStroke(125, 100, stroke))
+            assert.is_false(Geometry.isPointNearPoints(125, 100, stroke.points))
         end)
 
         it("checks all points in stroke", function()
@@ -70,13 +70,13 @@ describe("Geometry", function()
                 },
             }
             -- Near first point
-            assert.is_true(Geometry.isPointNearStroke(5, 5, stroke, 10))
+            assert.is_true(Geometry.isPointNearPoints(5, 5, stroke.points, 10))
             -- Near middle point
-            assert.is_true(Geometry.isPointNearStroke(105, 105, stroke, 10))
+            assert.is_true(Geometry.isPointNearPoints(105, 105, stroke.points, 10))
             -- Near last point
-            assert.is_true(Geometry.isPointNearStroke(195, 5, stroke, 10))
+            assert.is_true(Geometry.isPointNearPoints(195, 5, stroke.points, 10))
             -- Not near any point
-            assert.is_false(Geometry.isPointNearStroke(100, 50, stroke, 10))
+            assert.is_false(Geometry.isPointNearPoints(100, 50, stroke.points, 10))
         end)
 
         it("handles boundary case (exactly at threshold)", function()
@@ -84,8 +84,8 @@ describe("Geometry", function()
                 points = { { x = 0, y = 0 } },
             }
             -- At exactly threshold distance (10 units away)
-            assert.is_true(Geometry.isPointNearStroke(10, 0, stroke, 10))
-            assert.is_true(Geometry.isPointNearStroke(0, 10, stroke, 10))
+            assert.is_true(Geometry.isPointNearPoints(10, 0, stroke.points, 10))
+            assert.is_true(Geometry.isPointNearPoints(0, 10, stroke.points, 10))
         end)
 
     end)
