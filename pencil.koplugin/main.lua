@@ -94,6 +94,10 @@ local Pencil = InputContainer:extend{
     -- Delayed refresh - only refresh after user stops writing
     pending_refresh = nil,
     refresh_delay_ms = 600, -- Wait 600ms after last stroke before final refresh
+    -- Screen-space bbox of strokes drawn since the last delayed refresh fired.
+    -- The post-lift "clean" refresh is scoped to this region instead of the
+    -- whole screen, so a dense page doesn't trigger a full-panel e-ink update.
+    pending_refresh_bbox = nil,
 
     -- Debounced save - coalesces full O(N) serialization across consecutive strokes.
     -- Force-flushed on page change, close, and the deferred-work scheduler.
@@ -394,7 +398,12 @@ function Pencil:handleStylusSlot(input, slot)
                 end
                 self.view:paintTo(Screen.bb, 0, 0)
                 self:paintTo(Screen.bb, 0, 0)
-                Screen:refreshFast(0, 0, Screen:getWidth(), Screen:getHeight())
+                local rx, ry, rw, rh = self:erasedStrokesRefreshRect(deleted)
+                if rx then
+                    Screen:refreshFast(rx, ry, rw, rh)
+                else
+                    Screen:refreshFast(0, 0, Screen:getWidth(), Screen:getHeight())
+                end
             end
             -- Also remove any native KOReader text highlight at this position.
             -- removeItemByIndex emits AnnotationsModified and triggers its own
@@ -485,7 +494,12 @@ function Pencil:handleStylusSlot(input, slot)
                     -- Immediately repaint view and our strokes overlay, then refresh
                     self.view:paintTo(Screen.bb, 0, 0)
                     self:paintTo(Screen.bb, 0, 0)
-                    Screen:refreshUI(0, 0, Screen:getWidth(), Screen:getHeight())
+                    local rx, ry, rw, rh = self:erasedStrokesRefreshRect(deleted)
+                    if rx then
+                        Screen:refreshUI(rx, ry, rw, rh)
+                    else
+                        Screen:refreshUI(0, 0, Screen:getWidth(), Screen:getHeight())
+                    end
                     if self.input_debug_mode then
                         self:writeDebugLog(string.format("ERASED %d strokes at (%d, %d)", #deleted, x, y))
                     end
@@ -724,6 +738,9 @@ function Pencil:endRawStroke()
                 #self.strokes, #self.current_stroke.points, #self.strokes))
         end
         logger.dbg("Pencil: raw stroke ended with", #self.current_stroke.points, "points")
+        -- Track the region this stroke touched so the delayed refresh below
+        -- can be scoped to it instead of the whole screen.
+        self:accumulateRefreshBbox(self.current_stroke)
     else
         if self.input_debug_mode then
             self:writeDebugLog("endRawStroke: NOT SAVED (no current_stroke or no points)")
@@ -1718,18 +1735,55 @@ function Pencil:onDrawHold(ges)
     return true
 end
 
+-- Union a finished stroke's (screen-space) bounding box into the pending
+-- post-lift refresh region, expanded by the stroke's own half-width plus a
+-- small antialiasing pad. The delayed refresh then only updates this region.
+function Pencil:accumulateRefreshBbox(stroke)
+    if not stroke then return end
+    local bbox = PencilGeometry.computeStrokeBbox(stroke)
+    if not bbox then return end
+    local margin = math.floor((stroke.width or 0) / 2) + 4
+    bbox = PencilGeometry.bboxExpand(bbox, margin)
+    if self.pending_refresh_bbox then
+        self.pending_refresh_bbox = PencilGeometry.bboxUnion(self.pending_refresh_bbox, bbox)
+    else
+        self.pending_refresh_bbox = bbox
+    end
+end
+
 -- Schedule a delayed refresh after writing stops
 function Pencil:scheduleDelayedRefresh()
     -- Cancel any existing pending refresh
     self:cancelPendingRefresh()
 
-    -- Schedule new refresh
-    self.pending_refresh = UIManager:scheduleIn(self.refresh_delay_ms / 1000, function()
-        self.pending_refresh = nil
-        -- Do a fast refresh of the whole view to show all recent strokes
-        UIManager:setDirty(self.view, "fast")
+    -- Schedule new refresh. Store the closure itself (not scheduleIn's nil
+    -- return) so cancelPendingRefresh can actually unschedule it.
+    local action
+    action = function()
+        if self.pending_refresh == action then self.pending_refresh = nil end
+        local bbox = self.pending_refresh_bbox
+        self.pending_refresh_bbox = nil
+        if bbox then
+            -- Scope the fast refresh to the region the recent strokes touched.
+            -- The view still repaints fully, but the slow e-ink update is small.
+            bbox = PencilGeometry.bboxClampToScreen(bbox, Screen:getWidth(), Screen:getHeight())
+            local rw = bbox.x1 - bbox.x0
+            local rh = bbox.y1 - bbox.y0
+            if rw > 0 and rh > 0 then
+                local region = Geom:new{ x = bbox.x0, y = bbox.y0, w = rw, h = rh }
+                UIManager:setDirty(self.view, "fast", region)
+            else
+                UIManager:setDirty(self.view, "fast")
+            end
+        else
+            -- No tracked region (e.g. refresh scheduled without a finished
+            -- stroke) — fall back to a full-view fast refresh.
+            UIManager:setDirty(self.view, "fast")
+        end
         logger.dbg("Pencil: delayed refresh triggered")
-    end)
+    end
+    self.pending_refresh = action
+    UIManager:scheduleIn(self.refresh_delay_ms / 1000, action)
 end
 
 -- Cancel pending refresh (called when new stroke starts)
@@ -1741,13 +1795,20 @@ function Pencil:cancelPendingRefresh()
 end
 
 -- Schedule a debounced save + bookmark flush after writing pauses.
+-- NOTE: UIManager:scheduleIn() returns nil, and UIManager:unschedule() matches
+-- by the action function reference. So we must store the closure itself in
+-- pending_save (not scheduleIn's return value) or cancelPendingSave can never
+-- cancel it — which previously caused one full save to fire per stroke.
 function Pencil:scheduleDeferredWork()
     self:cancelPendingSave()
-    self.pending_save = UIManager:scheduleIn(self.save_delay_ms / 1000, function()
-        self.pending_save = nil
+    local action
+    action = function()
+        if self.pending_save == action then self.pending_save = nil end
         self:flushDirtyGroups()
         self:saveStrokes()
-    end)
+    end
+    self.pending_save = action
+    UIManager:scheduleIn(self.save_delay_ms / 1000, action)
 end
 
 function Pencil:cancelPendingSave()
@@ -2589,7 +2650,12 @@ function Pencil:onDrawPan(ges)
                 table.insert(self.eraser_deleted, stroke)
             end
             self.view:paintTo(Screen.bb, 0, 0)
-            Screen:refreshUI()
+            local rx, ry, rw, rh = self:erasedStrokesRefreshRect(deleted)
+            if rx then
+                Screen:refreshUI(rx, ry, rw, rh)
+            else
+                Screen:refreshUI()
+            end
         end
         return true
     end
@@ -2696,6 +2762,7 @@ function Pencil:onDrawPanRelease(ges)
         self:assignStrokeToGroup(#self.strokes)
 
         logger.dbg("Pencil: stroke completed with", #self.current_stroke.points, "points")
+        self:accumulateRefreshBbox(self.current_stroke)
     end
 
     self.current_stroke = nil
@@ -3655,22 +3722,23 @@ function Pencil:clearAllStrokes()
 end
 
 -- Render a line segment using rectangles (since BlitBuffer has no native line drawing)
-function Pencil:drawLineSegment(bb, x1, y1, x2, y2, width, color)
+-- Rasterize a thick line by stamping width×width squares along the segment.
+-- Steps by ~half the pen width (via Geometry.segmentStepCount) so the squares
+-- overlap without the ~width-fold per-pixel overdraw that stepping by 1px gives.
+function Pencil:drawThickLine(bb, x1, y1, x2, y2, width, color)
     local dx = x2 - x1
     local dy = y2 - y1
     local dist = math.sqrt(dx * dx + dy * dy)
+    local half_w = math.floor(width / 2)
 
     if dist < 1 then
         -- Just draw a single point
-        local half_w = math.floor(width / 2)
         bb:paintRectRGB32(x1 - half_w, y1 - half_w, width, width, color)
         return
     end
 
-    -- Step along the line drawing small rectangles
-    local steps = math.ceil(dist)
-    local half_w = math.floor(width / 2)
-
+    -- Inclusive 0..steps loop emits both endpoints (t=0 and t=1).
+    local steps = PencilGeometry.segmentStepCount(dist, width)
     for i = 0, steps do
         local t = i / steps
         local x = math.floor(x1 + dx * t)
@@ -3679,35 +3747,41 @@ function Pencil:drawLineSegment(bb, x1, y1, x2, y2, width, color)
     end
 end
 
+function Pencil:drawLineSegment(bb, x1, y1, x2, y2, width, color)
+    self:drawThickLine(bb, x1, y1, x2, y2, width, color)
+end
+
 -- Render a highlighter segment (semi-transparent, wider)
 function Pencil:drawHighlighterSegment(bb, x1, y1, x2, y2, width, color)
-    local dx = x2 - x1
-    local dy = y2 - y1
-    local dist = math.sqrt(dx * dx + dy * dy)
-
     -- Highlighter is drawn as a lighter gray to simulate transparency on e-ink
     local highlight_color = color or Blitbuffer.Color8(0xDD)
-
-    if dist < 1 then
-        local half_w = math.floor(width / 2)
-        bb:paintRectRGB32(x1 - half_w, y1 - half_w, width, width, highlight_color)
-        return
-    end
-
-    local steps = math.ceil(dist)
-    local half_w = math.floor(width / 2)
-
-    for i = 0, steps do
-        local t = i / steps
-        local x = math.floor(x1 + dx * t)
-        local y = math.floor(y1 + dy * t)
-        bb:paintRectRGB32(x - half_w, y - half_w, width, width, highlight_color)
-    end
+    self:drawThickLine(bb, x1, y1, x2, y2, width, highlight_color)
 end
 
 -- Check if a point is near a stroke (for eraser)
 function Pencil:isPointNearStroke(px, py, stroke, threshold)
     return PencilGeometry.isPointNearStroke(px, py, stroke, threshold)
+end
+
+-- Screen-space refresh rect (x, y, w, h) covering a set of just-deleted
+-- strokes, expanded by the eraser width and clamped to the screen. Returns
+-- nil when no stroke has geometry, signalling the caller to refresh fully.
+function Pencil:erasedStrokesRefreshRect(strokes)
+    local bbox = nil
+    for _, s in ipairs(strokes) do
+        local b = PencilGeometry.computeStrokeBbox(s)
+        if b then
+            bbox = bbox and PencilGeometry.bboxUnion(bbox, b) or b
+        end
+    end
+    if not bbox then return nil end
+    local margin = (self.tool_settings[TOOL_ERASER] and self.tool_settings[TOOL_ERASER].width) or 20
+    bbox = PencilGeometry.bboxExpand(bbox, margin)
+    bbox = PencilGeometry.bboxClampToScreen(bbox, Screen:getWidth(), Screen:getHeight())
+    local w = bbox.x1 - bbox.x0
+    local h = bbox.y1 - bbox.y0
+    if w <= 0 or h <= 0 then return nil end
+    return bbox.x0, bbox.y0, w, h
 end
 
 -- Erase strokes at a given point

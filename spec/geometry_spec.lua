@@ -307,4 +307,31 @@ describe("Geometry", function()
         end)
     end)
 
+    describe("segmentStepCount", function()
+
+        it("steps by ~half the width for thick pens", function()
+            -- width 10 -> step 5; dist 100 -> ceil(100/5) = 20
+            assert.are.equal(20, Geometry.segmentStepCount(100, 10))
+        end)
+
+        it("never returns less than 1 step", function()
+            assert.are.equal(1, Geometry.segmentStepCount(0, 10))
+            assert.are.equal(1, Geometry.segmentStepCount(2, 10))
+        end)
+
+        it("falls back to 1px steps for thin pens (width <= 2)", function()
+            -- floor(2/2) = 1 -> step 1 -> ceil(100/1) = 100
+            assert.are.equal(100, Geometry.segmentStepCount(100, 2))
+            -- floor(1/2) = 0 -> max(1, 0) = 1 -> ceil(100/1) = 100
+            assert.are.equal(100, Geometry.segmentStepCount(100, 1))
+        end)
+
+        it("produces far fewer steps than the old 1px stepping for wide pens", function()
+            local dist = 300
+            local old_steps = math.ceil(dist)  -- previous behaviour
+            local new_steps = Geometry.segmentStepCount(dist, 12)
+            assert.is_true(new_steps < old_steps / 4)
+        end)
+    end)
+
 end)

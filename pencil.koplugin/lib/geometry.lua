@@ -59,6 +59,18 @@ function Geometry.transformForRotation(x, y, rotation, screen_width, screen_heig
     return x, y  -- fallback for unknown rotation
 end
 
+--- Number of interpolation steps to rasterize a segment of length `dist`
+--- with a pen of the given width. Steps by ~half the width so consecutive
+--- width×width squares overlap enough to leave no gaps, without painting
+--- every pixel ~width times over (which is what stepping by 1px does).
+-- @param dist segment length in pixels
+-- @param width pen width in pixels
+-- @return number step count (>= 1)
+function Geometry.segmentStepCount(dist, width)
+    local step = math.max(1, math.floor(width / 2))
+    return math.max(1, math.ceil(dist / step))
+end
+
 --- Compute the bounding box of a stroke from its points array.
 -- @param stroke Table with points array (each point has x, y)
 -- @return table {x0, y0, x1, y1} or nil if no points
