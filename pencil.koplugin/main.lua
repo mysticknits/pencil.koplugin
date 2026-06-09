@@ -4082,7 +4082,9 @@ function Pencil:strokeToSaveable(stroke)
         width = stroke.width,
         alpha = stroke.alpha,
         datetime = stroke.datetime,
-        points = stroke.points,
+        -- v4: points packed as a single "x y x y ..." string instead of an
+        -- array of {x=,y=} tables, so the serializer doesn't walk every point.
+        p = PencilGeometry.packPoints(stroke.points),
         color_name = stroke.color_name,  -- Save color name for persistence
     }
 end
@@ -4103,6 +4105,16 @@ function Pencil:strokeFromSaved(saved)
         end
     end
 
+    -- Points: v4 stores a packed "x y ..." string in `p`; v3 and earlier store
+    -- an array of {x=,y=} tables in `points`. Reconstruct the in-memory
+    -- {x=,y=} array either way.
+    local points
+    if saved.p ~= nil then
+        points = PencilGeometry.unpackPoints(saved.p)
+    else
+        points = saved.points or {}
+    end
+
     return {
         page = saved.page,
         tool = saved.tool,
@@ -4111,7 +4123,7 @@ function Pencil:strokeFromSaved(saved)
         color_name = saved.color_name,
         alpha = saved.alpha or tool_settings.alpha,
         datetime = saved.datetime,
-        points = saved.points,
+        points = points,
     }
 end
 
@@ -4147,11 +4159,12 @@ function Pencil:saveStrokes()
         saveable_strokes[i] = self:strokeToSaveable(stroke)
     end
 
-    -- Serialize and write. Version 3 marks files that may contain image_path /
-    -- image_rotation fields on annotation groups; older readers can ignore
-    -- those fields and continue to use the strokes directly.
+    -- Serialize and write. Version 4 packs each stroke's points into a single
+    -- "x y x y ..." string (field `p`) instead of an array of {x=,y=} tables,
+    -- cutting serialize time + file size on heavily-annotated documents. v3 and
+    -- earlier (points array) still load via strokeFromSaved's fallback.
     local data = {
-        version = 3,
+        version = 4,
         strokes = saveable_strokes,
         annotation_groups = self.annotation_groups,
     }

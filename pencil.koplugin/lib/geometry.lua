@@ -59,6 +59,46 @@ function Geometry.transformForRotation(x, y, rotation, screen_width, screen_heig
     return x, y  -- fallback for unknown rotation
 end
 
+--- Pack a points array ({x=,y=} list) into a compact "x y x y ..." string.
+-- Saving points as tiny tables makes the serializer emit a key + indentation per
+-- element (tens of thousands of them); packing to one string per stroke keeps
+-- the serializer cost proportional to stroke count, not point count.
+-- @param points array of {x=, y=} (may be nil/empty)
+-- @return string space-separated coordinates ("" when empty)
+function Geometry.packPoints(points)
+    if not points or #points == 0 then return "" end
+    local buf = {}
+    local n = 0
+    for i = 1, #points do
+        local p = points[i]
+        n = n + 1; buf[n] = p.x or 0
+        n = n + 1; buf[n] = p.y or 0
+    end
+    return table.concat(buf, " ")
+end
+
+--- Inverse of packPoints: parse "x y x y ..." back into a {x=,y=} array.
+-- Tolerates ints, floats and negatives. Returns {} for nil/empty input.
+-- @param str packed string from packPoints
+-- @return array of {x=, y=}
+function Geometry.unpackPoints(str)
+    local points = {}
+    if not str or str == "" then return points end
+    local nums, k = {}, 0
+    for tok in str:gmatch("%S+") do
+        k = k + 1
+        nums[k] = tonumber(tok)
+    end
+    local pi = 0
+    for i = 1, k - 1, 2 do
+        if nums[i] and nums[i + 1] then
+            pi = pi + 1
+            points[pi] = { x = nums[i], y = nums[i + 1] }
+        end
+    end
+    return points
+end
+
 --- Number of interpolation steps to rasterize a segment of length `dist`
 --- with a pen of the given width. Steps by ~half the width so consecutive
 --- width×width squares overlap enough to leave no gaps, without painting
