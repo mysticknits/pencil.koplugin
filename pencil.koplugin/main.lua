@@ -7,6 +7,7 @@ Enables freehand drawing and annotation with stylus on supported devices.
 
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
+local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
@@ -39,6 +40,35 @@ end
 local TOOL_PEN = "pen"
 local TOOL_HIGHLIGHTER = "highlighter"
 local TOOL_ERASER = "eraser"
+
+-- Native PDF ink-annotation support (issue #63).
+--
+-- We call koreader-base's MuPDF wrapper directly, so this feature patches NO
+-- core KOReader files. Everything the wrapper already exports
+-- (mupdf_pdf_create_annot / set_annot_color / set_annot_opacity) plus the base
+-- MuPDF cdefs come from require("ffi/mupdf"); we only add cdefs for the two ink
+-- setters that stock ffi/mupdf_h.lua doesn't declare. The single external
+-- requirement is that libwrap-mupdf.so actually exports those two symbols
+-- (ships once koreader-base gains ink support; see koreader-patches/).
+--
+-- InkAnnot is nil when unsupported, so the feature degrades gracefully.
+local InkAnnot = (function()
+    local ok, ffi = pcall(require, "ffi")
+    if not ok then return nil end
+    -- Pulls in fz_point / pdf_annot / pdf_page / PDF_ANNOT_INK and loads the lib.
+    if not pcall(require, "ffi/mupdf") then return nil end
+    pcall(ffi.cdef, [[
+        void *mupdf_pdf_set_annot_ink_list(fz_context *, pdf_annot *, int, const int *, const fz_point *);
+        void *mupdf_pdf_set_annot_border_width(fz_context *, pdf_annot *, float);
+        void *mupdf_pdf_update_annot(fz_context *, pdf_annot *);
+    ]])
+    local W_ok, W = pcall(ffi.loadlib, "wrap-mupdf")
+    if not W_ok or not W then return nil end
+    -- Probe: the symbol resolves lazily and errors if the lib lacks it.
+    if not pcall(function() return W.mupdf_pdf_set_annot_ink_list end) then return nil end
+    local ink_ok, ink_type = pcall(function() return ffi.C.PDF_ANNOT_INK end)
+    return { ffi = ffi, W = W, PDF_ANNOT_INK = ink_ok and ink_type or 15 }
+end)()
 
 -- Color picker trigger settings
 local COLOR_PICKER_DELAY_MS = 500  -- How long pen must be held still (milliseconds)
@@ -1266,6 +1296,19 @@ function Pencil:addToMainMenu(menu_items)
                                     timeout = 2,
                                 })
                             end
+                        end,
+                    },
+                    {
+                        text = _("Save annotations to PDF (this page)"),
+                        help_text = _("Write this page's pencil strokes (as ink annotations) and text highlights (as native highlight annotations) into the PDF file, so they travel with the file and are visible in any PDF reader. PDF documents only. Requires a KOReader build with MuPDF ink support (see the Pencil README)."),
+                        keep_menu_open = true,
+                        -- Always selectable for PDFs (it reports if there's
+                        -- nothing on the page), so it's never hidden/greyed.
+                        enabled_func = function()
+                            return self.ui.paging ~= nil
+                        end,
+                        callback = function()
+                            self:saveCurrentPageToPdf()
                         end,
                     },
                 },
@@ -3652,6 +3695,291 @@ function Pencil:clearAllStrokes()
     self:purgeOrphanImages()
 
     UIManager:setDirty(self.view, "ui")
+end
+
+-- ===================================================================
+-- Save annotations to PDF (issue #63)
+--
+-- Converts this page's pencil strokes into native PDF ink annotations
+-- (/Subtype /Ink) and writes them into the document file, so they are
+-- visible in any PDF reader. Manual, current-page only: it relies on
+-- KOReader's live ReaderView:screenToPageTransform, which is exact for
+-- the page currently on screen (off-screen pages have no laid-out
+-- transform). Strokes are stored in screen coordinates; we map each
+-- point to native page coordinates before handing it to MuPDF.
+--
+-- Requires a libwrap-mupdf.so that exports the ink setters (see the module
+-- InkAnnot block near the top, and koreader-patches/). Degrades gracefully:
+-- when InkAnnot is nil the menu action explains what's missing.
+-- ===================================================================
+
+-- Map a stroke's screen-space points to native page coordinates.
+-- transform_fn is injectable for testing; by default it uses the live
+-- ReaderView transform for the current on-screen page.
+function Pencil:strokeToPagePoints(stroke, transform_fn)
+    transform_fn = transform_fn or function(pt)
+        return self.view:screenToPageTransform({ x = pt.x, y = pt.y })
+    end
+    local points = {}
+    for _, p in ipairs(stroke.points or {}) do
+        local pp = transform_fn(p)
+        if pp then
+            points[#points + 1] = { x = pp.x, y = pp.y }
+        end
+    end
+    return points
+end
+
+-- Derive the ink annotation options (color/width/opacity) for a stroke.
+function Pencil:strokeToInkOpts(stroke)
+    local tool = stroke.tool or TOOL_PEN
+    local color = stroke.color or self.tool_settings[tool].color or Blitbuffer.COLOR_BLACK
+    local rgb = color:getColorRGB32()
+    return {
+        color = { r = rgb:getR(), g = rgb:getG(), b = rgb:getB() },
+        width = stroke.width or self.tool_settings[tool].width or 3,
+        -- Highlighter renders as a translucent wash; the pen is opaque.
+        opacity = (tool == TOOL_HIGHLIGHTER) and 0.4 or 1.0,
+    }
+end
+
+-- Create one native ink annotation on `pageno` from `strokes` (an array of
+-- point-lists in native page coordinates) with the given color/width/opacity.
+-- Talks to the MuPDF wrapper directly (mirrors PdfDocument:saveHighlight's
+-- open/mutate/close/mark-edited dance) so no core KOReader file is patched.
+-- Returns true on success, or the _checkIfWritable() reason for a read-only file.
+function Pencil:writeInkAnnotation(pageno, strokes, opts)
+    local doc = self.ui.document
+    local can_write = doc:_checkIfWritable()
+    if can_write ~= true then return can_write end
+
+    local n = #strokes
+    if n == 0 then return true end
+    local ffi = InkAnnot.ffi
+    local W = InkAnnot.W
+
+    -- counts[i] = points in stroke i; vertices = flattened fz_point[].
+    local counts = ffi.new("int[?]", n)
+    local total = 0
+    for i = 1, n do
+        counts[i - 1] = #strokes[i]
+        total = total + #strokes[i]
+    end
+    if total == 0 then return true end
+    local vertices = ffi.new("fz_point[?]", total)
+    local k = 0
+    for i = 1, n do
+        for j = 1, #strokes[i] do
+            vertices[k].x = strokes[i][j].x
+            vertices[k].y = strokes[i][j].y
+            k = k + 1
+        end
+    end
+
+    doc.is_edited = true
+    local page = doc._document:openPage(pageno)
+    local ctx = page.ctx
+    local pdf_page = ffi.cast("pdf_page*", page.page)
+    local annot = W.mupdf_pdf_create_annot(ctx, pdf_page, InkAnnot.PDF_ANNOT_INK)
+    if annot ~= nil then
+        W.mupdf_pdf_set_annot_ink_list(ctx, annot, n, counts, vertices)
+        local color = ffi.new("float[3]")
+        color[0] = opts.color.r / 255
+        color[1] = opts.color.g / 255
+        color[2] = opts.color.b / 255
+        W.mupdf_pdf_set_annot_color(ctx, annot, 3, color)
+        W.mupdf_pdf_set_annot_border_width(ctx, annot, opts.width or 1.0)
+        W.mupdf_pdf_set_annot_opacity(ctx, annot, opts.opacity or 1.0)
+        -- Synthesize the /Rect and /AP appearance stream, so the annotation
+        -- renders in any PDF viewer (not just KOReader's geometry renderer).
+        W.mupdf_pdf_update_annot(ctx, annot)
+    end
+    page:close()
+    doc:resetTileCacheValidity()
+    return annot ~= nil
+end
+
+-- Collect this page's KOReader text highlights (text selections made with a
+-- finger or the text-mode highlighter, stored in the sidecar) so they can be
+-- embedded into the PDF as native /Highlight annotations alongside the ink.
+function Pencil:getPageTextHighlights(pageno)
+    local result = {}
+    local annotation = self.ui and self.ui.annotation
+    if not (annotation and annotation.annotations) then return result end
+    for _, item in ipairs(annotation.annotations) do
+        -- A drawable text highlight has page boxes and a drawer style.
+        if item.pboxes and item.drawer and item.page == pageno then
+            result[#result + 1] = item
+        end
+    end
+    return result
+end
+
+-- Write a single KOReader text highlight into the PDF as a native markup
+-- annotation (/Highlight, /Underline or /StrikeOut per its drawer). Mirrors
+-- writeInkAnnotation: create -> set geometry/color -> pdf_update_annot on the
+-- same handle, which synthesizes /Rect + /AP so it renders in any PDF viewer.
+-- Returns true on success, or the _checkIfWritable() reason for a read-only file.
+function Pencil:writeHighlightAnnotation(pageno, item)
+    if not (item.pboxes and #item.pboxes > 0) then return true end
+    local doc = self.ui.document
+    local can_write = doc:_checkIfWritable()
+    if can_write ~= true then return can_write end
+
+    local ffi = InkAnnot.ffi
+    local W = InkAnnot.W
+    local C = ffi.C
+
+    -- pboxes {x,y,w,h} (page coords) -> fz_quad[], same mapping as KOReader's
+    -- _quadpointsFromPboxes (order: ll, lr, ul, ur).
+    local n = #item.pboxes
+    local quads = ffi.new("fz_quad[?]", n)
+    for i = 1, n do
+        local b = item.pboxes[i]
+        local q = quads[i - 1]
+        q.ll.x = b.x;             q.ll.y = b.y + b.h - 1
+        q.lr.x = b.x + b.w - 1;   q.lr.y = b.y + b.h - 1
+        q.ul.x = b.x;             q.ul.y = b.y
+        q.ur.x = b.x + b.w - 1;   q.ur.y = b.y
+    end
+
+    local annot_type, opacity = C.PDF_ANNOT_HIGHLIGHT, 0.5
+    if item.drawer == "underscore" then
+        annot_type, opacity = C.PDF_ANNOT_UNDERLINE, 1.0
+    elseif item.drawer == "strikeout" then
+        annot_type, opacity = C.PDF_ANNOT_STRIKE_OUT, 1.0
+    end
+
+    doc.is_edited = true
+    local page = doc._document:openPage(pageno)
+    local ctx = page.ctx
+    local pdf_page = ffi.cast("pdf_page*", page.page)
+    local annot = W.mupdf_pdf_create_annot(ctx, pdf_page, annot_type)
+    if annot ~= nil then
+        W.mupdf_pdf_set_annot_quad_points(ctx, annot, n, quads)
+        local color = ffi.new("float[3]")
+        local bb = item.color and Blitbuffer.colorFromName(item.color)
+        if bb then
+            local rgb = bb:getColorRGB32()
+            color[0] = rgb:getR() / 255
+            color[1] = rgb:getG() / 255
+            color[2] = rgb:getB() / 255
+        else
+            color[0], color[1], color[2] = 1.0, 1.0, 0.0  -- default yellow
+        end
+        W.mupdf_pdf_set_annot_color(ctx, annot, 3, color)
+        W.mupdf_pdf_set_annot_opacity(ctx, annot, opacity)
+        W.mupdf_pdf_update_annot(ctx, annot)  -- generate /Rect + /AP
+    end
+    page:close()
+    doc:resetTileCacheValidity()
+    return annot ~= nil
+end
+
+-- Write the current page's pencil strokes (as ink) and text highlights (as
+-- native /Highlight annotations) into the PDF file.
+function Pencil:saveCurrentPageToPdf()
+    if not self.ui.paging then
+        UIManager:show(InfoMessage:new{
+            text = _("Saving annotations to the file is only supported for PDF documents."),
+            timeout = 3,
+        })
+        return
+    end
+    if not InkAnnot then
+        UIManager:show(InfoMessage:new{
+            text = _("This KOReader build cannot write ink annotations. It needs a libwrap-mupdf with ink support (see the Pencil README / koreader-patches)."),
+        })
+        return
+    end
+
+    local page = self:getCurrentPage()
+    local strokes = self:getStrokesForPage(page)
+    local highlights = self:getPageTextHighlights(page)
+    if #strokes == 0 and #highlights == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("No annotations on this page to save."),
+            timeout = 2,
+        })
+        return
+    end
+
+    local saved_ink, saved_hl = 0, 0
+    local writable_fail = nil
+
+    -- Pencil strokes -> ink annotations (one per stroke, keeping color/width).
+    for _, stroke in ipairs(strokes) do
+        local points = self:strokeToPagePoints(stroke)
+        if #points >= 1 then
+            local opts = self:strokeToInkOpts(stroke)
+            local ok, res = pcall(function()
+                return self:writeInkAnnotation(page, { points }, opts)
+            end)
+            if ok and res == true then
+                saved_ink = saved_ink + 1
+            elseif ok then
+                writable_fail = res  -- read-only file
+            else
+                logger.warn("Pencil: writeInkAnnotation failed:", res)
+            end
+        end
+    end
+
+    -- Text highlights -> native markup annotations (with appearance streams).
+    for _, item in ipairs(highlights) do
+        local ok, res = pcall(function()
+            return self:writeHighlightAnnotation(page, item)
+        end)
+        if ok and res == true then
+            saved_hl = saved_hl + 1
+        elseif ok then
+            writable_fail = res  -- read-only file
+        else
+            logger.warn("Pencil: writeHighlightAnnotation failed:", res)
+        end
+    end
+
+    local saved = saved_ink + saved_hl
+    if saved == 0 then
+        UIManager:show(InfoMessage:new{
+            text = writable_fail
+                and _("The PDF file is not writable, so annotations can't be saved.")
+                or _("Failed to save annotations to the PDF."),
+            timeout = 3,
+        })
+        return
+    end
+
+    -- Persist the freshly created annotations to disk now.
+    local ok, err = pcall(function() self.ui.document:writeDocument() end)
+    if not ok then
+        logger.err("Pencil: writeDocument failed:", err)
+        UIManager:show(InfoMessage:new{
+            text = _("Could not write annotations to the PDF file."),
+            timeout = 3,
+        })
+        return
+    end
+    UIManager:setDirty(self.view, "ui")
+
+    -- Only the pencil ink is drawn by this plugin's overlay; offer to drop those
+    -- copies so they aren't drawn on top of the embedded ink. (Text highlights
+    -- are drawn by KOReader itself and are left untouched.)
+    if saved_ink > 0 then
+        UIManager:show(ConfirmBox:new{
+            text = T(_("Saved %1 pencil stroke(s) and %2 highlight(s) into the PDF file.\n\nRemove the pencil overlay copies for this page so they aren't drawn on top of the embedded ink?"), saved_ink, saved_hl),
+            ok_text = _("Remove overlay"),
+            cancel_text = _("Keep both"),
+            ok_callback = function()
+                self:clearPageStrokes()
+            end,
+        })
+    else
+        UIManager:show(InfoMessage:new{
+            text = T(_("Saved %1 highlight(s) into the PDF file."), saved_hl),
+            timeout = 3,
+        })
+    end
 end
 
 -- Render a line segment using rectangles (since BlitBuffer has no native line drawing)

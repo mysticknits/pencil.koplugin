@@ -80,10 +80,30 @@ When enabled, the plugin automatically groups your pencil strokes into logical a
 - Your pencil strokes and drawings are not affected — only the bookmarks are removed
 - Annotation groups are still tracked internally, so you won't lose any grouping data if you turn it back on
 
+### Save annotations to PDF
+
+Writes the **current page's** pencil strokes into the PDF file as native ink annotations
+(`/Subtype /Ink`), so they travel with the file and are visible/removable in any PDF reader —
+not just re-drawn by this plugin. **PDF documents only.**
+
+**To use:** Pencil menu > Experimental > Save annotations to PDF (this page)
+
+**Notes and limitations:**
+- **Current page only.** Conversion uses KOReader's live on-screen page transform, which is
+  exact only for the page you're viewing. As with the rest of the plugin, keep a consistent
+  (fixed) zoom — resizing after drawing will misplace annotations.
+- After saving, you're asked whether to remove the plugin's overlay copies for that page, so
+  the embedded annotation isn't drawn twice.
+- **Requires an ink-capable `libwrap-mupdf.so`.** KOReader's bundled MuPDF wrapper doesn't
+  export a setter for ink-annotation geometry. The plugin itself patches **no core KOReader
+  files** — it just needs a `libwrap-mupdf.so` that exports the two ink symbols. Drop in the
+  prebuilt library (or rebuild for your KOReader version) from
+  [`koreader-patches/`](koreader-patches/); without it the menu item explains what's missing
+  and does nothing to your file.
+
 ## Features In the Pipeline
 
-1. Export of annotations
-2. Handling changing canvas size
+1. Handling changing canvas size
 
 ## Acknowledgements
 
