@@ -3828,6 +3828,7 @@ function Pencil:writeInkAnnotation(pageno, strokes, opts)
         W.mupdf_pdf_update_annot(ctx, annot)
     end
     page:close()
+    if annot ~= nil then self._pdf_dirty = true end
     doc:resetTileCacheValidity()
     return annot ~= nil
 end
@@ -3905,8 +3906,37 @@ function Pencil:writeHighlightAnnotation(pageno, item)
         W.mupdf_pdf_update_annot(ctx, annot)  -- generate /Rect + /AP
     end
     page:close()
+    if annot ~= nil then self._pdf_dirty = true end
     doc:resetTileCacheValidity()
     return annot ~= nil
+end
+
+-- Persist the plugin's in-memory PDF edits (ink/highlights created or deleted
+-- this session) to disk with a SINGLE incremental writeDocument, mirroring how
+-- KOReader itself batches all annotation edits into one write on close.
+--
+-- Critically it then clears doc.is_edited, so KOReader's own PdfDocument:close
+-- does NOT issue a second writeDocument on the same document handle -- two
+-- stacked incremental saves corrupt the xref (MuPDF: "cannot find object").
+-- That single write also captures any in-memory highlight edits KOReader made
+-- (e.g. via "write highlights into PDF"), so nothing is lost.
+-- Returns true if a write happened.
+function Pencil:flushPdfEdits()
+    if not self._pdf_dirty then return false end
+    local doc = self.ui and self.ui.document
+    if not (doc and doc.writeDocument) then return false end
+    if not (doc._checkIfWritable and doc:_checkIfWritable() == true) then
+        return false
+    end
+    local ok, err = pcall(function() doc:writeDocument() end)
+    if not ok then
+        logger.err("Pencil: flushPdfEdits writeDocument failed:", err)
+        return false
+    end
+    self._pdf_dirty = false
+    doc.is_edited = false  -- prevent KOReader's close from writing again
+    logger.info("Pencil: flushed plugin PDF edits (single write)")
+    return true
 end
 
 -- Write the current page's pencil strokes (as ink) and text highlights (as
@@ -3942,18 +3972,25 @@ function Pencil:saveCurrentPageToPdf()
 
     -- Pencil strokes -> ink annotations (one per stroke, keeping color/width).
     for _, stroke in ipairs(strokes) do
-        local points = self:strokeToPagePoints(stroke)
-        if #points >= 1 then
-            local opts = self:strokeToInkOpts(stroke)
-            local ok, res = pcall(function()
-                return self:writeInkAnnotation(page, { points }, opts)
-            end)
-            if ok and res == true then
-                saved_ink = saved_ink + 1
-            elseif ok then
-                writable_fail = res  -- read-only file
-            else
-                logger.warn("Pencil: writeInkAnnotation failed:", res)
+        if not stroke.embedded then
+            local points = self:strokeToPagePoints(stroke)
+            if #points >= 1 then
+                local opts = self:strokeToInkOpts(stroke)
+                opts.annot_id = stroke.annot_id or self:nextAnnotId()
+                local ok, res = pcall(function()
+                    return self:writeInkAnnotation(page, { points }, opts)
+                end)
+                if ok and res == true then
+                    -- Tag + mark embedded, same as auto-save, so the two never
+                    -- create duplicate annotations for one stroke.
+                    stroke.embedded = true
+                    stroke.annot_id = opts.annot_id
+                    saved_ink = saved_ink + 1
+                elseif ok then
+                    writable_fail = res  -- read-only file
+                else
+                    logger.warn("Pencil: writeInkAnnotation failed:", res)
+                end
             end
         end
     end
@@ -3983,36 +4020,26 @@ function Pencil:saveCurrentPageToPdf()
         return
     end
 
-    -- Persist the freshly created annotations to disk now.
-    local ok, err = pcall(function() self.ui.document:writeDocument() end)
-    if not ok then
-        logger.err("Pencil: writeDocument failed:", err)
-        UIManager:show(InfoMessage:new{
-            text = _("Could not write annotations to the PDF file."),
-            timeout = 3,
-        })
-        return
-    end
+    -- The annotations are now in the in-memory document (visible immediately),
+    -- but the actual file write is DEFERRED to a single write when the book is
+    -- closed (see flushPdfEdits / onCloseDocument). Writing here as well would
+    -- stack a second incremental save on the close write and corrupt the xref.
+    -- Embedded strokes are auto-suppressed from the overlay (paintTo), so there's
+    -- no double-draw to clean up and no prompt to remove them.
     UIManager:setDirty(self.view, "ui")
 
-    -- Only the pencil ink is drawn by this plugin's overlay; offer to drop those
-    -- copies so they aren't drawn on top of the embedded ink. (Text highlights
-    -- are drawn by KOReader itself and are left untouched.)
-    if saved_ink > 0 then
-        UIManager:show(ConfirmBox:new{
-            text = T(_("Saved %1 pencil stroke(s) and %2 highlight(s) into the PDF file.\n\nRemove the pencil overlay copies for this page so they aren't drawn on top of the embedded ink?"), saved_ink, saved_hl),
-            ok_text = _("Remove overlay"),
-            cancel_text = _("Keep both"),
-            ok_callback = function()
-                self:clearPageStrokes()
-            end,
-        })
+    local msg
+    if saved_ink > 0 and saved_hl > 0 then
+        msg = T(_("Added %1 pencil stroke(s) and %2 highlight(s) to this page."), saved_ink, saved_hl)
+    elseif saved_ink > 0 then
+        msg = T(_("Added %1 pencil stroke(s) to this page."), saved_ink)
     else
-        UIManager:show(InfoMessage:new{
-            text = T(_("Saved %1 highlight(s) into the PDF file."), saved_hl),
-            timeout = 3,
-        })
+        msg = T(_("Added %1 highlight(s) to this page."), saved_hl)
     end
+    UIManager:show(InfoMessage:new{
+        text = msg .. "\n\n" .. _("They'll be written into the PDF file when you close the book."),
+        timeout = 3,
+    })
 end
 
 -- Generate a process-unique tag for an embedded ink annotation. Stored in the
@@ -4102,14 +4129,13 @@ function Pencil:deleteEmbeddedAnnotationsFor(strokes)
     end
 
     if deleted > 0 then
+        -- In-memory delete only; the disk write is deferred to flushPdfEdits()
+        -- on close (one write per session). The tile-cache reset makes the ink
+        -- disappear on screen immediately, rendered from the in-memory doc.
         doc.is_edited = true
-        local ok, err = pcall(function() doc:writeDocument() end)
-        if not ok then
-            logger.err("Pencil: writeDocument after erase failed:", err)
-            return 0
-        end
+        self._pdf_dirty = true
         doc:resetTileCacheValidity()
-        logger.info("Pencil: removed", deleted, "embedded ink annotation(s) via eraser")
+        logger.info("Pencil: removed", deleted, "embedded ink annotation(s) via eraser (deferred write)")
     end
 
     -- Drop the embedded state on every erased stroke that had one (even if its
@@ -4168,10 +4194,9 @@ function Pencil:autoSaveInkToPdf()
 
     if #just_embedded == 0 then return 0 end
 
-    -- Self-heal: on every page we just wrote to, drop any plugin-tagged ink
-    -- annotation that isn't claimed by a current stroke. This clears orphans /
-    -- duplicates left by an interrupted earlier session so the file's plugin
-    -- ink always mirrors the live stroke list.
+    -- Self-heal: on every page we just touched, drop any plugin-tagged ink
+    -- annotation that isn't claimed by a current stroke (orphans/duplicates
+    -- from an interrupted earlier session), so the file mirrors the live list.
     for pageno in pairs(touched_pages) do
         local keep_ids = {}
         for _, stroke in ipairs(self.strokes) do
@@ -4186,15 +4211,13 @@ function Pencil:autoSaveInkToPdf()
         end)
     end
 
-    local ok, err = pcall(function() doc:writeDocument() end)
-    if not ok then
-        logger.err("Pencil: autoSave writeDocument failed:", err)
-        -- Undo the flags on the strokes we embedded this pass so the next
-        -- close retries rather than silently dropping them.
-        for _, stroke in ipairs(just_embedded) do stroke.embedded = nil end
-        return 0
-    end
-    logger.info("Pencil: auto-saved", #just_embedded, "stroke(s) into the PDF on close")
+    -- NOTE: no writeDocument here. All mutations are in-memory; the single disk
+    -- write happens in flushPdfEdits() (called on close after this), matching
+    -- KOReader's own one-write-on-close model. Rollback of the embedded flags
+    -- on a failed write is handled by the caller (onCloseDocument).
+    self._pdf_dirty = true
+    self._auto_embedded_this_close = just_embedded
+    logger.info("Pencil: staged", #just_embedded, "stroke(s) for embedding on close")
     return #just_embedded
 end
 
@@ -4671,15 +4694,33 @@ function Pencil:onCloseDocument()
     -- Final bookmark sync before close
     self:syncAllBookmarks()
 
-    -- Auto-save pencil ink into the PDF file (opt-in). Must run while the
-    -- document is still open/writable; the resulting `embedded` flags are
-    -- persisted by the saveStrokes() below so re-opening never re-embeds.
+    -- Auto-save pencil ink into the PDF file (opt-in). This only stages the
+    -- annotations in memory; the actual disk write is the single flushPdfEdits()
+    -- below. Must run while the document is still open/writable.
     if self.auto_save_pdf then
-        local ok, embedded = pcall(function() return self:autoSaveInkToPdf() end)
+        local ok, err = pcall(function() self:autoSaveInkToPdf() end)
         if not ok then
-            logger.err("Pencil: autoSaveInkToPdf error:", embedded)
+            logger.err("Pencil: autoSaveInkToPdf error:", err)
         end
     end
+
+    -- Single, final write of any in-memory PDF edits the plugin made this
+    -- session (auto-saved ink, erased ink, manual per-page saves). One
+    -- incremental write, then is_edited is cleared so KOReader's own close
+    -- doesn't stack a second write (which corrupts the xref). Runs regardless
+    -- of the auto-save toggle, since the eraser/manual paths also set dirty.
+    local ok, ferr = pcall(function() self:flushPdfEdits() end)
+    if not ok then logger.err("Pencil: flushPdfEdits error:", ferr) end
+    -- flushPdfEdits clears _pdf_dirty on a successful write; if it's still set,
+    -- the write didn't happen, so un-embed the strokes we staged this close (the
+    -- sidecar must not claim they're in a file that never received them).
+    if self._pdf_dirty and self._auto_embedded_this_close then
+        for _, stroke in ipairs(self._auto_embedded_this_close) do
+            stroke.embedded = nil
+            stroke.annot_id = nil
+        end
+    end
+    self._auto_embedded_this_close = nil
 
     -- Always save strokes on close (even if empty, to clear any previous data)
     logger.info("Pencil: saving strokes on document close")
