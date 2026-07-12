@@ -93,9 +93,15 @@ not just re-drawn by this plugin. **PDF documents only.**
 - **Automatic on close:** Pencil menu > Experimental > *Auto-save pencil ink to PDF on close*.
   When enabled, every pencil stroke you've drawn (across all pages) is written into the PDF
   when you close the document. It runs once per session and only adds strokes that aren't
-  already in the file, so re-opening never duplicates them. Text highlights are **not**
-  auto-saved (KOReader keeps drawing its own copy of those, which would double a baked-in
-  highlight) — use the manual per-page action for highlights.
+  already in the file, so re-opening never duplicates them. Erasing an embedded stroke removes
+  its annotation from the PDF too.
+
+**Text highlights** are handled by KOReader itself, not this plugin's auto-save — KOReader
+draws its own copy of a highlight, so a plugin-embedded one would show doubled. To get text
+highlights into the PDF, enable KOReader's built-in feature: **top menu > Highlights > "Write
+highlights into PDF" > On** (long-press *On* to make it the default for all books). Use **"Write
+all highlights into PDF file"** in that same menu to push highlights you've already made. (The
+manual *Save annotations to PDF (this page)* action can still embed highlights on demand.)
 
 **Notes and limitations:**
 - **Fixed zoom.** Conversion uses KOReader's live on-screen page transform. Keep a consistent
