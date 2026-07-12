@@ -3965,8 +3965,21 @@ function Pencil:ensureHighlightAppearances()
     if not ok_types then return end
 
     local pages = {}
+    local hl_count = 0
     for _, item in ipairs(annotation.annotations) do
-        if item.drawer and item.pboxes and item.page then pages[item.page] = true end
+        if item.drawer and item.pboxes and item.page then
+            pages[item.page] = true
+            hl_count = hl_count + 1
+        end
+    end
+
+    -- Only (re)generate /AP when the highlight set has grown since we last did
+    -- it, so we don't rewrite the whole file on every close (which would bloat
+    -- the PDF with an incremental update each time). Track the count down too,
+    -- so deleting then re-adding a highlight still re-triggers.
+    if hl_count <= (self.hl_ap_count or 0) then
+        self.hl_ap_count = hl_count
+        return
     end
 
     local updated = 0
@@ -3992,6 +4005,7 @@ function Pencil:ensureHighlightAppearances()
         doc:resetTileCacheValidity()
         logger.info("Pencil: generated /AP for", updated, "highlight annotation(s)")
     end
+    self.hl_ap_count = hl_count
 end
 
 -- Write the current page's pencil strokes (as ink) and text highlights (as
@@ -4622,6 +4636,7 @@ function Pencil:loadStrokes()
             end
         end
 
+        self.hl_ap_count = data.hl_ap_count or 0
         self.strokes_loaded = true
         logger.info("Pencil: loaded", #self.strokes, "strokes from", filepath)
     else
@@ -4716,6 +4731,7 @@ function Pencil:saveStrokes()
         version = 3,
         strokes = saveable_strokes,
         annotation_groups = self.annotation_groups,
+        hl_ap_count = self.hl_ap_count,  -- highlights already given an /AP
     }
 
     local f, err = io.open(filepath, "w")
