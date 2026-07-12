@@ -2009,8 +2009,6 @@ end
 function Pencil:commitErase(deleted)
     if not deleted or #deleted == 0 then return end
     table.insert(self.undo_stack, { type = "delete", strokes = deleted })
-    -- Also remove any baked-in PDF annotations for erased strokes.
-    self:deleteEmbeddedAnnotationsFor(deleted)
     self:flushDirtyGroups()
     self:refreshDogear()
     self:saveStrokes()
@@ -4136,6 +4134,59 @@ function Pencil:flushPdfEdits()
     return true
 end
 
+-- KOReader's addMarkupAnnotation (used by its "write highlights into PDF"
+-- feature) does NOT synthesize an appearance stream, so the highlights it bakes
+-- into the file are invisible in desktop PDF viewers (which render only /AP);
+-- KOReader itself draws them from geometry, which is why they look fine on the
+-- device but vanish on a Mac. For every page that carries a KOReader text
+-- highlight, run pdf_update_annot on its markup annotations to generate the /AP.
+-- In-memory only (marks _pdf_dirty); the single close flush writes it out.
+function Pencil:ensureHighlightAppearances()
+    if not (self.ui and self.ui.paging and InkAnnot) then return end
+    local annotation = self.ui.annotation
+    if not (annotation and annotation.annotations) then return end
+    local doc = self.ui.document
+    if not (doc and doc._checkIfWritable and doc:_checkIfWritable() == true) then return end
+    local ffi = InkAnnot.ffi
+    local W = InkAnnot.W
+    local C = ffi.C
+
+    -- Only markup types get an /AP from update_annot; probe the enum once.
+    local ok_types, HL, UL, SO = pcall(function()
+        return C.PDF_ANNOT_HIGHLIGHT, C.PDF_ANNOT_UNDERLINE, C.PDF_ANNOT_STRIKE_OUT
+    end)
+    if not ok_types then return end
+
+    local pages = {}
+    for _, item in ipairs(annotation.annotations) do
+        if item.drawer and item.pboxes and item.page then pages[item.page] = true end
+    end
+
+    local updated = 0
+    for pageno in pairs(pages) do
+        pcall(function()
+            local page = doc._document:openPage(pageno)
+            local ctx = page.ctx
+            local annot = W.mupdf_pdf_first_annot(ctx, ffi.cast("pdf_page*", page.page))
+            while annot ~= nil do
+                local t = W.mupdf_pdf_annot_type(ctx, annot)
+                if t == HL or t == UL or t == SO then
+                    W.mupdf_pdf_update_annot(ctx, annot)
+                    updated = updated + 1
+                end
+                annot = W.mupdf_pdf_next_annot(ctx, annot)
+            end
+            page:close()
+        end)
+    end
+    if updated > 0 then
+        doc.is_edited = true
+        self._pdf_dirty = true
+        doc:resetTileCacheValidity()
+        logger.info("Pencil: generated /AP for", updated, "highlight annotation(s)")
+    end
+end
+
 -- Write the current page's pencil strokes (as ink) and text highlights (as
 -- native /Highlight annotations) into the PDF file.
 function Pencil:saveCurrentPageToPdf()
@@ -4546,6 +4597,13 @@ function Pencil:eraseAtPoint(x, y, page)
         if self.input_debug_mode then
             self:writeDebugLog(string.format("ERASE: deleted %d strokes", #deleted))
         end
+        -- Delete the baked-in PDF ink annotations for any embedded strokes we
+        -- just erased. Done HERE (the single choke point every eraser input
+        -- path funnels through) rather than at the various gesture-end sites,
+        -- so it works for the stylus-eraser, hardware-button and touch paths
+        -- alike. In-memory delete + tile refresh; the disk write is deferred to
+        -- flushPdfEdits() on close.
+        self:deleteEmbeddedAnnotationsFor(deleted)
         return deleted
     end
 
@@ -5031,6 +5089,12 @@ function Pencil:onCloseDocument()
             logger.err("Pencil: autoSaveInkToPdf error:", err)
         end
     end
+
+    -- Give KOReader's text highlights an appearance stream so they're visible in
+    -- desktop PDF viewers too (KOReader writes them without one). Staged only;
+    -- the flush below writes everything in one pass.
+    local hok, herr = pcall(function() self:ensureHighlightAppearances() end)
+    if not hok then logger.err("Pencil: ensureHighlightAppearances error:", herr) end
 
     -- Single, final write of any in-memory PDF edits the plugin made this
     -- session (auto-saved ink, erased ink, manual per-page saves). One
