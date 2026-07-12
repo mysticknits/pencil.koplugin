@@ -530,6 +530,8 @@ function Pencil:handleStylusSlot(input, slot)
                 self.erasing = false
                 if self.eraser_deleted and #self.eraser_deleted > 0 then
                     table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_deleted })
+                    -- Also remove any baked-in PDF annotations for erased strokes.
+                    self:deleteEmbeddedAnnotationsFor(self.eraser_deleted)
                     self:saveStrokes()
                 end
                 self.eraser_deleted = nil
@@ -1029,6 +1031,8 @@ function Pencil:loadSettings()
     self.experimental_pen_width = settings.experimental_pen_width or false
     self.experimental_color_picker = settings.experimental_color_picker or false
     self.experimental_text_highlight = settings.experimental_text_highlight or false
+    -- Auto-save pencil ink into the PDF file when the document is closed.
+    self.auto_save_pdf = settings.auto_save_pdf or false
     -- Load pen color by name and look up the actual color value
     local color_name = settings.pen_color_name
     if color_name then
@@ -1062,6 +1066,7 @@ function Pencil:saveSettings()
         experimental_pen_width = self.experimental_pen_width,
         experimental_color_picker = self.experimental_color_picker,
         experimental_text_highlight = self.experimental_text_highlight,
+        auto_save_pdf = self.auto_save_pdf,
         pen_color_name = self.tool_settings[TOOL_PEN].color_name,
         swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
         pen_width = self.tool_settings[TOOL_PEN].width,
@@ -1309,6 +1314,26 @@ function Pencil:addToMainMenu(menu_items)
                         end,
                         callback = function()
                             self:saveCurrentPageToPdf()
+                        end,
+                    },
+                    {
+                        text = _("Auto-save pencil ink to PDF on close"),
+                        help_text = _("When enabled, every pencil stroke you've drawn is written into the PDF file as a native ink annotation when you close the document, so your annotations travel with the file. Runs once per session (only new strokes are added). PDF documents only; requires a KOReader build with MuPDF ink support. Text highlights are not auto-saved — use the per-page action above for those."),
+                        enabled_func = function()
+                            return self.ui.paging ~= nil and InkAnnot ~= nil
+                        end,
+                        checked_func = function()
+                            return self.auto_save_pdf == true
+                        end,
+                        callback = function()
+                            self.auto_save_pdf = not self.auto_save_pdf
+                            self:saveSettings()
+                            UIManager:show(InfoMessage:new{
+                                text = self.auto_save_pdf
+                                    and _("Pencil ink will be saved into the PDF when you close the document.")
+                                    or _("Auto-save to PDF disabled."),
+                                timeout = 2,
+                            })
                         end,
                     },
                 },
@@ -2711,6 +2736,8 @@ function Pencil:onDrawPanRelease(ges)
         if self.eraser_deleted and #self.eraser_deleted > 0 then
             -- Add deleted strokes to undo stack
             table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_deleted })
+            -- Also remove any baked-in PDF annotations for erased strokes.
+            self:deleteEmbeddedAnnotationsFor(self.eraser_deleted)
             self:saveStrokes()
         end
         -- Always refresh screen after erasing to clear any visual artifacts
@@ -3790,6 +3817,12 @@ function Pencil:writeInkAnnotation(pageno, strokes, opts)
         W.mupdf_pdf_set_annot_color(ctx, annot, 3, color)
         W.mupdf_pdf_set_annot_border_width(ctx, annot, opts.width or 1.0)
         W.mupdf_pdf_set_annot_opacity(ctx, annot, opts.opacity or 1.0)
+        -- Tag the annotation so the eraser can find and delete this exact
+        -- stroke's annotation later (stored in /Contents). Only auto-save
+        -- passes an id; the manual per-page action leaves /Contents empty.
+        if opts.annot_id then
+            W.mupdf_pdf_set_annot_contents(ctx, annot, opts.annot_id)
+        end
         -- Synthesize the /Rect and /AP appearance stream, so the annotation
         -- renders in any PDF viewer (not just KOReader's geometry renderer).
         W.mupdf_pdf_update_annot(ctx, annot)
@@ -3980,6 +4013,144 @@ function Pencil:saveCurrentPageToPdf()
             timeout = 3,
         })
     end
+end
+
+-- Generate a process-unique tag for an embedded ink annotation. Stored in the
+-- annotation's /Contents and on the stroke, so the eraser can pair the two up.
+function Pencil:nextAnnotId()
+    self._annot_seq = (self._annot_seq or 0) + 1
+    return string.format("kop-ink-%d-%d-%d", os.time(), self._annot_seq, math.random(1000, 9999))
+end
+
+-- Delete the baked-in PDF ink annotations that belong to the given (just-erased)
+-- strokes, matching each stroke's annot_id against the annotation's /Contents.
+-- Writes the file once if anything was removed, and clears the strokes' embedded
+-- state so an undo restores them as ordinary redrawn overlay strokes rather than
+-- invisible orphans. Returns the number of annotations deleted.
+function Pencil:deleteEmbeddedAnnotationsFor(strokes)
+    if not (self.ui and self.ui.paging and InkAnnot) then return 0 end
+
+    -- Collect wanted ids grouped by page (only embedded strokes have them).
+    local wanted_by_page = {}
+    local any = false
+    for _, stroke in ipairs(strokes) do
+        if stroke.embedded and stroke.annot_id and stroke.page then
+            wanted_by_page[stroke.page] = wanted_by_page[stroke.page] or {}
+            wanted_by_page[stroke.page][stroke.annot_id] = true
+            any = true
+        end
+    end
+    if not any then return 0 end
+
+    local doc = self.ui.document
+    if not (doc and doc._checkIfWritable and doc:_checkIfWritable() == true) then
+        return 0
+    end
+    local ffi = InkAnnot.ffi
+    local W = InkAnnot.W
+
+    local deleted = 0
+    for pageno, wanted in pairs(wanted_by_page) do
+        local ok = pcall(function()
+            local page = doc._document:openPage(pageno)
+            local ctx = page.ctx
+            local pdf_page = ffi.cast("pdf_page*", page.page)
+            local annot = W.mupdf_pdf_first_annot(ctx, pdf_page)
+            while annot ~= nil do
+                -- Grab next before a possible delete unlinks the current one.
+                local next_annot = W.mupdf_pdf_next_annot(ctx, annot)
+                if W.mupdf_pdf_annot_type(ctx, annot) == InkAnnot.PDF_ANNOT_INK then
+                    local cptr = W.mupdf_pdf_annot_contents(ctx, annot)
+                    if cptr ~= nil and wanted[ffi.string(cptr)] then
+                        W.mupdf_pdf_delete_annot(ctx, pdf_page, annot)
+                        deleted = deleted + 1
+                    end
+                end
+                annot = next_annot
+            end
+            page:close()
+        end)
+        if not ok then
+            logger.warn("Pencil: deleteEmbeddedAnnotations failed on page", pageno)
+        end
+    end
+
+    if deleted > 0 then
+        doc.is_edited = true
+        local ok, err = pcall(function() doc:writeDocument() end)
+        if not ok then
+            logger.err("Pencil: writeDocument after erase failed:", err)
+            return 0
+        end
+        doc:resetTileCacheValidity()
+        logger.info("Pencil: removed", deleted, "embedded ink annotation(s) via eraser")
+    end
+
+    -- Drop the embedded state on every erased stroke that had one (even if its
+    -- annotation was already gone from the file): if the user undoes the erase
+    -- they should return as normal redrawn overlay strokes and get re-embedded
+    -- on the next close, never as invisible orphans.
+    for _, stroke in ipairs(strokes) do
+        if stroke.embedded or stroke.annot_id then
+            stroke.embedded = nil
+            stroke.annot_id = nil
+        end
+    end
+    return deleted
+end
+
+-- Silently embed every not-yet-embedded pencil stroke into the PDF as native
+-- ink annotations, then write the file once. Used by the "auto-save on close"
+-- option. Unlike the manual per-page action it:
+--   * covers all pages (relies on the plugin's fixed page-fit layout so the
+--     live screen->page transform maps each stroke's local coords correctly),
+--   * marks each embedded stroke so re-runs / re-opens never duplicate it,
+--   * shows no dialogs and does not offer to remove the overlay (embedded
+--     strokes stop being drawn by paintTo instead — see the `embedded` skip).
+-- Text highlights are intentionally left out (KOReader keeps drawing its own
+-- copy from the sidecar, which would double a baked-in /Highlight); those stay
+-- on the manual per-page action. Returns the number of strokes embedded.
+function Pencil:autoSaveInkToPdf()
+    if not (self.ui and self.ui.paging and InkAnnot) then return 0 end
+
+    local doc = self.ui.document
+    if not (doc and doc._checkIfWritable and doc:_checkIfWritable() == true) then
+        return 0
+    end
+
+    local just_embedded = {}
+    for _, stroke in ipairs(self.strokes) do
+        if not stroke.embedded and stroke.page then
+            local points = self:strokeToPagePoints(stroke)
+            if #points >= 1 then
+                local opts = self:strokeToInkOpts(stroke)
+                opts.annot_id = stroke.annot_id or self:nextAnnotId()
+                local ok, res = pcall(function()
+                    return self:writeInkAnnotation(stroke.page, { points }, opts)
+                end)
+                if ok and res == true then
+                    stroke.embedded = true
+                    stroke.annot_id = opts.annot_id
+                    just_embedded[#just_embedded + 1] = stroke
+                elseif not ok then
+                    logger.warn("Pencil: autoSave writeInkAnnotation failed:", res)
+                end
+            end
+        end
+    end
+
+    if #just_embedded == 0 then return 0 end
+
+    local ok, err = pcall(function() doc:writeDocument() end)
+    if not ok then
+        logger.err("Pencil: autoSave writeDocument failed:", err)
+        -- Undo the flags on the strokes we embedded this pass so the next
+        -- close retries rather than silently dropping them.
+        for _, stroke in ipairs(just_embedded) do stroke.embedded = nil end
+        return 0
+    end
+    logger.info("Pencil: auto-saved", #just_embedded, "stroke(s) into the PDF on close")
+    return #just_embedded
 end
 
 -- Render a line segment using rectangles (since BlitBuffer has no native line drawing)
@@ -4233,7 +4404,10 @@ function Pencil:paintTo(bb, x, y)
     for _, idx in ipairs(indices) do
         if not (stale_indices and stale_indices[idx]) then
             local stroke = self.strokes[idx]
-            if stroke then
+            -- Skip strokes already embedded into the PDF: MuPDF renders the
+            -- baked-in ink annotation, so drawing our overlay copy too would
+            -- double it (and it wouldn't rotate correctly).
+            if stroke and not stroke.embedded then
                 self:renderStroke(bb, stroke)
             end
         end
@@ -4338,6 +4512,8 @@ function Pencil:strokeToSaveable(stroke)
         datetime = stroke.datetime,
         points = stroke.points,
         color_name = stroke.color_name,  -- Save color name for persistence
+        embedded = stroke.embedded,      -- true once written into the PDF file
+        annot_id = stroke.annot_id,      -- tag of its PDF annotation (for the eraser)
     }
 end
 
@@ -4366,6 +4542,8 @@ function Pencil:strokeFromSaved(saved)
         alpha = saved.alpha or tool_settings.alpha,
         datetime = saved.datetime,
         points = saved.points,
+        embedded = saved.embedded,
+        annot_id = saved.annot_id,
     }
 end
 
@@ -4447,6 +4625,16 @@ function Pencil:onCloseDocument()
 
     -- Final bookmark sync before close
     self:syncAllBookmarks()
+
+    -- Auto-save pencil ink into the PDF file (opt-in). Must run while the
+    -- document is still open/writable; the resulting `embedded` flags are
+    -- persisted by the saveStrokes() below so re-opening never re-embeds.
+    if self.auto_save_pdf then
+        local ok, embedded = pcall(function() return self:autoSaveInkToPdf() end)
+        if not ok then
+            logger.err("Pencil: autoSaveInkToPdf error:", embedded)
+        end
+    end
 
     -- Always save strokes on close (even if empty, to clear any previous data)
     logger.info("Pencil: saving strokes on document close")
