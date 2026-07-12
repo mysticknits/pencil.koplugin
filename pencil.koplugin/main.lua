@@ -3982,6 +3982,7 @@ function Pencil:ensureHighlightAppearances()
         return
     end
 
+    local tmp = ffi.new("fz_quad[1]")
     local updated = 0
     for pageno in pairs(pages) do
         pcall(function()
@@ -3991,6 +3992,19 @@ function Pencil:ensureHighlightAppearances()
             while annot ~= nil do
                 local t = W.mupdf_pdf_annot_type(ctx, annot)
                 if t == HL or t == UL or t == SO then
+                    -- pdf_update_annot only synthesizes an /AP when the annotation
+                    -- is dirty. A highlight re-opened in a fresh page handle is
+                    -- clean, so re-set its quad points (identical geometry) to mark
+                    -- it dirty, then update_annot actually generates the appearance.
+                    local qn = W.mupdf_pdf_annot_quad_point_count(ctx, annot)
+                    if qn and qn > 0 then
+                        local quads = ffi.new("fz_quad[?]", qn)
+                        for i = 0, qn - 1 do
+                            W.mupdf_pdf_annot_quad_point(ctx, annot, i, tmp)
+                            quads[i] = tmp[0]
+                        end
+                        W.mupdf_pdf_set_annot_quad_points(ctx, annot, qn, quads)
+                    end
                     W.mupdf_pdf_update_annot(ctx, annot)
                     updated = updated + 1
                 end
