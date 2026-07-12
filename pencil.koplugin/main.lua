@@ -3949,18 +3949,27 @@ function Pencil:flushPdfEdits()
 end
 
 -- KOReader's addMarkupAnnotation (used by its "write highlights into PDF"
--- feature) does NOT synthesize an appearance stream, so the highlights it bakes
--- into the file are invisible in desktop PDF viewers (which render only /AP);
--- KOReader itself draws them from geometry, which is why they look fine on the
--- device but vanish on a Mac. For every page that carries a KOReader text
--- highlight, run pdf_update_annot on its markup annotations to generate the /AP.
--- In-memory only (marks _pdf_dirty); the single close flush writes it out.
+-- feature) does NOT synthesize an appearance stream, so a freshly created
+-- highlight is a "dirty" PDF annotation with no /AP. Desktop PDF viewers render
+-- only /AP, so those highlights are invisible on a Mac (KOReader itself draws
+-- them from geometry, which is why they look fine on the device).
+--
+-- We fix this by running pdf_update_annot on the markup annotations of every
+-- page that carries a KOReader highlight. MuPDF synthesizes an /AP ONLY for the
+-- dirty (newly created) annots and no-ops on ones that already have an
+-- appearance -- so we neither miss a new highlight nor rewrite/bloat the file
+-- for old ones. We only bother when KOReader recorded an annotation change this
+-- session (document.is_edited, set by saveHighlight/deleteHighlight when
+-- write-into-PDF is on); the single close flush then writes it out.
 function Pencil:ensureHighlightAppearances()
     if not (self.ui and self.ui.paging and InkAnnot) then return end
     local annotation = self.ui.annotation
     if not (annotation and annotation.annotations) then return end
     local doc = self.ui.document
     if not (doc and doc._checkIfWritable and doc:_checkIfWritable() == true) then return end
+    -- Nothing changed this session -> nothing to synthesize or rewrite. This is
+    -- what keeps us from appending an identical incremental update on every close.
+    if not doc.is_edited then return end
     local ffi = InkAnnot.ffi
     local W = InkAnnot.W
     local C = ffi.C
@@ -3972,25 +3981,11 @@ function Pencil:ensureHighlightAppearances()
     if not ok_types then return end
 
     local pages = {}
-    local hl_count = 0
     for _, item in ipairs(annotation.annotations) do
-        if item.drawer and item.pboxes and item.page then
-            pages[item.page] = true
-            hl_count = hl_count + 1
-        end
+        if item.drawer and item.page then pages[item.page] = true end
     end
 
-    -- Only (re)generate /AP when the highlight set has grown since we last did
-    -- it, so we don't rewrite the whole file on every close (which would bloat
-    -- the PDF with an incremental update each time). Track the count down too,
-    -- so deleting then re-adding a highlight still re-triggers.
-    if hl_count <= (self.hl_ap_count or 0) then
-        self.hl_ap_count = hl_count
-        return
-    end
-
-    local tmp = ffi.new("fz_quad[1]")
-    local updated = 0
+    local visited = 0
     for pageno in pairs(pages) do
         pcall(function()
             local page = doc._document:openPage(pageno)
@@ -3999,34 +3994,23 @@ function Pencil:ensureHighlightAppearances()
             while annot ~= nil do
                 local t = W.mupdf_pdf_annot_type(ctx, annot)
                 if t == HL or t == UL or t == SO then
-                    -- pdf_update_annot only synthesizes an /AP when the annotation
-                    -- is dirty. A highlight re-opened in a fresh page handle is
-                    -- clean, so re-set its quad points (identical geometry) to mark
-                    -- it dirty, then update_annot actually generates the appearance.
-                    local qn = W.mupdf_pdf_annot_quad_point_count(ctx, annot)
-                    if qn and qn > 0 then
-                        local quads = ffi.new("fz_quad[?]", qn)
-                        for i = 0, qn - 1 do
-                            W.mupdf_pdf_annot_quad_point(ctx, annot, i, tmp)
-                            quads[i] = tmp[0]
-                        end
-                        W.mupdf_pdf_set_annot_quad_points(ctx, annot, qn, quads)
-                    end
+                    -- Synthesizes /AP only for dirty (new this session) annots;
+                    -- a genuine no-op for highlights that already have one, so no
+                    -- force-dirtying and no per-close rewrite of unchanged annots.
                     W.mupdf_pdf_update_annot(ctx, annot)
-                    updated = updated + 1
+                    visited = visited + 1
                 end
                 annot = W.mupdf_pdf_next_annot(ctx, annot)
             end
             page:close()
         end)
     end
-    if updated > 0 then
-        doc.is_edited = true
-        self._pdf_dirty = true
-        doc:resetTileCacheValidity()
-        logger.info("Pencil: generated /AP for", updated, "highlight annotation(s)")
-    end
-    self.hl_ap_count = hl_count
+    -- We reached here only because is_edited was set (a highlight was added or
+    -- removed this session), so flush to persist it -- new highlights now carry
+    -- an /AP, and any deletion is written through our single close flush.
+    self._pdf_dirty = true
+    doc:resetTileCacheValidity()
+    logger.info("Pencil: refreshed appearance for", visited, "highlight annotation(s)")
 end
 
 -- Write the current page's pencil strokes (as ink) and text highlights (as
@@ -4657,7 +4641,6 @@ function Pencil:loadStrokes()
             end
         end
 
-        self.hl_ap_count = data.hl_ap_count or 0
         self.strokes_loaded = true
         logger.info("Pencil: loaded", #self.strokes, "strokes from", filepath)
     else
@@ -4752,7 +4735,6 @@ function Pencil:saveStrokes()
         version = 3,
         strokes = saveable_strokes,
         annotation_groups = self.annotation_groups,
-        hl_ap_count = self.hl_ap_count,  -- highlights already given an /AP
     }
 
     local f, err = io.open(filepath, "w")
