@@ -4022,21 +4022,51 @@ function Pencil:nextAnnotId()
     return string.format("kop-ink-%d-%d-%d", os.time(), self._annot_seq, math.random(1000, 9999))
 end
 
--- Delete the baked-in PDF ink annotations that belong to the given (just-erased)
--- strokes, matching each stroke's annot_id against the annotation's /Contents.
--- Writes the file once if anything was removed, and clears the strokes' embedded
--- state so an undo restores them as ordinary redrawn overlay strokes rather than
--- invisible orphans. Returns the number of annotations deleted.
+-- Tag prefix carried in each embedded ink annotation's /Contents. Lets us
+-- recognise (and only ever delete) annotations this plugin created.
+local INK_TAG_PREFIX = "kop-ink-"
+
+-- Delete every plugin-tagged ink annotation on the already-open pdf_page whose
+-- /Contents tag is NOT in keep_ids (a set of tags to preserve). Foreign ink
+-- (any annotation without our prefix) is never touched. Returns count deleted.
+function Pencil:_pruneInkAnnotsOnPage(ctx, pdf_page, keep_ids)
+    local ffi = InkAnnot.ffi
+    local W = InkAnnot.W
+    local deleted = 0
+    local annot = W.mupdf_pdf_first_annot(ctx, pdf_page)
+    while annot ~= nil do
+        -- Grab next before a possible delete unlinks the current one.
+        local next_annot = W.mupdf_pdf_next_annot(ctx, annot)
+        if W.mupdf_pdf_annot_type(ctx, annot) == InkAnnot.PDF_ANNOT_INK then
+            local cptr = W.mupdf_pdf_annot_contents(ctx, annot)
+            local tag = cptr ~= nil and ffi.string(cptr) or ""
+            if tag:sub(1, #INK_TAG_PREFIX) == INK_TAG_PREFIX and not keep_ids[tag] then
+                W.mupdf_pdf_delete_annot(ctx, pdf_page, annot)
+                deleted = deleted + 1
+            end
+        end
+        annot = next_annot
+    end
+    return deleted
+end
+
+-- Remove the baked-in ink annotations for the given (just-erased) strokes.
+-- Self-healing: on each affected page it keeps only the annotations claimed by
+-- strokes that are *still* present, and deletes every other plugin-tagged ink
+-- annotation on that page (so orphans/duplicates from earlier sessions get
+-- cleaned up too). Writes the file once if anything changed, and clears the
+-- erased strokes' embedded state so an undo restores them as normal overlay
+-- strokes rather than invisible orphans. Returns the number of annotations
+-- deleted.
 function Pencil:deleteEmbeddedAnnotationsFor(strokes)
     if not (self.ui and self.ui.paging and InkAnnot) then return 0 end
 
-    -- Collect wanted ids grouped by page (only embedded strokes have them).
-    local wanted_by_page = {}
+    -- Which pages had an embedded stroke erased?
+    local affected = {}
     local any = false
     for _, stroke in ipairs(strokes) do
-        if stroke.embedded and stroke.annot_id and stroke.page then
-            wanted_by_page[stroke.page] = wanted_by_page[stroke.page] or {}
-            wanted_by_page[stroke.page][stroke.annot_id] = true
+        if stroke.embedded and stroke.page then
+            affected[stroke.page] = true
             any = true
         end
     end
@@ -4047,31 +4077,27 @@ function Pencil:deleteEmbeddedAnnotationsFor(strokes)
         return 0
     end
     local ffi = InkAnnot.ffi
-    local W = InkAnnot.W
 
+    -- For each affected page, the tags we must keep = annot_ids of embedded
+    -- strokes still in the live list on that page.
     local deleted = 0
-    for pageno, wanted in pairs(wanted_by_page) do
-        local ok = pcall(function()
-            local page = doc._document:openPage(pageno)
-            local ctx = page.ctx
-            local pdf_page = ffi.cast("pdf_page*", page.page)
-            local annot = W.mupdf_pdf_first_annot(ctx, pdf_page)
-            while annot ~= nil do
-                -- Grab next before a possible delete unlinks the current one.
-                local next_annot = W.mupdf_pdf_next_annot(ctx, annot)
-                if W.mupdf_pdf_annot_type(ctx, annot) == InkAnnot.PDF_ANNOT_INK then
-                    local cptr = W.mupdf_pdf_annot_contents(ctx, annot)
-                    if cptr ~= nil and wanted[ffi.string(cptr)] then
-                        W.mupdf_pdf_delete_annot(ctx, pdf_page, annot)
-                        deleted = deleted + 1
-                    end
-                end
-                annot = next_annot
+    for pageno in pairs(affected) do
+        local keep_ids = {}
+        for _, stroke in ipairs(self.strokes) do
+            if stroke.page == pageno and stroke.embedded and stroke.annot_id then
+                keep_ids[stroke.annot_id] = true
             end
+        end
+        local ok, res = pcall(function()
+            local page = doc._document:openPage(pageno)
+            local n = self:_pruneInkAnnotsOnPage(page.ctx, ffi.cast("pdf_page*", page.page), keep_ids)
             page:close()
+            return n
         end)
-        if not ok then
-            logger.warn("Pencil: deleteEmbeddedAnnotations failed on page", pageno)
+        if ok then
+            deleted = deleted + res
+        else
+            logger.warn("Pencil: prune ink failed on page", pageno, res)
         end
     end
 
@@ -4087,9 +4113,8 @@ function Pencil:deleteEmbeddedAnnotationsFor(strokes)
     end
 
     -- Drop the embedded state on every erased stroke that had one (even if its
-    -- annotation was already gone from the file): if the user undoes the erase
-    -- they should return as normal redrawn overlay strokes and get re-embedded
-    -- on the next close, never as invisible orphans.
+    -- annotation was already gone): an undo should bring it back as a normal
+    -- redrawn overlay stroke that re-embeds cleanly on the next close.
     for _, stroke in ipairs(strokes) do
         if stroke.embedded or stroke.annot_id then
             stroke.embedded = nil
@@ -4119,6 +4144,7 @@ function Pencil:autoSaveInkToPdf()
     end
 
     local just_embedded = {}
+    local touched_pages = {}
     for _, stroke in ipairs(self.strokes) do
         if not stroke.embedded and stroke.page then
             local points = self:strokeToPagePoints(stroke)
@@ -4132,6 +4158,7 @@ function Pencil:autoSaveInkToPdf()
                     stroke.embedded = true
                     stroke.annot_id = opts.annot_id
                     just_embedded[#just_embedded + 1] = stroke
+                    touched_pages[stroke.page] = true
                 elseif not ok then
                     logger.warn("Pencil: autoSave writeInkAnnotation failed:", res)
                 end
@@ -4140,6 +4167,24 @@ function Pencil:autoSaveInkToPdf()
     end
 
     if #just_embedded == 0 then return 0 end
+
+    -- Self-heal: on every page we just wrote to, drop any plugin-tagged ink
+    -- annotation that isn't claimed by a current stroke. This clears orphans /
+    -- duplicates left by an interrupted earlier session so the file's plugin
+    -- ink always mirrors the live stroke list.
+    for pageno in pairs(touched_pages) do
+        local keep_ids = {}
+        for _, stroke in ipairs(self.strokes) do
+            if stroke.page == pageno and stroke.embedded and stroke.annot_id then
+                keep_ids[stroke.annot_id] = true
+            end
+        end
+        pcall(function()
+            local page = doc._document:openPage(pageno)
+            self:_pruneInkAnnotsOnPage(page.ctx, InkAnnot.ffi.cast("pdf_page*", page.page), keep_ids)
+            page:close()
+        end)
+    end
 
     local ok, err = pcall(function() doc:writeDocument() end)
     if not ok then
