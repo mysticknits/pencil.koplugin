@@ -955,11 +955,18 @@ end
 function Pencil:eraseHighlightAtScreenPos(screen_x, screen_y)
     local index = self:findHighlightAtScreenPos(screen_x, screen_y)
     if not index then return false end
-    if not (self.ui and self.ui.bookmark and self.ui.bookmark.removeItemByIndex) then
+    -- Use ReaderHighlight:deleteHighlight, not bookmark:removeItemByIndex.
+    -- The latter only drops the highlight from KOReader's list; the former also
+    -- removes it from the PDF (via writePdfAnnotation "delete") when write-into-
+    -- PDF is on -- otherwise MuPDF keeps rendering the baked annotation and the
+    -- highlight never disappears. The PDF mutation is in-memory; our close
+    -- flush writes it out (mark dirty so it does).
+    if not (self.ui and self.ui.highlight and self.ui.highlight.deleteHighlight) then
         return false
     end
-    local ok = pcall(self.ui.bookmark.removeItemByIndex, self.ui.bookmark, index)
+    local ok = pcall(self.ui.highlight.deleteHighlight, self.ui.highlight, index)
     if ok then
+        self._pdf_dirty = true
         UIManager:setDirty(self.ui.dialog or self.ui.view, "ui")
     end
     return ok
