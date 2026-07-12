@@ -4220,11 +4220,18 @@ function Pencil:deleteEmbeddedAnnotationsFor(strokes)
 
     if deleted > 0 then
         -- In-memory delete only; the disk write is deferred to flushPdfEdits()
-        -- on close (one write per session). The tile-cache reset makes the ink
-        -- disappear on screen immediately, rendered from the in-memory doc.
+        -- on close (one write per session).
         doc.is_edited = true
         self._pdf_dirty = true
         doc:resetTileCacheValidity()
+        -- The erased ink is a baked PDF annotation, so its pixels live in the
+        -- rendered page tile, not our overlay. The eraser gesture's own
+        -- refreshFast only repaints the overlay with a fast waveform and leaves
+        -- the baked ink ghosting on screen (which looks like "erase did
+        -- nothing"). Schedule a proper "ui" refresh -- like KOReader's own
+        -- deleteHighlight -- so the page tile is regenerated from the now-pruned
+        -- in-memory doc and the ink actually disappears without a page turn.
+        UIManager:setDirty(self.ui.dialog or self.ui.view, "ui")
         logger.info("Pencil: removed", deleted, "embedded ink annotation(s) via eraser (deferred write)")
     end
 
