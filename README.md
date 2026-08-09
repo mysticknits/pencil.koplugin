@@ -115,12 +115,12 @@ manual *Save annotations to PDF (this page)* action can still embed highlights o
   annotation from the PDF too (matched via a small tag stored in the annotation's `/Contents`)
   and re-saves the file; undo brings the stroke back as a normal overlay stroke. Each erase
   that touches embedded ink writes the file once.
-- **Requires an ink-capable `libwrap-mupdf.so`.** KOReader's bundled MuPDF wrapper doesn't
-  export a setter for ink-annotation geometry. The plugin itself patches **no core KOReader
-  files** — it just needs a `libwrap-mupdf.so` that exports the two ink symbols. Drop in the
-  prebuilt library (or rebuild for your KOReader version) from
-  [`koreader-patches/`](koreader-patches/); without it the menu item explains what's missing
-  and does nothing to your file.
+- **Requires KOReader 2026.07 or newer.** Writing ink needs MuPDF ink symbols that
+  koreader-base only exports since
+  [koreader-base#2444](https://github.com/koreader/koreader-base/pull/2444), shipped in
+  KOReader 2026.07. Nothing extra to install on those builds, and the plugin patches **no
+  core KOReader files**. On older builds the feature degrades gracefully: the menu item
+  explains what's missing and does nothing to your file.
 
 ## Features In the Pipeline
 

@@ -44,14 +44,15 @@ local TOOL_ERASER = "eraser"
 -- Native PDF ink-annotation support (issue #63).
 --
 -- We call koreader-base's MuPDF wrapper directly, so this feature patches NO
--- core KOReader files. Everything the wrapper already exports
--- (mupdf_pdf_create_annot / set_annot_color / set_annot_opacity) plus the base
--- MuPDF cdefs come from require("ffi/mupdf"); we only add cdefs for the two ink
--- setters that stock ffi/mupdf_h.lua doesn't declare. The single external
--- requirement is that libwrap-mupdf.so actually exports those two symbols
--- (ships once koreader-base gains ink support; see koreader-patches/).
+-- core KOReader files. Everything we need comes from require("ffi/mupdf"):
+-- koreader-base exports the ink setters as of koreader/koreader-base#2444,
+-- shipped in KOReader 2026.07. The local cdefs below are a fallback for builds
+-- whose stock ffi/mupdf_h.lua predates that -- on 2026.07+ ffi/mupdf declares
+-- these symbols first and LuaJIT rejects our (pcall'd) redefinition, which is
+-- fine: the stock declarations are the ones we then call.
 --
--- InkAnnot is nil when unsupported, so the feature degrades gracefully.
+-- InkAnnot is nil when the symbols are absent, so on older KOReader builds the
+-- feature degrades gracefully instead of erroring.
 local InkAnnot = (function()
     local ok, ffi = pcall(require, "ffi")
     if not ok then return nil end
@@ -3744,9 +3745,9 @@ end
 -- transform). Strokes are stored in screen coordinates; we map each
 -- point to native page coordinates before handing it to MuPDF.
 --
--- Requires a libwrap-mupdf.so that exports the ink setters (see the module
--- InkAnnot block near the top, and koreader-patches/). Degrades gracefully:
--- when InkAnnot is nil the menu action explains what's missing.
+-- Requires KOReader 2026.07+ for the ink setters (see the module InkAnnot
+-- block near the top). Degrades gracefully: when InkAnnot is nil the menu
+-- action explains what's missing.
 -- ===================================================================
 
 -- Map a stroke's screen-space points to native page coordinates.
@@ -3948,11 +3949,17 @@ function Pencil:flushPdfEdits()
     return true
 end
 
--- KOReader's addMarkupAnnotation (used by its "write highlights into PDF"
--- feature) does NOT synthesize an appearance stream, so a freshly created
--- highlight is a "dirty" PDF annotation with no /AP. Desktop PDF viewers render
--- only /AP, so those highlights are invisible on a Mac (KOReader itself draws
--- them from geometry, which is why they look fine on the device).
+-- Older KOReader builds' addMarkupAnnotation (used by the "write highlights
+-- into PDF" feature) did NOT synthesize an appearance stream, so a freshly
+-- created highlight was a "dirty" PDF annotation with no /AP. Desktop PDF
+-- viewers render only /AP, so those highlights were invisible on a Mac
+-- (KOReader draws them from geometry, which is why they looked fine on device).
+--
+-- koreader/koreader-base#2457 (KOReader 2026.07+) makes addMarkupAnnotation
+-- call pdf_update_annot itself, so highlights created there already carry an
+-- /AP and this pass is a no-op in effect. We keep it for highlights made on
+-- older builds and for files highlighted before upgrading, which still have
+-- /AP-less markup annotations that only get fixed on the next change.
 --
 -- We fix this by running pdf_update_annot on the markup annotations of every
 -- page that carries a KOReader highlight. MuPDF synthesizes an /AP ONLY for the
@@ -4041,7 +4048,7 @@ function Pencil:saveCurrentPageToPdf()
     end
     if not InkAnnot then
         UIManager:show(InfoMessage:new{
-            text = _("This KOReader build cannot write ink annotations. It needs a libwrap-mupdf with ink support (see the Pencil README / koreader-patches)."),
+            text = _("This KOReader build cannot write ink annotations. Update to KOReader 2026.07 or newer."),
         })
         return
     end
