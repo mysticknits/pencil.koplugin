@@ -88,7 +88,7 @@ local Pencil = InputContainer:extend{
     pen_y = 0,
 
     last_refresh_time = 0,
-    refresh_interval_ms = 16,  -- Refresh at most every 16ms during drawing (~60fps)
+    refresh_interval_ms = 50,  -- Refresh at most every 50ms during drawing (matches "a2" e-ink waveform timing)
     dirty_region = nil,  -- Accumulated dirty region for batch refresh
 
     -- Delayed refresh - only refresh after user stops writing
@@ -482,10 +482,13 @@ function Pencil:handleStylusSlot(input, slot)
                     for _, stroke in ipairs(deleted) do
                         table.insert(self.eraser_deleted, stroke)
                     end
-                    -- Immediately repaint view and our strokes overlay, then refresh
+                    -- Immediately repaint view and our strokes overlay, then refresh.
+                    -- Use the fast waveform here too (matches the hardware-eraser-end
+                    -- path above): a full-screen "ui" refresh on every erased point
+                    -- was the same kind of overload that caused pen lag.
                     self.view:paintTo(Screen.bb, 0, 0)
                     self:paintTo(Screen.bb, 0, 0)
-                    Screen:refreshUI(0, 0, Screen:getWidth(), Screen:getHeight())
+                    Screen:refreshFast(0, 0, Screen:getWidth(), Screen:getHeight())
                     if self.input_debug_mode then
                         self:writeDebugLog(string.format("ERASED %d strokes at (%d, %d)", #deleted, x, y))
                     end
@@ -699,8 +702,16 @@ function Pencil:addRawPoint(x, y)
             local ry = math.max(0, math.floor(r.y))
             local rw = math.min(Screen:getWidth() - rx, math.ceil(r.w))
             local rh = math.min(Screen:getHeight() - ry, math.ceil(r.h))
-            -- Use UI refresh mode for proper color rendering on color e-ink
-            Screen:refreshUI(rx, ry, rw, rh)
+            -- "a2" is the fastest e-ink waveform (pure black/white, no grays),
+            -- normally used for things like keyboard input where responsiveness
+            -- matters more than tonal accuracy. It's a step faster than "fast".
+            -- Trade-off: colored/gray ink (highlighter, colored pens) may look
+            -- coarser than its real color WHILE actively drawing. This is
+            -- cosmetic only - scheduleDelayedRefresh() below repaints with
+            -- "fast" once the pen stops, and the stored stroke color/points are
+            -- never touched. If this look bothers you, change refreshA2 back
+            -- to refreshFast here.
+            Screen:refreshA2(rx, ry, rw, rh)
             self.dirty_region = nil
         end
     end
@@ -2589,7 +2600,7 @@ function Pencil:onDrawPan(ges)
                 table.insert(self.eraser_deleted, stroke)
             end
             self.view:paintTo(Screen.bb, 0, 0)
-            Screen:refreshUI()
+            Screen:refreshFast()
         end
         return true
     end
