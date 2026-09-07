@@ -3961,13 +3961,22 @@ function Pencil:strokeToPagePoints(stroke, transform_fn)
 end
 
 -- Derive the ink annotation options (color/width/opacity) for a stroke.
+-- Stroke widths are stored in screen pixels, but MuPDF's border width is in
+-- native page units, so it needs the same zoom division the points get from
+-- screenToPageTransform. (MuPDF's ink border width is the full line width,
+-- centered on the path, so no extra halving is needed.)
 function Pencil:strokeToInkOpts(stroke)
     local tool = stroke.tool or TOOL_PEN
     local color = stroke.color or self.tool_settings[tool].color or Blitbuffer.COLOR_BLACK
     local rgb = color:getColorRGB32()
+    local width = stroke.width or self.tool_settings[tool].width or 3
+    local zoom = self.view and self.view.state and self.view.state.zoom
+    if zoom and zoom > 0 then
+        width = width / zoom
+    end
     return {
         color = { r = rgb:getR(), g = rgb:getG(), b = rgb:getB() },
-        width = stroke.width or self.tool_settings[tool].width or 3,
+        width = width,
         -- Highlighter renders as a translucent wash; the pen is opaque.
         opacity = (tool == TOOL_HIGHLIGHTER) and 0.4 or 1.0,
     }

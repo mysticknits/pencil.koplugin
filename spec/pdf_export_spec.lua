@@ -52,9 +52,14 @@ local function createMockPencil()
         local tool = stroke.tool or TOOL_PEN
         local color = stroke.color or self.tool_settings[tool].color
         local rgb = color:getColorRGB32()
+        local width = stroke.width or self.tool_settings[tool].width or 3
+        local zoom = self.view and self.view.state and self.view.state.zoom
+        if zoom and zoom > 0 then
+            width = width / zoom
+        end
         return {
             color = { r = rgb:getR(), g = rgb:getG(), b = rgb:getB() },
-            width = stroke.width or self.tool_settings[tool].width or 3,
+            width = width,
             opacity = (tool == TOOL_HIGHLIGHTER) and 0.4 or 1.0,
         }
     end
@@ -136,6 +141,20 @@ describe("strokeToInkOpts", function()
         local opts = pencil:strokeToInkOpts({ tool = TOOL_PEN })
         assert.equals(3, opts.width)              -- tool_settings.pen.width
         assert.same({ r = 0, g = 0, b = 0 }, opts.color)  -- tool_settings.pen.color
+    end)
+
+    it("scales the width from screen pixels to page units by the zoom", function()
+        local pencil = createMockPencil()
+        pencil.view = { state = { zoom = 2 } }
+        local opts = pencil:strokeToInkOpts({ tool = TOOL_PEN, width = 6 })
+        assert.equals(3, opts.width)
+    end)
+
+    it("leaves the width alone when the zoom is missing or degenerate", function()
+        local pencil = createMockPencil()
+        assert.equals(6, pencil:strokeToInkOpts({ tool = TOOL_PEN, width = 6 }).width)
+        pencil.view = { state = { zoom = 0 } }
+        assert.equals(6, pencil:strokeToInkOpts({ tool = TOOL_PEN, width = 6 }).width)
     end)
 
     it("defaults to the pen tool when tool is unset", function()
