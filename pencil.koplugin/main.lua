@@ -419,6 +419,9 @@ function Pencil:handleStylusSlot(input, slot)
     if self.experimental_text_highlight
             and (slot.tool == TOOL_TYPE_HIGHLIGHTER or self.highlighting) then
         local current_slot_id = slot.id or -1
+        -- Mark the side button as used so its release isn't treated as a
+        -- quick press (which would toggle to the eraser).
+        self.side_button_used_for_highlight = true
         if current_slot_id >= 0 and not self.highlighting then
             self:startTextHighlight(slot.x or 0, slot.y or 0)
         elseif current_slot_id >= 0 and self.highlighting then
