@@ -20,7 +20,7 @@ end
 local refreshes = {}
 
 local screen = {
-    bb = {},
+    bb = { paintRectRGB32 = function() end, },
     night_mode = false,
     getWidth = function() return 1264 end,
     getHeight = function() return 1680 end,
@@ -33,6 +33,9 @@ local stubs = {
         __index = function() return function() return true end end,
     }),
     ["ui/uimanager"] = setmetatable({}, { __index = function() return function() end end }),
+        ["ui/time"] = {
+            now = function() return 0 end,
+            to_ms = function(t) return t end,},
     ["ui/widget/container/inputcontainer"] = {
         -- No stub fallback: unset fields must read as nil, as in KOReader.
         extend = function(_, o) return o or {} end,
@@ -43,7 +46,8 @@ local stubs = {
 
 local function load_pencil()
     table.insert(loaders, 2, function(name)
-        if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
+                     if name == "pencilinput" then return function() return dofile("pencil.koplugin/pencilinput.lua") end end
+                     if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")

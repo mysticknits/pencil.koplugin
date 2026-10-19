@@ -75,6 +75,7 @@ local stubs = {
 
 local function load_pencil()
     table.insert(loaders, 2, function(name)
+                     if name == "pencilinput" then return function() return dofile("pencil.koplugin/pencilinput.lua") end end
                      if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" or name == "lib/pencilnotes" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
