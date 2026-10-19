@@ -13,10 +13,9 @@ local PencilGeometry = require("lib/geometry")
 local PencilTool = require("lib/penciltool")
 local PencilStrokes = require("lib/pencilstrokes")
 local PencilNotes = require("lib/pencilnotes")
+local PencilLasso = require("lib/pencillasso")
 local Screen = Device.screen
-local Font = require("ui/font")
 local InfoMessage = require("ui/widget/infomessage")
-local TextWidget = require("ui/widget/textwidget")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local NetworkMgr = require("ui/network/manager")
 local MyScript = require("lib/myscript")
@@ -202,6 +201,7 @@ function Pencil:init()
     -- Tool selection, per-tool settings, eraser and highlight mode state
     self.tool = PencilTool:new()
     self.notes_feature = PencilNotes:new{ plugin = self }
+    self.lasso_feature = PencilLasso:new{ plugin = self }
 
     -- Calculate gray value from highlight_lighten_factor setting
     local lighten_factor = G_reader_settings:readSetting("highlight_lighten_factor") or 0.2
@@ -700,8 +700,8 @@ function Pencil:handleStylusSlot(input, slot)
         return true  -- Dominate: remove from gesture detection
     end
 
-    if self.lasso then
-        return self:handleLassoSlot(slot)
+    if self.lasso_feature and self.lasso_feature:isActive() then
+        return self.lasso_feature:handleStylus(slot)
     end
 
     -- Handle pen/highlighter mode
@@ -997,7 +997,7 @@ function Pencil:checkUnderlineHold()
     -- The ink was only a gesture: drop it and repaint where it was.
     self.current_stroke = nil
     self.dirty_region = nil
-    self.view:paintTo(Screen.bb)
+    self.view:paintTo(Screen.bb, 0, 0)
     self:paintTo(Screen.bb)
     local pad = (stroke.width or 3) + 4
     local sw, sh = Screen:getWidth(), Screen:getHeight()
@@ -2077,302 +2077,13 @@ function Pencil:runHoldMenuAction(action, x, y)
     elseif action == "redo" then
         self:redoLastStroke()
     elseif action == "lasso" then
-        self:startLasso()
+        self.lasso_feature:start()
     elseif action == "note" then
         self.notes_feature:openAt(x, y)
     end
 end
 
--- Lasso: select strokes by circling them, then delete or drag them.
--- Phases: "armed" (waiting for the pen), "drawing" (path being drawn),
--- "selected" (buttons + selection box shown), "moving" (dragging).
--- The selection box and buttons are painted on the page by paintTo and
--- hit-tested here, so pen input keeps coming to the plugin (an overlay
--- widget would route the pen to KOReader's gestures instead).
-
-local LASSO_MIN_RATIO = 0.6       -- Share of a stroke's points that must be inside
-local LASSO_BOX_MARGIN = 8        -- Padding around the selection box
-local LASSO_PREVIEW_MS = 40       -- Min interval between drag previews
-
-function Pencil:startLasso()
-    self.lasso = { phase = "armed" }
-end
-
--- Drop lasso state (and the drag snapshot) without repainting.
-function Pencil:clearLasso()
-    local lasso = self.lasso
-    if not lasso then return end
-    if lasso.snapshot then
-        lasso.snapshot:free()
-        lasso.snapshot = nil
-    end
-    self.lasso = nil
-end
-
-function Pencil:cancelLasso()
-    if not self.lasso then return end
-    self:clearLasso()
-    self:repaintReader()
-end
-
--- Returns true while the lasso owns pen input.
-function Pencil:isLassoActive()
-    return self.lasso ~= nil
-end
-
-function Pencil:handleLassoSlot(slot)
-    local lasso = self.lasso
-    local raw_x = slot.x or self.pen_x or 0
-    local raw_y = slot.y or self.pen_y or 0
-    local x, y = self:transformCoordinates(raw_x, raw_y)
-    local down = slot.id ~= nil and slot.id >= 0
-
-    if lasso.phase == "armed" then
-        if down then
-            lasso.phase = "drawing"
-            lasso.path = { { x = x, y = y } }
-            self.pen_down = true
-            self.dirty_region = nil
-            self.stroke_fast_refresh = true
-            self.last_refresh_time = time.now()
-        end
-    elseif lasso.phase == "drawing" then
-        if down then
-            local last = lasso.path[#lasso.path]
-            if math.abs(x - last.x) + math.abs(y - last.y) >= 3 then
-                table.insert(lasso.path, { x = x, y = y })
-                self:drawLassoSegment(last.x, last.y, x, y)
-            end
-        else
-            self.pen_down = false
-            self:finishLassoPath()
-        end
-    elseif lasso.phase == "selected" then
-        if down and not self.pen_down then
-            self.pen_down = true
-            local hit = self:lassoHitTest(x, y)
-            if hit == "delete" then
-                self:deleteLassoSelection()
-            elseif hit == "done" then
-                self:cancelLasso()
-            elseif hit == "inside" then
-                lasso.phase = "moving"
-                lasso.from = { x = x, y = y }
-                lasso.dx, lasso.dy = 0, 0
-                lasso.preview_time = time.now()
-                -- The page as shown now; the drag preview only moves an
-                -- outline over it, restoring pixels from this copy.
-                lasso.snapshot = Screen.bb:copy()
-            else
-                self:cancelLasso()
-            end
-        elseif not down then
-            self.pen_down = false
-        end
-    elseif lasso.phase == "moving" then
-        if down then
-            lasso.dx, lasso.dy = x - lasso.from.x, y - lasso.from.y
-            local now = time.now()
-            if time.to_ms(now - lasso.preview_time) >= LASSO_PREVIEW_MS then
-                lasso.preview_time = now
-                self:previewLassoDrag()
-            end
-        else
-            self.pen_down = false
-            self:applyLassoMove()
-        end
-    end
-    return true
-end
-
--- Draw a piece of the lasso path as a thin gray line, refreshed in batches.
-function Pencil:drawLassoSegment(x1, y1, x2, y2)
-    PencilStrokes.drawThickLine(Screen.bb, x1, y1, x2, y2, 2, Blitbuffer.COLOR_DARK_GRAY)
-    local x0, y0 = math.min(x1, x2) - 3, math.min(y1, y2) - 3
-    local w, h = math.abs(x2 - x1) + 6, math.abs(y2 - y1) + 6
-    local r = self.dirty_region
-    if r then
-        local rx2, ry2 = math.max(r.x + r.w, x0 + w), math.max(r.y + r.h, y0 + h)
-        r.x, r.y = math.min(r.x, x0), math.min(r.y, y0)
-        r.w, r.h = rx2 - r.x, ry2 - r.y
-    else
-        self.dirty_region = { x = x0, y = y0, w = w, h = h }
-    end
-    local now = time.now()
-    if time.to_ms(now - self.last_refresh_time) >= self.refresh_interval_ms then
-        self.last_refresh_time = now
-        self:refreshDirtyRegion()
-    end
-end
-
--- Strokes that can be selected: the ones drawn on screen right now.
-function Pencil:visibleStrokes()
-    local out = {}
-    local pages, page = self:getVisiblePages()
-    for _, p in ipairs(pages) do
-        for _, idx in ipairs(self.store.page_strokes[p] or {}) do
-            local stroke = self.store.strokes[idx]
-            if stroke then
-                if stroke.page_points then
-                    if self:syncStrokeToView(stroke) then table.insert(out, stroke) end
-                elseif p == page then
-                    table.insert(out, stroke)
-                end
-            end
-        end
-    end
-    return out
-end
-
-function Pencil:finishLassoPath()
-    local lasso = self.lasso
-    self.dirty_region = nil
-    local path = lasso.path
-    if not path or #path < 3 then
-        self:cancelLasso()
-        return
-    end
-    local selected, bbox = {}, nil
-    for _, stroke in ipairs(self:visibleStrokes()) do
-        if PencilGeometry.strokeInPolygon(stroke, path, LASSO_MIN_RATIO) then
-            local b = PencilGeometry.computeStrokeBbox(stroke)
-
-            if b and b.x0 and b.y0 and b.x1 and b.y1 then
-                table.insert(selected, stroke)
-                bbox = bbox and PencilGeometry.bboxUnion(bbox, b) or b
-            end
-        end
-    end
-    lasso.path = nil
-    if #selected == 0 then
-        self:cancelLasso()
-        return
-    end
-    lasso.strokes = selected
-    lasso.bbox = PencilGeometry.bboxExpand(bbox, LASSO_BOX_MARGIN)
-    lasso.phase = "selected"
-    self:repaintLasso(false)
-end
-
--- Selection box (offset by the current drag) and button rects.
-function Pencil:lassoLayout()
-    local lasso = self.lasso
-    local b = lasso.bbox
-    local dx, dy = lasso.dx or 0, lasso.dy or 0
-    local box = { x = b.x0 + dx, y = b.y0 + dy, w = b.x1 - b.x0, h = b.y1 - b.y0 }
-    local bw, bh = Screen:scaleBySize(90), Screen:scaleBySize(40)
-    local gap = Screen:scaleBySize(8)
-    local by = box.y - bh - gap
-    if by < 0 then by = box.y + box.h + gap end
-    by = math.min(by, Screen:getHeight() - bh)
-    local bx = math.max(0, math.min(box.x, Screen:getWidth() - 2 * bw - gap))
-    return box, {
-        { name = "delete", label = _("Delete"), x = bx, y = by, w = bw, h = bh },
-        { name = "done", label = _("Done"), x = bx + bw + gap, y = by, w = bw, h = bh },
-    }
-end
-
-function Pencil:lassoHitTest(x, y)
-    local box, buttons = self:lassoLayout()
-    for _, b in ipairs(buttons) do
-        if x >= b.x and x < b.x + b.w and y >= b.y and y < b.y + b.h then
-            return b.name
-        end
-    end
-    if x >= box.x and x < box.x + box.w and y >= box.y and y < box.y + box.h then
-        return "inside"
-    end
-end
-
--- Painted by paintTo while a selection exists.
-function Pencil:drawLassoOverlay(bb)
-    local box, buttons = self:lassoLayout()
-    bb:paintBorder(box.x, box.y, box.w, box.h, 2, Blitbuffer.COLOR_DARK_GRAY)
-    if self.lasso.phase == "moving" then return end
-    local face = Font:getFace("cfont", 18)
-    for _, b in ipairs(buttons) do
-        bb:paintRect(b.x, b.y, b.w, b.h, Blitbuffer.COLOR_WHITE)
-        bb:paintBorder(b.x, b.y, b.w, b.h, 2, Blitbuffer.COLOR_BLACK)
-        local label = TextWidget:new{ text = b.label, face = face, max_width = b.w - 4 }
-        local size = label:getSize()
-        label:paintTo(bb, b.x + math.floor((b.w - size.w) / 2), b.y + math.floor((b.h - size.h) / 2))
-        label:free()
-    end
-end
-
-function Pencil:repaintLasso(fast)
-    local target = self.ui and (self.ui.dialog or self.ui) or self.view
-    UIManager:setDirty(target, fast and "partial" or "ui")
-end
-
--- Move the selection outline to the current drag offset: restore the old
--- outline's pixels from the snapshot, draw the new one, refresh just that.
-function Pencil:previewLassoDrag()
-    local lasso = self.lasso
-    local snap = lasso.snapshot
-    if not snap then return end
-    local box = self:lassoLayout()
-    local bb = Screen.bb
-    local sw, sh = Screen:getWidth(), Screen:getHeight()
-    local function clamp(r)
-        local x0, y0 = math.max(0, r.x), math.max(0, r.y)
-        local x1, y1 = math.min(sw, r.x + r.w), math.min(sh, r.y + r.h)
-        if x1 <= x0 or y1 <= y0 then return nil end
-        return { x = x0, y = y0, w = x1 - x0, h = y1 - y0 }
-    end
-    local function restore(r)
-        local c = clamp(r)
-        if c then bb:blitFrom(snap, c.x, c.y, c.x, c.y, c.w, c.h) end
-    end
-    local prev = lasso.prev_box
-    if prev then
-        local t = 2
-        restore({ x = prev.x, y = prev.y, w = prev.w, h = t })
-        restore({ x = prev.x, y = prev.y + prev.h - t, w = prev.w, h = t })
-        restore({ x = prev.x, y = prev.y, w = t, h = prev.h })
-        restore({ x = prev.x + prev.w - t, y = prev.y, w = t, h = prev.h })
-    end
-    local c = clamp(box)
-    if c then bb:paintBorder(c.x, c.y, c.w, c.h, 2, Blitbuffer.COLOR_DARK_GRAY) end
-    local area = prev and {
-        x = math.min(prev.x, box.x), y = math.min(prev.y, box.y),
-        w = math.max(prev.x + prev.w, box.x + box.w) - math.min(prev.x, box.x),
-        h = math.max(prev.y + prev.h, box.y + box.h) - math.min(prev.y, box.y),
-    } or box
-    area = clamp(area)
-    if area then Screen:refreshFast(area.x, area.y, area.w, area.h) end
-    lasso.prev_box = box
-end
-
-function Pencil:deleteLassoSelection()
-    local selected = self.lasso.strokes
-    self:clearLasso()
-    if self.store:removeStrokes(selected) then
-        self.store:pushUndo({ type = "delete", strokes = selected })
-    end
-    self:afterHistoryChange()
-end
-
-function Pencil:applyLassoMove()
-    local lasso = self.lasso
-    local dx, dy = lasso.dx or 0, lasso.dy or 0
-    if lasso.snapshot then
-        lasso.snapshot:free()
-        lasso.snapshot = nil
-    end
-    lasso.prev_box = nil
-    if math.abs(dx) + math.abs(dy) < 3 then
-        -- A tap inside the box: keep the selection.
-        lasso.phase = "selected"
-        lasso.dx, lasso.dy = 0, 0
-        self:repaintLasso(false)
-        return
-    end
-    self:clearLasso()
-    local pdeltas = self:translateStrokes(lasso.strokes, dx, dy)
-    self.store:pushUndo({ type = "move", strokes = lasso.strokes, dx = dx, dy = dy, pdeltas = pdeltas })
-    self:afterHistoryChange()
-end
+-- Lasso selection is owned by self.lasso_feature (lib/pencillasso.lua).
 
 -- Shift strokes by (dx, dy) screen pixels; sign = -1 reverses a move.
 -- Page-anchored strokes move in page space by pdeltas[i] (computed from the
@@ -2644,7 +2355,7 @@ function Pencil:onDrawPan(ges)
             for _, stroke in ipairs(deleted) do
                 table.insert(self.eraser_deleted, stroke)
             end
-            self.view:paintTo(Screen.bb)
+            self.view:paintTo(Screen.bb, 0, 0)
             local rx, ry, rw, rh = self:erasedStrokesRefreshRect(deleted)
             if rx then
                 Screen:refreshUI(rx, ry, rw, rh)
@@ -4556,7 +4267,7 @@ end
 -- @param deleted array of erased strokes
 -- @param fast use the fast waveform instead of the UI one
 function Pencil:refreshAfterErase(deleted, fast)
-    self.view:paintTo(Screen.bb)
+    self.view:paintTo(Screen.bb, 0, 0)
     self:paintTo(Screen.bb)
     local bbox, margin = nil, 0
     for _, stroke in ipairs(deleted) do
@@ -4738,8 +4449,8 @@ function Pencil:paintTo(bb)
         self.notes_feature:paintTo(bb)
     end
 
-    if self.lasso and self.lasso.strokes then
-        self:drawLassoOverlay(bb)
+    if self.lasso_feature then
+        self.lasso_feature:paintTo(bb)
     end
 end
 
@@ -4821,7 +4532,7 @@ function Pencil:onCloseDocument()
     if self.notes_feature and self.notes_feature:isOpen() then
         self.notes_feature:close(false)
     end
-    self:clearLasso()
+    if self.lasso_feature then self.lasso_feature:clear() end
     self:rebuildStaleGroups()
 
     -- Run any pending deferred image captures synchronously before close so
@@ -4927,7 +4638,7 @@ end
 
 -- Handle page changes (paging mode)
 function Pencil:onPageUpdate()
-    self:clearLasso()
+    if self.lasso_feature then self.lasso_feature:clear() end
     -- Clear any in-progress stroke when page changes
     if self.current_stroke and #self.current_stroke.points >= 2 then
         -- Save the stroke before clearing. The inline saveStrokes below covers
