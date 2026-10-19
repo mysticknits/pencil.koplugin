@@ -75,7 +75,7 @@ local stubs = {
 
 local function load_pencil()
     table.insert(loaders, 2, function(name)
-        if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
+                     if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" or name == "lib/pencilnotes" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
@@ -84,8 +84,8 @@ local function load_pencil()
 end
 
 local Pencil = load_pencil()
-local PencilStrokes = require("lib/pencilstrokes")
 local PencilTool = require("lib/penciltool")
+local PencilNotes = require("lib/pencilnotes")
 local make_tool = dofile("spec/helpers/make_tool.lua")
 
 local function new_pencil(opts)
@@ -97,7 +97,6 @@ local function new_pencil(opts)
         } }),
         available_colors = {},
         annotation_groups = {},
-        notes = {},
         refresh_interval_ms = 16,
         input_debug_mode = false,
         experimental_color_picker = false,
@@ -110,6 +109,7 @@ local function new_pencil(opts)
         ui = opts.ui or { rolling = {}, document = {} },
     }, { __index = Pencil })
     p:initStrokeStore()
+    p.notes_feature = PencilNotes:new{ plugin = p }
     p.isEnabled = function() return true end
     p.isOverlayActive = function() return false end
     p.transformCoordinates = function(_, x, y) return x, y end
@@ -124,7 +124,7 @@ end
 local function pen(p, x, y, tool) p:handleStylusSlot(nil, { id = 1, x = x, y = y, tool = tool or 1 }) end
 local function lift(p) p:handleStylusSlot(nil, { id = -1, tool = 1 }) end
 local function tap_bar(p, name)
-    for _, b in ipairs(p.note_canvas:barButtons()) do
+    for _, b in ipairs(p.notes_feature.canvas:barButtons()) do
         if b.name == name then
             pen(p, b.x + 5, b.y + 5)
             lift(p)
@@ -137,77 +137,77 @@ end
 describe("note canvas (real main.lua)", function()
     it("creates a note at the hold position and records ink on the canvas", function()
         local p = new_pencil()
-        p:openNoteAt(300, 400)
-        assert.is_truthy(p.note_canvas)
+        p.notes_feature:openAt(300, 400)
+        assert.is_truthy(p.notes_feature.canvas)
         pen(p, 100, 500)
         pen(p, 200, 520)
         lift(p)
-        local note = p.notes[1]
+        local note = p.notes_feature.items[1]
         assert.are.equal(5, note.page)
         assert.are.equal("/body/p[3].12", note.xpointer)
         assert.are.equal(1, #note.pages[1].strokes)
         assert.are.equal(2, #note.pages[1].strokes[1].points)
         assert.are.equal(0, #p.store.strokes) -- canvas ink never reaches the page
         tap_bar(p, "done")
-        assert.is_nil(p.note_canvas)
-        assert.are.equal(1, #p.notes)
+        assert.is_nil(p.notes_feature.canvas)
+        assert.are.equal(1, #p.notes_feature.items)
         assert.is_true(p.saved > 0)
     end)
 
     it("drops a note that was closed without ink", function()
         local p = new_pencil()
-        p:openNoteAt(300, 400)
+        p.notes_feature:openAt(300, 400)
         tap_bar(p, "done")
-        assert.are.equal(0, #p.notes)
+        assert.are.equal(0, #p.notes_feature.items)
     end)
 
     it("reopens a note by tapping its marker, ignoring the rest of that contact", function()
         local p = new_pencil()
-        p:openNoteAt(300, 400)
+        p.notes_feature:openAt(300, 400)
         pen(p, 100, 500)
         lift(p)
         tap_bar(p, "done")
         pen(p, 302, 398) -- on the marker
-        assert.is_truthy(p.note_canvas)
+        assert.is_truthy(p.notes_feature.canvas)
         pen(p, 320, 420) -- same contact keeps moving: no ink
         lift(p)
-        assert.are.equal(1, #p.notes[1].pages[1].strokes)
+        assert.are.equal(1, #p.notes_feature.items[1].pages[1].strokes)
         assert.is_false(p.pen_down)
     end)
 
     it("erases, undoes, and pages through the canvas", function()
         local p = new_pencil()
-        p:openNoteAt(300, 400)
+        p.notes_feature:openAt(300, 400)
         pen(p, 100, 500) pen(p, 200, 500) lift(p)
         pen(p, 100, 900) pen(p, 200, 900) lift(p)
         pen(p, 100, 500, 2) lift(p) -- eraser end over the first stroke
-        assert.are.equal(1, #p.notes[1].pages[1].strokes)
+        assert.are.equal(1, #p.notes_feature.items[1].pages[1].strokes)
         tap_bar(p, "undo")
-        assert.are.equal(0, #p.notes[1].pages[1].strokes)
+        assert.are.equal(0, #p.notes_feature.items[1].pages[1].strokes)
         pen(p, 100, 600) lift(p)
         tap_bar(p, "add")
-        assert.are.equal(2, #p.notes[1].pages)
-        assert.are.equal(2, p.note_canvas.page_index)
+        assert.are.equal(2, #p.notes_feature.items[1].pages)
+        assert.are.equal(2, p.notes_feature.canvas.page_index)
         pen(p, 100, 700) lift(p)
         tap_bar(p, "prev")
-        assert.are.equal(1, p.note_canvas.page_index)
-        assert.are.equal(1, #p.notes[1].pages[2].strokes)
+        assert.are.equal(1, p.notes_feature.canvas.page_index)
+        assert.are.equal(1, #p.notes_feature.items[1].pages[2].strokes)
     end)
 
     it("deletes a note from the canvas", function()
         local p = new_pencil()
-        p:openNoteAt(300, 400)
+        p.notes_feature:openAt(300, 400)
         pen(p, 100, 500) lift(p)
         tap_bar(p, "delete")
-        assert.are.equal(0, #p.notes)
+        assert.are.equal(0, #p.notes_feature.items)
     end)
 
     it("saves and loads notes", function()
         local p = new_pencil()
-        p:openNoteAt(300, 400)
+        p.notes_feature:openAt(300, 400)
         pen(p, 100, 500) pen(p, 200, 520) lift(p)
         tap_bar(p, "done")
-        local loaded = p:notesFromSaved(p:notesToSaveable())
+        local loaded = p.notes_feature:deserialize(p.notes_feature:serialize())
         assert.are.equal(1, #loaded)
         assert.are.equal("/body/p[3].12", loaded[1].xpointer)
         assert.are.same({ { x = 100, y = 500 }, { x = 200, y = 520 } }, loaded[1].pages[1].strokes[1].points)
@@ -221,13 +221,13 @@ describe("note canvas (real main.lua)", function()
             screenToPageTransform = function(_, pos) return { x = pos.x / 2, y = pos.y / 2, page = 2 } end,
         }
         local p = new_pencil({ view = view, ui = { paging = {} } })
-        p:openNoteAt(300, 400)
+        p.notes_feature:openAt(300, 400)
         pen(p, 100, 500) lift(p)
         tap_bar(p, "done")
-        local note = p.notes[1]
+        local note = p.notes_feature.items[1]
         assert.are.equal(150, note.page_x)
         view.state.zoom = 1
-        local x, y = p:getNoteMarkerPos(note)
+        local x, y = p.notes_feature:getMarkerPos(note)
         assert.are.equal(150, x)
         assert.are.equal(200, y)
     end)

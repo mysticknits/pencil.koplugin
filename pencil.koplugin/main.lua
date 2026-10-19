@@ -9,11 +9,10 @@ local Blitbuffer = require("ffi/blitbuffer")
 local DataStorage = require("datastorage")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
-local Geom = require("ui/geometry")
-local GestureRange = require("ui/gesturerange")
 local PencilGeometry = require("lib/geometry")
 local PencilTool = require("lib/penciltool")
 local PencilStrokes = require("lib/pencilstrokes")
+local PencilNotes = require("lib/pencilnotes")
 local Screen = Device.screen
 local Font = require("ui/font")
 local InfoMessage = require("ui/widget/infomessage")
@@ -108,7 +107,6 @@ local _active_pencil = nil
 local _bookmark_hook_installed = false
 local _palm_filter_installed = false
 
-local NoteCanvas  -- defined with the notes code below
 
 local Pencil = InputContainer:extend{
     name = "pencil_annotation",
@@ -203,6 +201,7 @@ function Pencil:init()
 
     -- Tool selection, per-tool settings, eraser and highlight mode state
     self.tool = PencilTool:new()
+    self.notes_feature = PencilNotes:new{ plugin = self }
 
     -- Calculate gray value from highlight_lighten_factor setting
     local lighten_factor = G_reader_settings:readSetting("highlight_lighten_factor") or 0.2
@@ -510,8 +509,8 @@ function Pencil:handleStylusSlot(input, slot)
     end
     -- Remembered for palm rejection (see filterPalmSlots)
     self.last_stylus_time = time.now()
-    if self.note_canvas then
-        return self.note_canvas:handleStylus(slot)
+    if self.notes_feature and self.notes_feature:handleStylus(slot) then
+        return true
     end
 
     -- Debug logging at the very start to see slot.tool
@@ -710,11 +709,11 @@ function Pencil:handleStylusSlot(input, slot)
         -- Pen down or moving
         if not self.pen_down then
             -- Pen down on a note marker opens the note.
-            if self.notes and #self.notes > 0 then
+            if self.notes_feature then
                 local mx, my = self:transformCoordinates(slot.x or 0, slot.y or 0)
-                local note = self:findNoteMarkerAt(mx, my)
+                local note = self.notes_feature:findMarkerAt(mx, my)
                 if note then
-                    self:openNote(note, true)
+                    self.notes_feature:open(note, true)
                     return true
                 end
             end
@@ -2080,7 +2079,7 @@ function Pencil:runHoldMenuAction(action, x, y)
     elseif action == "lasso" then
         self:startLasso()
     elseif action == "note" then
-        self:openNoteAt(x, y)
+        self.notes_feature:openAt(x, y)
     end
 end
 
@@ -2382,401 +2381,7 @@ function Pencil:translateStrokes(strokes, dx, dy, pdeltas, sign)
     return PencilStrokes.translate(strokes, dx, dy, pdeltas, sign, self.stroke_view)
 end
 
--- Notes: a full-screen canvas for longer handwriting, anchored to a spot in
--- the book and shown there as a small marker. Created from the hold-pen
--- menu; reopened by tapping the marker with the pen.
---
--- note = {
---     id, datetime, page, x, y,       -- anchor; x/y are screen coords at creation
---     xpointer,                        -- EPUB: follows reflow
---     page_x, page_y,                  -- PDF: page coordinates
---     pages = { { strokes = { { points, width, color_name } } } },
--- }
-
-local NOTE_MARKER_SIZE = 28
-local NOTE_MARKER_HIT_PAD = 12
-
--- Screen position of a note's marker on the current view, or nil when the
--- note isn't on a visible page.
-function Pencil:getNoteMarkerPos(note)
-    if self.ui.paging then
-        local zoom, ox, oy = self:pageAffine(note.page)
-        if not zoom or not note.page_x then return nil end
-        return note.page_x * zoom + ox, note.page_y * zoom + oy
-    end
-    if self:getGroupCurrentPage(note) ~= self:getCurrentPage() then return nil end
-    local y = note.y
-    if note.xpointer and self.ui.document and self.ui.document.getScreenPositionFromXPointer then
-        local ok, sy = pcall(self.ui.document.getScreenPositionFromXPointer, self.ui.document, note.xpointer)
-        if ok and sy then y = sy end
-    end
-    return note.x, y
-end
-
-function Pencil:getNoteMarkerRect(note)
-    local x, y = self:getNoteMarkerPos(note)
-    if not x then return nil end
-    local size = NOTE_MARKER_SIZE
-    local rx = math.max(0, math.min(math.floor(x - size / 2), Screen:getWidth() - size))
-    local ry = math.max(0, math.min(math.floor(y - size / 2), Screen:getHeight() - size))
-    return { x = rx, y = ry, w = size, h = size }
-end
-
-function Pencil:findNoteMarkerAt(x, y)
-    for _, note in ipairs(self.notes or {}) do
-        local r = self:getNoteMarkerRect(note)
-        if r and x >= r.x - NOTE_MARKER_HIT_PAD and x <= r.x + r.w + NOTE_MARKER_HIT_PAD
-                and y >= r.y - NOTE_MARKER_HIT_PAD and y <= r.y + r.h + NOTE_MARKER_HIT_PAD then
-            return note
-        end
-    end
-end
-
--- A small "page with lines" icon.
-function Pencil:drawNoteMarkers(bb)
-    for _, note in ipairs(self.notes or {}) do
-        local r = self:getNoteMarkerRect(note)
-        if r then
-            bb:paintRect(r.x, r.y, r.w, r.h, Blitbuffer.COLOR_WHITE)
-            bb:paintBorder(r.x, r.y, r.w, r.h, 2, Blitbuffer.COLOR_BLACK)
-            local inset = math.floor(r.w / 5)
-            for i = 1, 3 do
-                bb:paintRect(r.x + inset, r.y + i * math.floor(r.h / 4), r.w - 2 * inset, 2, Blitbuffer.COLOR_BLACK)
-            end
-        end
-    end
-end
-
--- Create a note anchored at screen position (x, y) and open it.
-function Pencil:openNoteAt(x, y)
-    local note = {
-        id = "note_" .. os.date("%Y%m%d%H%M%S") .. "_" .. tostring(#(self.notes or {}) + 1),
-        datetime = os.time(),
-        page = self:getCurrentPage(),
-        x = x,
-        y = y,
-        pages = { { strokes = {} } },
-    }
-    if self.ui.paging then
-        local pos = self.view:screenToPageTransform({ x = x, y = y })
-        if pos and pos.page then
-            note.page = pos.page
-            local zoom, ox, oy = self:pageAffine(pos.page)
-            if zoom then
-                note.page_x, note.page_y = (x - ox) / zoom, (y - oy) / zoom
-            end
-        end
-    elseif self.ui.rolling then
-        note.xpointer = self:getXPointerAtBboxCenter({ x0 = x, y0 = y, x1 = x, y1 = y })
-    end
-    self.notes = self.notes or {}
-    table.insert(self.notes, note)
-    self:openNote(note)
-end
-
--- @param wait_lift ignore the pen contact that opened the note
-function Pencil:openNote(note, wait_lift)
-    if self.note_canvas then return end
-    -- The canvas takes over pen input, including the rest of this contact.
-    self.pen_down = false
-    self.current_stroke = nil
-    self.note_canvas = NoteCanvas:new{
-        plugin = self,
-        note = note,
-        wait_lift = wait_lift,
-    }
-    UIManager:show(self.note_canvas)
-    UIManager:setDirty(self.note_canvas, "ui")
-end
-
-local function noteHasInk(note)
-    for _, page in ipairs(note.pages or {}) do
-        if #page.strokes > 0 then return true end
-    end
-    return false
-end
-
-function Pencil:removeNote(note)
-    for i, n in ipairs(self.notes or {}) do
-        if n == note then
-            table.remove(self.notes, i)
-            return
-        end
-    end
-end
-
--- Close the canvas; notes left empty are dropped.
-function Pencil:closeNoteCanvas(delete)
-    local canvas = self.note_canvas
-    if not canvas then return end
-    self.note_canvas = nil
-    UIManager:close(canvas)
-    if delete or not noteHasInk(canvas.note) then
-        self:removeNote(canvas.note)
-    end
-    self:saveStrokes()
-    self:repaintReader()
-end
-
-function Pencil:notesToSaveable()
-    local out = {}
-    for _, note in ipairs(self.notes or {}) do
-        local pages = {}
-        for i, page in ipairs(note.pages) do
-            local strokes = {}
-            for j, s in ipairs(page.strokes) do
-                strokes[j] = { p = PencilGeometry.packPoints(s.points), width = s.width, color_name = s.color_name }
-            end
-            pages[i] = { strokes = strokes }
-        end
-        table.insert(out, {
-            id = note.id, datetime = note.datetime, page = note.page,
-            x = note.x, y = note.y, xpointer = note.xpointer,
-            page_x = note.page_x, page_y = note.page_y,
-            pages = pages,
-        })
-    end
-    return out
-end
-
-function Pencil:notesFromSaved(saved)
-    local notes = {}
-    for _, n in ipairs(saved or {}) do
-        local pages = {}
-        for i, page in ipairs(n.pages or {}) do
-            local strokes = {}
-            for j, s in ipairs(page.strokes or {}) do
-                strokes[j] = { points = PencilGeometry.unpackPoints(s.p), width = s.width, color_name = s.color_name }
-            end
-            pages[i] = { strokes = strokes }
-        end
-        if #pages == 0 then pages[1] = { strokes = {} } end
-        table.insert(notes, {
-            id = n.id, datetime = n.datetime, page = n.page,
-            x = n.x, y = n.y, xpointer = n.xpointer,
-            page_x = n.page_x, page_y = n.page_y,
-            pages = pages,
-        })
-    end
-    return notes
-end
-
--- Full-screen writing canvas for one note. Pen input is routed here by
--- Pencil:handleStylusSlot while it's open; the top bar works with both pen
--- and finger.
-NoteCanvas = InputContainer:extend{
-    plugin = nil,
-    note = nil,
-    wait_lift = false,
-    page_index = 1,
-}
-
-function NoteCanvas:init()
-    self.dimen = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() }
-    self.bar_h = Screen:scaleBySize(48)
-    self.page_index = 1
-    self.ges_events = {
-        TapBar = {
-            GestureRange:new{
-                ges = "tap",
-                range = function() return Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = self.bar_h } end,
-            },
-        },
-    }
-end
-
-function NoteCanvas:currentPage()
-    return self.note.pages[self.page_index]
-end
-
-function NoteCanvas:barButtons()
-    local labels = {
-        { name = "done", label = _("Done") },
-        { name = "undo", label = _("Undo") },
-        { name = "prev", label = _("Prev") },
-        { name = "page", label = T("%1/%2", self.page_index, #self.note.pages) },
-        { name = "next", label = _("Next") },
-        { name = "add", label = _("+ Page") },
-        { name = "delete", label = _("Delete") },
-    }
-    local w = math.floor(Screen:getWidth() / #labels)
-    for i, b in ipairs(labels) do
-        b.x, b.y, b.w, b.h = (i - 1) * w, 0, w, self.bar_h
-    end
-    return labels
-end
-
-function NoteCanvas:hitBar(x, y)
-    if y < 0 or y >= self.bar_h then return nil end
-    for _, b in ipairs(self:barButtons()) do
-        if x >= b.x and x < b.x + b.w then return b.name end
-    end
-end
-
-function NoteCanvas:runBarAction(name)
-    local plugin = self.plugin
-    if name == "done" then
-        plugin:closeNoteCanvas(false)
-        return
-    elseif name == "delete" then
-        plugin:closeNoteCanvas(true)
-        return
-    elseif name == "undo" then
-        table.remove(self:currentPage().strokes)
-    elseif name == "prev" then
-        self.page_index = math.max(1, self.page_index - 1)
-    elseif name == "next" then
-        self.page_index = math.min(#self.note.pages, self.page_index + 1)
-    elseif name == "add" then
-        table.insert(self.note.pages, self.page_index + 1, { strokes = {} })
-        self.page_index = self.page_index + 1
-    else
-        return
-    end
-    self:repaint()
-end
-
-function NoteCanvas:onTapBar(_, ges)
-    local name = ges and ges.pos and self:hitBar(ges.pos.x, ges.pos.y)
-    if name then self:runBarAction(name) end
-    return true
-end
-
-function NoteCanvas:strokeColor(stroke)
-    for _, c in ipairs(self.plugin.available_colors or {}) do
-        if c.name == stroke.color_name then return c.color end
-    end
-    return Blitbuffer.COLOR_BLACK
-end
-
-function NoteCanvas:renderStroke(bb, stroke)
-    local pts = stroke.points
-    local color = self:strokeColor(stroke)
-    if #pts == 1 then
-        local half = math.floor(stroke.width / 2)
-        bb:paintRectRGB32(pts[1].x - half, pts[1].y - half, stroke.width, stroke.width, color)
-        return
-    end
-    for i = 2, #pts do
-        PencilStrokes.drawThickLine(bb, pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y, stroke.width, color)
-    end
-end
-
-function NoteCanvas:paintTo(bb)
-    local w, h = Screen:getWidth(), Screen:getHeight()
-    bb:paintRect(0, 0, w, h, Blitbuffer.COLOR_WHITE)
-    local face = Font:getFace("cfont", 18)
-    for _, b in ipairs(self:barButtons()) do
-        bb:paintBorder(b.x, b.y, b.w, b.h, 1, Blitbuffer.COLOR_DARK_GRAY)
-        local label = TextWidget:new{ text = b.label, face = face, max_width = b.w - 4 }
-        local size = label:getSize()
-        label:paintTo(bb, b.x + math.floor((b.w - size.w) / 2), b.y + math.floor((b.h - size.h) / 2))
-        label:free()
-    end
-    bb:paintRect(0, self.bar_h, w, 2, Blitbuffer.COLOR_BLACK)
-    for _, stroke in ipairs(self:currentPage().strokes) do
-        self:renderStroke(bb, stroke)
-    end
-end
-
-function NoteCanvas:repaint()
-    self:paintTo(Screen.bb)
-    Screen:refreshUI(0, 0, Screen:getWidth(), Screen:getHeight())
-end
-
-function NoteCanvas:isEraser(slot)
-    local plugin = self.plugin
-    return plugin.tool:getEffectiveToolForSlot(slot, plugin.side_button_down) == TOOL_ERASER
-end
-
-function NoteCanvas:eraseAt(x, y)
-    local strokes = self:currentPage().strokes
-    local settings = self.plugin.tool:getToolSettings(TOOL_ERASER)
-    local radius = (settings and settings.width) or 20
-    local erased = false
-    for i = #strokes, 1, -1 do
-        if PencilGeometry.isPointNearStroke(x, y, strokes[i], radius) then
-            table.remove(strokes, i)
-            erased = true
-        end
-    end
-    if erased then self:repaint() end
-end
-
--- Pen input while the canvas is open. Always consumes the event.
-function NoteCanvas:handleStylus(slot)
-    local plugin = self.plugin
-    local down = slot.id ~= nil and slot.id >= 0
-    if self.wait_lift then
-        if not down then self.wait_lift = false end
-        return true
-    end
-    local x, y = plugin:transformCoordinates(slot.x or self.last_x or 0, slot.y or self.last_y or 0)
-
-    if not down then
-        if self.stroke then
-            -- Show what was drawn since the last batched refresh.
-            plugin:refreshDirtyRegion()
-            self.stroke = nil
-        elseif self.contact and self.contact.bar then
-            local name = self:hitBar(self.contact.x, self.contact.y)
-            self.contact = nil
-            if name then self:runBarAction(name) end
-            return true
-        end
-        self.contact = nil
-        return true
-    end
-
-    if self:isEraser(slot) then
-        self.contact = self.contact or {}
-        self:eraseAt(x, y)
-        self.last_x, self.last_y = x, y
-        return true
-    end
-
-    if not self.contact then
-        -- New contact: the bar takes taps, the page takes ink.
-        self.contact = { x = x, y = y, bar = y < self.bar_h }
-        if self.contact.bar then return true end
-        local settings = plugin.tool:getToolSettings(TOOL_PEN)
-        self.stroke = { points = { { x = x, y = y } }, width = settings.width, color_name = settings.color_name }
-        table.insert(self:currentPage().strokes, self.stroke)
-        plugin.stroke_fast_refresh = true
-        plugin.dirty_region = nil
-        plugin.last_refresh_time = time.now()
-        self:drawLive(x, y, x, y)
-    elseif self.stroke and (x ~= self.last_x or y ~= self.last_y) then
-        table.insert(self.stroke.points, { x = x, y = y })
-        self:drawLive(self.last_x, self.last_y, x, y)
-    end
-    self.last_x, self.last_y = x, y
-    return true
-end
-
--- Draw a segment straight to the framebuffer and refresh in batches,
--- reusing the reader's low-latency path.
-function NoteCanvas:drawLive(x1, y1, x2, y2)
-    local plugin = self.plugin
-    local width = self.stroke.width
-    PencilStrokes.drawThickLine(Screen.bb, x1, y1, x2, y2, width, self:strokeColor(self.stroke))
-    local pad = math.floor(width / 2) + 2
-    local x0, y0 = math.min(x1, x2) - pad, math.min(y1, y2) - pad
-    local w, h = math.abs(x2 - x1) + 2 * pad, math.abs(y2 - y1) + 2 * pad
-    local r = plugin.dirty_region
-    if r then
-        local rx2, ry2 = math.max(r.x + r.w, x0 + w), math.max(r.y + r.h, y0 + h)
-        r.x, r.y = math.min(r.x, x0), math.min(r.y, y0)
-        r.w, r.h = rx2 - r.x, ry2 - r.y
-    else
-        plugin.dirty_region = { x = x0, y = y0, w = w, h = h }
-    end
-    local now = time.now()
-    if time.to_ms(now - plugin.last_refresh_time) >= plugin.refresh_interval_ms then
-        plugin.last_refresh_time = now
-        plugin:refreshDirtyRegion()
-    end
-end
+-- Notes are owned by self.notes_feature (lib/pencilnotes.lua).
 
 -- Highlighter colors offered to the user: all but Black, which would hide the text.
 function Pencil:getHighlighterColors()
@@ -5129,8 +4734,8 @@ function Pencil:paintTo(bb)
         self:renderStroke(bb, self.current_stroke)
     end
 
-    if self.notes and #self.notes > 0 then
-        self:drawNoteMarkers(bb)
+    if self.notes_feature then
+        self.notes_feature:paintTo(bb)
     end
 
     if self.lasso and self.lasso.strokes then
@@ -5144,7 +4749,8 @@ end
 
 -- Load strokes from our own file
 function Pencil:loadStrokes()
-    self.notes = {}
+    self.notes_feature = self.notes_feature or PencilNotes:new{ plugin = self }
+    self.notes_feature:deserialize(nil)
     local doc_settings = self.ui and self.ui.doc_settings
     local filepath = PencilStrokes.migrateFileIfNeeded(doc_settings)
     logger.info("Pencil: loadStrokes - filepath =", filepath)
@@ -5157,7 +4763,7 @@ function Pencil:loadStrokes()
     if status == "error" then
         self.annotation_groups = {}
     elseif status == "ok" then
-        self.notes = self:notesFromSaved(data.notes)
+        self.notes_feature:deserialize(data.notes)
 
         -- Load annotation groups or bootstrap from v1 data
         if data.annotation_groups and #data.annotation_groups > 0 then
@@ -5187,7 +4793,7 @@ function Pencil:saveStrokes()
     local filepath = self:getStrokesFilePath()
     if self.store:save(filepath, {
         annotation_groups = self.annotation_groups,
-        notes = self:notesToSaveable(),
+        notes = self.notes_feature and self.notes_feature:serialize() or {},
     }) then
         PencilStrokes.rememberFilePath(self.ui and self.ui.doc_settings, filepath)
     end
@@ -5212,8 +4818,8 @@ function Pencil:onCloseDocument()
     end
 
     self:teardownPenInput()
-    if self.note_canvas then
-        self:closeNoteCanvas(false)
+    if self.notes_feature and self.notes_feature:isOpen() then
+        self.notes_feature:close(false)
     end
     self:clearLasso()
     self:rebuildStaleGroups()

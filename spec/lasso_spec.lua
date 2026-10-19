@@ -62,7 +62,7 @@ local stubs = {
 
 local function load_pencil()
     table.insert(loaders, 2, function(name)
-        if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
+        if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes"  or name == "lib/pencilnotes" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
@@ -71,8 +71,8 @@ local function load_pencil()
 end
 
 local Pencil = load_pencil()
-local PencilStrokes = require("lib/pencilstrokes")
 local PencilTool = require("lib/penciltool")
+local PencilNotes = require("lib/pencilnotes")
 local make_tool = dofile("spec/helpers/make_tool.lua")
 
 local function hline(x0, x1, y)
@@ -94,6 +94,7 @@ local function new_pencil()
         save_delay_ms = 1500,
     }, { __index = Pencil })
     p:initStrokeStore()
+    p.notes_feature = PencilNotes:new{ plugin = p }
     for _, stroke in ipairs({ hline(100, 300, 100), hline(100, 300, 500) }) do p.store:add(stroke) end
     p.isEnabled = function() return true end
     p.isOverlayActive = function() return false end
@@ -205,7 +206,9 @@ describe("lasso (real main.lua)", function()
         local called = {}
         p.undoLastStroke = function() table.insert(called, "undo") end
         p.redoLastStroke = function() table.insert(called, "redo") end
-        p.openNoteAt = function(_, x, y) table.insert(called, "note " .. x .. "," .. y) end
+        p.notes_feature.openAt = function(_, x, y)
+            table.insert(called, "note " .. x .. "," .. y)
+        end
         p:runHoldMenuAction("undo", 1, 2)
         p:runHoldMenuAction("redo", 1, 2)
         p:runHoldMenuAction("note", 10, 20)
