@@ -307,4 +307,172 @@ describe("Geometry", function()
         end)
     end)
 
+    describe("packPoints / unpackPoints", function()
+
+        it("returns empty string for nil/empty points", function()
+            assert.are.equal("", Geometry.packPoints(nil))
+            assert.are.equal("", Geometry.packPoints({}))
+        end)
+
+        it("returns empty array for nil/empty string", function()
+            assert.are.same({}, Geometry.unpackPoints(nil))
+            assert.are.same({}, Geometry.unpackPoints(""))
+        end)
+
+        it("round-trips a points array exactly", function()
+            local pts = { {x=1, y=2}, {x=345, y=678}, {x=0, y=0} }
+            local packed = Geometry.packPoints(pts)
+            assert.are.equal("1 2 345 678 0 0", packed)
+            assert.are.same(pts, Geometry.unpackPoints(packed))
+        end)
+
+        it("round-trips negative and fractional coordinates", function()
+            local pts = { {x=-5, y=10}, {x=3.5, y=-2.25} }
+            assert.are.same(pts, Geometry.unpackPoints(Geometry.packPoints(pts)))
+        end)
+
+        it("handles a large stroke", function()
+            local pts = {}
+            for i = 1, 500 do pts[i] = { x = i, y = i * 2 } end
+            assert.are.same(pts, Geometry.unpackPoints(Geometry.packPoints(pts)))
+        end)
+    end)
+
+    describe("segmentStepCount", function()
+
+        it("steps by ~half the width for thick pens", function()
+            -- width 10 -> step 5; dist 100 -> ceil(100/5) = 20
+            assert.are.equal(20, Geometry.segmentStepCount(100, 10))
+        end)
+
+        it("never returns less than 1 step", function()
+            assert.are.equal(1, Geometry.segmentStepCount(0, 10))
+            assert.are.equal(1, Geometry.segmentStepCount(2, 10))
+        end)
+
+        it("falls back to 1px steps for thin pens (width <= 2)", function()
+            -- floor(2/2) = 1 -> step 1 -> ceil(100/1) = 100
+            assert.are.equal(100, Geometry.segmentStepCount(100, 2))
+            -- floor(1/2) = 0 -> max(1, 0) = 1 -> ceil(100/1) = 100
+            assert.are.equal(100, Geometry.segmentStepCount(100, 1))
+        end)
+
+        it("produces far fewer steps than the old 1px stepping for wide pens", function()
+            local dist = 300
+            local old_steps = math.ceil(dist)  -- previous behaviour
+            local new_steps = Geometry.segmentStepCount(dist, 12)
+            assert.is_true(new_steps < old_steps / 4)
+        end)
+    end)
+
+
+    describe("highlighter coverage (each pixel blended once)", function()
+        local function pixelsOf(rects, set, dup)
+            set = set or {}
+            for _, r in ipairs(rects) do
+                for y = r.y, r.y + r.h - 1 do
+                    for x = r.x, r.x + r.w - 1 do
+                        local key = x .. "," .. y
+                        if set[key] and dup then dup[#dup + 1] = key end
+                        set[key] = true
+                    end
+                end
+            end
+            return set
+        end
+        local function size(set) local n = 0 for _ in pairs(set) do n = n + 1 end return n end
+
+        -- brute-force union of the stamps
+        local function bruteUnion(points, width)
+            local set = {}
+            local function stamp(x, y)
+                for yy = y, y + width - 1 do
+                    for xx = x, x + width - 1 do set[xx .. "," .. yy] = true end
+                end
+            end
+            if #points == 1 then
+                local st = Geometry.segmentStamps(points[1].x, points[1].y, points[1].x, points[1].y, width)
+                stamp(st[1], st[2])
+            else
+                for i = 2, #points do
+                    local st = Geometry.segmentStamps(points[i - 1].x, points[i - 1].y, points[i].x, points[i].y, width)
+                    for j = 1, #st, 2 do stamp(st[j], st[j + 1]) end
+                end
+            end
+            return set
+        end
+
+        it("stamps a single point as one width x width square", function()
+            local st = Geometry.segmentStamps(100, 50, 100, 50, 20)
+            assert.same({ 90, 40 }, st)
+        end)
+
+        it("stamps include both endpoints and step by half the width", function()
+            local st = Geometry.segmentStamps(0, 0, 40, 0, 20)
+            assert.equals(0 - 10, st[1])
+            assert.equals(40 - 10, st[#st - 1])
+            assert.equals(5, #st / 2)  -- steps = ceil(40 / 10) = 4 -> 5 stamps
+        end)
+
+        it("returns only new pixels when stamps overlap, never a pixel twice", function()
+            local cov = Geometry.newCoverage()
+            local all, dup = {}, {}
+            pixelsOf(Geometry.coverageAddRect(cov, 0, 0, 10, 10, true), all, dup)
+            pixelsOf(Geometry.coverageAddRect(cov, 5, 5, 10, 10, true), all, dup)
+            pixelsOf(Geometry.coverageAddRect(cov, 0, 0, 10, 10, true), all, dup)  -- fully covered
+            assert.equals(0, #dup)
+            assert.equals(100 + 100 - 25, size(all))
+        end)
+
+        it("a stamp inside existing coverage adds nothing", function()
+            local cov = Geometry.newCoverage()
+            Geometry.coverageAddRect(cov, 0, 0, 20, 20)
+            assert.same({}, Geometry.coverageAddRect(cov, 5, 5, 5, 5, true))
+        end)
+
+        it("merges touching spans and fills gaps between spans", function()
+            local cov = Geometry.newCoverage()
+            Geometry.coverageAddRect(cov, 0, 0, 10, 1)
+            Geometry.coverageAddRect(cov, 20, 0, 10, 1)
+            local all = pixelsOf(Geometry.coverageAddRect(cov, 5, 0, 20, 1, true))
+            assert.equals(10, size(all))                 -- only the gap 10..19 is new
+            assert.same({ { 0, 30 } }, cov[0])           -- one merged span
+            Geometry.coverageAddRect(cov, 30, 0, 5, 1)   -- touching on the right
+            assert.same({ { 0, 35 } }, cov[0])
+        end)
+
+        it("merges identical rows into tall rectangles", function()
+            local cov = Geometry.newCoverage()
+            local rects = Geometry.coverageAddRect(cov, 3, 4, 10, 6, true)
+            assert.equals(1, #rects)
+            assert.same({ x = 3, y = 4, w = 10, h = 6 }, rects[1])
+            local all = Geometry.coverageRects(cov)
+            assert.equals(1, #all)
+            assert.same({ x = 3, y = 4, w = 10, h = 6 }, all[1])
+        end)
+
+        it("strokeCoverageRects equals the union of the brush stamps, each pixel once", function()
+            local strokes = {
+                { { x = 100, y = 100 } },
+                { { x = 100, y = 100 }, { x = 400, y = 100 } },
+                { { x = 10, y = 10 }, { x = 12, y = 11 }, { x = 15, y = 30 }, { x = 14, y = 29 }, { x = 80, y = 90 }, { x = 20, y = 200 } },
+                { { x = 50, y = 50 }, { x = 50, y = 50 }, { x = 51, y = 50 } },
+            }
+            for _, points in ipairs(strokes) do
+                local dup = {}
+                local got = pixelsOf(Geometry.strokeCoverageRects(points, 20), nil, dup)
+                local want = bruteUnion(points, 20)
+                assert.equals(0, #dup)
+                assert.equals(size(want), size(got))
+                for k in pairs(want) do assert.is_true(got[k]) end
+            end
+        end)
+
+        it("a straight horizontal highlight is a single rectangle", function()
+            local rects = Geometry.strokeCoverageRects({ { x = 100, y = 100 }, { x = 600, y = 100 } }, 20)
+            assert.equals(1, #rects)
+            assert.equals(20, rects[1].h)
+        end)
+    end)
+
 end)
