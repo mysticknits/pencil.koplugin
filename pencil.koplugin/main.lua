@@ -17,7 +17,12 @@ local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
-local PencilGeometry = require("lib/geometry")
+-- Some Android file managers flatten the plugin folder on extraction; accept
+-- geometry.lua next to main.lua as well as in lib/.
+local ok_geom, PencilGeometry = pcall(require, "lib/geometry")
+if not ok_geom then
+    PencilGeometry = require("geometry")
+end
 local Screen = Device.screen
 local Size = require("ui/size")
 local InfoMessage = require("ui/widget/infomessage")
