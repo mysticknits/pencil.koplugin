@@ -41,6 +41,7 @@ end
 local Pencil = loadPencil()
 
 local TOOL_TYPE_PEN = 1
+local TOOL_TYPE_ERASER = 2
 
 -- A pencil whose drawing calls are recorded, with an overlay we can open and
 -- close by hand.
@@ -109,6 +110,32 @@ describe("stylus callback and overlays", function()
         assert.is_false(down(pencil, 300, 50))
         assert.is_false(lift(pencil, 300, 50))
         assert.equals(1, pencil.started)
+    end)
+
+    it("stops drawing under an overlay that opens mid-contact, but still takes the lift", function()
+        local pencil = makePencil()
+        down(pencil, 100, 100)
+        pencil.overlay = true
+
+        assert.is_true(down(pencil, 160, 100))
+        assert.is_true(down(pencil, 220, 100))
+        assert.equals(0, pencil.points)
+
+        assert.is_true(lift(pencil, 220, 100))
+        assert.equals(1, pencil.ended)
+    end)
+
+    it("hands the next contact to an overlay even if a lift left pen_down set", function()
+        local pencil = makePencil()
+        down(pencil, 100, 100)
+        -- The pen lifts as the eraser end. That lift goes through the eraser
+        -- branch, which leaves the pen stroke's pen_down set.
+        assert.is_true(pencil:handleStylusSlot(nil, { id = -1, x = 100, y = 100, tool = TOOL_TYPE_ERASER }))
+        assert.is_true(pencil.pen_down)
+
+        pencil.overlay = true
+
+        assert.is_false(down(pencil, 300, 50))
     end)
 
     it("starts a fresh stroke after the overlay closes", function()
