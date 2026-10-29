@@ -359,7 +359,22 @@ end
 -- Handle a stylus slot from the callback
 -- slot = {slot=N, id=N, x=N, y=N, tool=N, timev=timestamp}
 -- id >= 0 means contact active, id == -1 means contact lifted
+--
+-- Tracks whether the current contact belongs to the plugin: it does once
+-- we've handled one of its samples, until it lifts. Every lift clears it,
+-- whichever branch handled the lift, so a stale flag like pen_down can't
+-- keep the plugin from handing later contacts to an overlay.
 function Pencil:handleStylusSlot(input, slot)
+    local handled = self:routeStylusSlot(input, slot)
+    if slot.id and slot.id >= 0 then
+        if handled then self.owns_contact = true end
+    else
+        self.owns_contact = false
+    end
+    return handled
+end
+
+function Pencil:routeStylusSlot(input, slot)
     -- Tool types from Linux input subsystem
     local TOOL_TYPE_PEN = 1
     local TOOL_TYPE_ERASER = 2
@@ -372,8 +387,14 @@ function Pencil:handleStylusSlot(input, slot)
             tostring(self.eraser_button_active)))
     end
 
-    -- Don't capture pen input when a menu or overlay is on top of the reader
-    if self:isOverlayActive() then return false end
+    -- Leave new contacts to a menu or overlay on top of the reader. A contact
+    -- that started on the page is still followed to its lift if an overlay
+    -- opens meanwhile, like the color picker shown while the pen is held
+    -- still: handing over the rest would make the lift a tap outside the
+    -- picker, closing it, and we'd never see the pen go up (#72). We just
+    -- stop drawing and erasing under the overlay.
+    local overlay = self:isOverlayActive()
+    if overlay and not self.owns_contact then return false end
 
     -- Detect eraser end via slot.tool BEFORE key events arrive
     -- This handles the timing issue where stylus callback fires before key events
@@ -399,7 +420,7 @@ function Pencil:handleStylusSlot(input, slot)
             local raw_y = slot.y or self.pen_y
             local x, y = self:transformCoordinates(raw_x, raw_y)
             local page = self:getCurrentPage()
-            local deleted = self:eraseAtPoint(x, y, page)
+            local deleted = not overlay and self:eraseAtPoint(x, y, page)
             if deleted then
                 for _, stroke in ipairs(deleted) do
                     table.insert(self.eraser_button_deleted, stroke)
@@ -416,7 +437,9 @@ function Pencil:handleStylusSlot(input, slot)
             -- Also remove any native KOReader text highlight at this position.
             -- removeItemByIndex emits AnnotationsModified and triggers its own
             -- repaint, so we don't need to mirror the refreshFast call above.
-            self:eraseHighlightAtScreenPos(x, y)
+            if not overlay then
+                self:eraseHighlightAtScreenPos(x, y)
+            end
             self.pen_x = x
             self.pen_y = y
         end
@@ -441,7 +464,7 @@ function Pencil:handleStylusSlot(input, slot)
         return true
     end
 
-    if not self:isEnabled() or self:isOverlayActive() then return false end
+    if not self:isEnabled() then return false end
 
     -- Log in debug mode
     if self.input_debug_mode then
@@ -494,7 +517,7 @@ function Pencil:handleStylusSlot(input, slot)
                     self:writeDebugLog(string.format("ERASE ATTEMPT at (%d, %d) page=%s erasing=%s",
                         x, y, tostring(page), tostring(self.erasing)))
                 end
-                local deleted = self:eraseAtPoint(x, y, page)
+                local deleted = not overlay and self:eraseAtPoint(x, y, page)
                 if deleted then
                     for _, stroke in ipairs(deleted) do
                         table.insert(self.eraser_deleted, stroke)
@@ -537,18 +560,8 @@ function Pencil:handleStylusSlot(input, slot)
     if slot.id and slot.id >= 0 then
         -- Pen down or moving
         if not self.pen_down then
-            -- Check if color picker is showing - route pen tap to it
-            if self.color_picker_showing and self.color_picker_widget then
-                local raw_x = slot.x or 0
-                local raw_y = slot.y or 0
-                local x, y = self:transformCoordinates(raw_x, raw_y)
-                if self.color_picker_widget:handlePenTap(x, y) then
-                    -- Color picker handled the tap, don't start a stroke
-                    return true
-                end
-            end
-
-            -- Start new stroke
+            -- Start new stroke. (Pen taps on an open color picker never get
+            -- here: new contacts go to the overlay, whose buttons handle them.)
             self.pen_down = true
             self.erasing = false
             self:cancelPendingRefresh()
@@ -591,7 +604,9 @@ function Pencil:handleStylusSlot(input, slot)
                         self:resetColorPickerTracking()
                     end
                 end
-                self:addRawPoint(x, y)
+                if not overlay then
+                    self:addRawPoint(x, y)
+                end
                 self.pen_x = x
                 self.pen_y = y
             end
@@ -748,14 +763,16 @@ function Pencil:endRawStroke()
         -- Track the region this stroke touched so the delayed refresh below
         -- can be scoped to it instead of the whole screen.
         self:accumulateRefreshBbox(self.current_stroke)
+        -- Schedule delayed refresh for clean display after writing stops.
+        -- Not when nothing was saved, e.g. a hold that opened the color
+        -- picker: a fast refresh over it would grey out its swatches.
+        self:scheduleDelayedRefresh()
     else
         if self.input_debug_mode then
             self:writeDebugLog("endRawStroke: NOT SAVED (no current_stroke or no points)")
         end
     end
     self.current_stroke = nil
-    -- Schedule delayed refresh for clean display after writing stops
-    self:scheduleDelayedRefresh()
 end
 
 -- Paint the in-progress text selection as "invert" rectangles while a
