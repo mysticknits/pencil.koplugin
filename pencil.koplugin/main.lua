@@ -267,10 +267,7 @@ function Pencil:onPencilToggleTool()
         self.current_tool = TOOL_ERASER
     end
     local display_name = self.current_tool == TOOL_PEN and _("pencil") or _("eraser")
-    UIManager:show(InfoMessage:new{
-        text = T(_("Tool: %1"), display_name),
-        timeout = 1,
-    })
+    self:showToast(T(_("Tool: %1"), display_name), 1)
     return true
 end
 
@@ -279,35 +276,23 @@ function Pencil:onPencilToggleEnabled()
     self:setEnabled(not enabled)
     if self:isEnabled() then
         self:setupPenInput()
-        UIManager:show(InfoMessage:new{
-            text = _("Pencil enabled"),
-            timeout = 1,
-        })
+        self:showToast(_("Pencil enabled"), 1)
     else
         self:teardownPenInput()
-        UIManager:show(InfoMessage:new{
-            text = _("Pencil disabled"),
-            timeout = 1,
-        })
+        self:showToast(_("Pencil disabled"), 1)
     end
     return true
 end
 
 function Pencil:onPencilSelectPen()
     self.current_tool = TOOL_PEN
-    UIManager:show(InfoMessage:new{
-        text = _("Pencil tool: pencil"),
-        timeout = 1,
-    })
+    self:showToast(_("Pencil tool: pencil"), 1)
     return true
 end
 
 function Pencil:onPencilSelectEraser()
     self.current_tool = TOOL_ERASER
-    UIManager:show(InfoMessage:new{
-        text = _("Eraser selected"),
-        timeout = 1,
-    })
+    self:showToast(_("Eraser selected"), 1)
     return true
 end
 
@@ -1048,10 +1033,7 @@ function Pencil:setTool(tool)
     self:saveSettings()
     -- Show visual feedback with proper display name
     local display_name = tool == TOOL_PEN and _("pencil") or _("eraser")
-    UIManager:show(InfoMessage:new{
-        text = T(_("Tool: %1"), display_name),
-        timeout = 1,
-    })
+    self:showToast(T(_("Tool: %1"), display_name), 1)
 end
 
 function Pencil:isEnabled()
@@ -1061,12 +1043,34 @@ end
 -- Check if a menu or overlay is shown on top of the reader view.
 -- When true, pen input should pass through so the overlay can handle it.
 function Pencil:isOverlayActive()
-    local top = UIManager:getTopmostVisibleWidget()
-    if not top then return false end
     -- ReaderUI is the document view itself — anything else is an overlay.
-    -- getTopmostVisibleWidget skips widgets marked invisible — transient
-    -- decorations that paint but don't capture input, e.g. TrapWidget.
-    return (top.name or top.id) ~= "ReaderUI"
+    -- Like getTopmostVisibleWidget, skip widgets marked invisible (transient
+    -- decorations that paint but don't capture input, e.g. TrapWidget). Also
+    -- skip toasts, which KOReader passes input through, like our own
+    -- confirmations (see showToast).
+    local stack = UIManager._window_stack
+    if not stack then
+        local top = UIManager:getTopmostVisibleWidget()
+        return top ~= nil and (top.name or top.id) ~= "ReaderUI"
+    end
+    for i = #stack, 1, -1 do
+        local widget = stack[i].widget
+        if not widget.invisible and not widget.toast then
+            return (widget.name or widget.id) ~= "ReaderUI"
+        end
+    end
+    return false
+end
+
+-- Show a short confirmation (tool, color, width) as a toast. KOReader passes
+-- input through toasts and isOverlayActive skips them, so a stroke started
+-- while one is still showing is drawn in full instead of losing its start.
+function Pencil:showToast(text, timeout)
+    UIManager:show(InfoMessage:new{
+        text = text,
+        timeout = timeout,
+        toast = true,
+    })
 end
 
 -- Set enabled state (global setting)
@@ -1429,10 +1433,7 @@ function Pencil:togglePenEraser()
     logger.dbg("Pencil: toggled from", old_tool, "to", new_tool)
 
     -- Show brief visual feedback
-    UIManager:show(InfoMessage:new{
-        text = T(_("Tool: %1"), new_tool),
-        timeout = 0.5,
-    })
+    self:showToast(T(_("Tool: %1"), new_tool), 0.5)
 end
 
 -- Handle stylus button and tool events
@@ -2346,10 +2347,7 @@ function Pencil:showColorPicker(x, y)
             -- This avoids the string-match ambiguity the earlier prototype had.
             if width_value then
                 plugin:setPenWidth(width_value)
-                UIManager:show(InfoMessage:new{
-                    text = T(_("Pen width: %1"), width_value),
-                    timeout = 1,
-                })
+                plugin:showToast(T(_("Pen width: %1"), width_value), 1)
                 return
             end
 
@@ -2360,10 +2358,7 @@ function Pencil:showColorPicker(x, y)
                 color_name = "White"
             end
 
-            UIManager:show(InfoMessage:new{
-                text = T(_("Pen color: %1"), color_name),
-                timeout = 1,
-            })
+            plugin:showToast(T(_("Pen color: %1"), color_name), 1)
         end,
         close_callback = function()
             plugin.color_picker_showing = false
@@ -3667,10 +3662,7 @@ function Pencil:clearPageStrokes()
     local indices_to_remove = self.page_strokes[page]
 
     if not indices_to_remove or #indices_to_remove == 0 then
-        UIManager:show(InfoMessage:new{
-            text = _("No annotations found on this page."),
-            timeout = 1,
-        })
+        self:showToast(_("No annotations found on this page."), 1)
         return
     end
 
@@ -3699,10 +3691,7 @@ function Pencil:clearPageStrokes()
     self:refreshDogear()
     self:saveStrokes()
 
-    UIManager:show(InfoMessage:new{
-        text = T(_("Cleared %1 annotation(s) from page."), #deleted_strokes),
-        timeout = 1,
-    })
+    self:showToast(T(_("Cleared %1 annotation(s) from page."), #deleted_strokes), 1)
     UIManager:setDirty(self.view, "ui")
 end
 
