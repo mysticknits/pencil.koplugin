@@ -93,6 +93,32 @@ When enabled, the plugin automatically groups your pencil strokes into logical a
 1. Export of annotations
 2. Handling changing canvas size
 
+## Contributing
+
+Contributions are welcome. Please open a pull request against `main`. Nothing in this section affects installing the plugin: only the `pencil.koplugin` folder is copied to a device.
+
+### Unit tests
+
+The specs in `spec/` stub out KOReader and run with [busted](https://lunarmodules.github.io/busted/). CI runs them on every pull request.
+
+```
+luarocks install busted
+busted spec
+```
+
+### Integration tests and the emulator
+
+To test against real KOReader without a device, build KOReader's desktop emulator. The `integration/` folder has a script that links your working copy of the plugin into it:
+
+```
+integration/run.sh test   # run integration tests inside KOReader's test harness
+integration/run.sh emu    # open the emulator with a test book
+```
+
+In the emulator, the mouse acts as the stylus. Hold E while dragging to use the eraser end, and hold H to use the side button. Clicks near the top or bottom edge open KOReader's menus.
+
+See [integration/README.md](integration/README.md) for the one-time setup and more detail. These tests need a local emulator build, so CI doesn't run them. Please run them before opening a pull request that touches drawing, erasing or bookmarks.
+
 ## Acknowledgements
 
 Eraser end detection based on techniques from [eraser.koplugin](https://github.com/SimonLiu423/eraser.koplugin) by SimonLiu.
