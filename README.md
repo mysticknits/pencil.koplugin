@@ -12,6 +12,8 @@ If you change the font size or margins after writing, your annotations will be W
 
 Rotating the device is handled: annotations written in the other orientation show as a small badge, and tapping the badge opens a saved picture of what you wrote.
 
+**Interested in helping maintain Pencil?** See [Looking for maintainers](#looking-for-maintainers).
+
 ### Requires KOReader 2026.07 "Sailing Walrus" or newer
 
 ## Features
@@ -106,6 +108,10 @@ When enabled, the plugin automatically groups your pencil strokes into logical a
 ## Contributing
 
 Contributions are welcome. Please open a pull request against `main`. Nothing in this section affects installing the plugin: only the `pencil.koplugin` folder is copied to a device.
+
+### Looking for maintainers
+
+I'd love help keeping Pencil going. A lot of good work is happening in forks, and I'd rather bring it together here. If you'd like to be an active maintainer, reviewing pull requests, triaging issues, or testing on devices I don't have, please [open an issue](https://github.com/mysticknits/pencil.koplugin/issues/new?title=Maintainer%20interest) and tell me a little about yourself, your device and what you'd like to work on.
 
 ### Unit tests
 
