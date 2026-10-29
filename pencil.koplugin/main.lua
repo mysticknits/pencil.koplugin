@@ -2998,13 +2998,27 @@ end
 
 -- Get the bookmark page reference for a group.
 -- For paging mode (PDF), this is the page number.
--- For rolling mode (EPUB), this must be an XPointer.
-function Pencil:getBookmarkPageRef(group_page)
+-- For rolling mode (EPUB), a valid XPointer, or nil. KOReader can't sort
+-- an invalid one. Two make its sort fail and the book won't open (#84).
+function Pencil:getBookmarkPageRef(group)
     if self.ui.rolling and self.ui.document and self.ui.document.getPageXPointer then
-        -- group.page is a number (from getCurrentPage), convert back to XPointer
-        return self.ui.document:getPageXPointer(group_page)
+        local doc = self.ui.document
+        local function valid(xp)
+            return type(xp) == "string" and xp ~= "" and doc:isXPointerInDocument(xp)
+        end
+        -- The ink's own XPointer. It follows the ink through font changes
+        -- and rotation.
+        if valid(group.xpointer) then
+            return group.xpointer
+        end
+        -- The page's start. Past the end of the book this is "".
+        local xp = doc:getPageXPointer(group.page)
+        if valid(xp) then
+            return xp
+        end
+        return nil
     end
-    return group_page
+    return group.page
 end
 
 -- Sync a group's bookmark into KOReader's annotation system.
@@ -3023,8 +3037,12 @@ function Pencil:syncGroupBookmark(group)
         -- Remove existing bookmark for this group first
         self:removeGroupBookmark(group)
 
-        local pageno = self:getPageNumber(group.page)
-        local bookmark_page = self:getBookmarkPageRef(group.page)
+        local bookmark_page = self:getBookmarkPageRef(group)
+        if not bookmark_page then
+            logger.dbg("Pencil: no valid position for group", group.id, "- no bookmark")
+            return
+        end
+        local pageno = self:getPageNumber(bookmark_page)
         local chapter = ""
         if self.ui.toc and self.ui.toc.getTocTitleByPage then
             chapter = self.ui.toc:getTocTitleByPage(bookmark_page) or ""
