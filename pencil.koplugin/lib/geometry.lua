@@ -7,22 +7,22 @@ Pure functions for stroke geometry calculations.
 
 local Geometry = {}
 
---- Check if a point is near any point in a stroke.
+--- Check if a point is near any point in an array.
 -- Uses squared distance comparison to avoid sqrt for performance.
 -- @param px X coordinate of point to check
 -- @param py Y coordinate of point to check
--- @param stroke Table with points array
+-- @param points Array with points
 -- @param threshold Distance threshold (default 20)
 -- @return boolean True if point is within threshold of any stroke point
-function Geometry.isPointNearStroke(px, py, stroke, threshold)
-    if not stroke or not stroke.points then
+function Geometry.isPointNearPoints(px, py, points, threshold)
+    if not points then
         return false
     end
 
     threshold = threshold or 20
     local threshold_sq = threshold * threshold
 
-    for _, point in ipairs(stroke.points) do
+    for _, point in ipairs(points) do
         local dx = px - point.x
         local dy = py - point.y
         if dx * dx + dy * dy <= threshold_sq then

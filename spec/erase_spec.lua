@@ -33,8 +33,11 @@ local function createMockPencil(strokes, eraser_width)
     end
 
     -- Use real geometry function for point-near-stroke check
-    function mock:isPointNearStroke(px, py, stroke, threshold)
-        return Geometry.isPointNearStroke(px, py, stroke, threshold)
+    function mock:isPointNearStroke(px, py, stroke, screen_points, threshold)
+        if not screen_points then
+            screen_points = stroke.points
+        end
+        return Geometry.isPointNearPoints(px, py, screen_points, threshold)
     end
 
     -- Copy of eraseAtPoint from main.lua. Mirrors the page-indexed loop so this
@@ -52,7 +55,7 @@ local function createMockPencil(strokes, eraser_width)
         if page_indices then
             for _, i in ipairs(page_indices) do
                 local stroke = self.strokes[i]
-                if stroke and self:isPointNearStroke(x, y, stroke, eraser_width) then
+                if stroke and self:isPointNearStroke(x, y, stroke, nil, eraser_width) then
                     table.insert(deleted, stroke)
                     table.insert(indices_to_remove, i)
                 end
