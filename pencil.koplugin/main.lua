@@ -4048,6 +4048,24 @@ function Pencil:migrateStrokesFileIfNeeded()
     self:rememberStrokesFilePath(current)
     logger.info("Pencil: moved strokes file from", previous, "to", current)
 
+    -- Bring the annotation preview pictures along. Groups store each
+    -- picture's filename relative to pencil_images/, so moving the folder is
+    -- enough. Never overwrite pictures already in the new sidecar.
+    local new_images = self:getImagesDir()
+    if old_sidecar and new_images then
+        local old_images = old_sidecar .. "/pencil_images"
+        if lfs.attributes(old_images, "mode") == "directory"
+                and not lfs.attributes(new_images, "mode") then
+            local moved_images, images_err = os.rename(old_images, new_images)
+            if moved_images then
+                logger.info("Pencil: moved annotation images to", new_images)
+            else
+                logger.warn("Pencil: failed to move annotation images from", old_images,
+                    "to", new_images, "error:", images_err)
+            end
+        end
+    end
+
     -- rmdir only succeeds when the legacy sidecar is empty. If KOReader or
     -- another plugin left data there, it is preserved without extra handling.
     if old_sidecar then
