@@ -18,6 +18,13 @@ end
 
 local shown = {}
 
+-- Tool confirmations are KOReader notifications, loaded when first shown.
+package.loaded["ui/widget/notification"] = {
+    SOURCE_DISPATCHER = 0x0020,
+    SOURCE_ALWAYS_SHOW = 0x8000,
+    notify = function(_, text) table.insert(shown, { text = text }) end,
+}
+
 local stubs = {
     ["ui/widget/container/inputcontainer"] = {
         extend = function(_, o) return setmetatable(o or {}, { __index = make_stub() }) end,
