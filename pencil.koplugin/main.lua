@@ -372,8 +372,7 @@ function Pencil:handleStylusSlot(input, slot)
         -- Switched from eraser end to pen tip
         logger.info("Pencil: Pen tip detected via slot.tool, deactivating eraser mode")
         if self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
-            table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
-            self:saveStrokes()
+            self:commitErase(self.eraser_button_deleted)
         end
         self.eraser_button_active = false
         self.eraser_button_deleted = nil
@@ -499,8 +498,7 @@ function Pencil:handleStylusSlot(input, slot)
                 self.pen_down = false
                 self.erasing = false
                 if self.eraser_deleted and #self.eraser_deleted > 0 then
-                    table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_deleted })
-                    self:saveStrokes()
+                    self:commitErase(self.eraser_deleted)
                 end
                 self.eraser_deleted = nil
                 UIManager:setDirty(self.view, "ui")
@@ -1189,12 +1187,14 @@ function Pencil:addToMainMenu(menu_items)
                             self:saveSettings()
                             if self.experimental_bookmark_sync then
                                 self:syncAllBookmarks()
+                                self:refreshDogear()
                                 UIManager:show(InfoMessage:new{
                                     text = _("Bookmark sync enabled. Pencil annotations will appear in the Bookmarks menu."),
                                     timeout = 3,
                                 })
                             else
                                 self:removeAllPencilBookmarks()
+                                self:refreshDogear()
                                 UIManager:show(InfoMessage:new{
                                     text = _("Bookmark sync disabled. Pencil bookmarks removed."),
                                     timeout = 3,
@@ -1460,8 +1460,7 @@ function Pencil:onKeyPress(key)
         logger.info("Pencil: BTN_TOOL_PEN press - deactivating eraser mode")
         if self.eraser_button_active and self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
             -- Save any pending eraser deletions before switching to pen
-            table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
-            self:saveStrokes()
+            self:commitErase(self.eraser_button_deleted)
         end
         self.eraser_button_active = false
         self.eraser_button_deleted = nil
@@ -1493,8 +1492,7 @@ function Pencil:onKeyRelease(key)
         logger.info("Pencil: Eraser button RELEASED")
         self.eraser_button_active = false
         if self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
-            table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
-            self:saveStrokes()
+            self:commitErase(self.eraser_button_deleted)
         end
         self.eraser_button_deleted = nil
         UIManager:setDirty(self.view, "ui")
@@ -1505,8 +1503,7 @@ function Pencil:onKeyRelease(key)
     if key_str:match("BTN_TOOL_RUBBER") or key_str:match("ToolRubber") then
         logger.info("Pencil: BTN_TOOL_RUBBER release - deactivating eraser mode")
         if self.eraser_button_active and self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
-            table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
-            self:saveStrokes()
+            self:commitErase(self.eraser_button_deleted)
         end
         self.eraser_button_active = false
         self.eraser_button_deleted = nil
@@ -1543,6 +1540,8 @@ function Pencil:undoLastStroke()
             table.remove(self.strokes, stroke_idx)
             self:rebuildPageIndex()
             self:rebuildAnnotationGroups()
+            self:flushDirtyGroups()
+            self:refreshDogear()
             self:saveStrokes()
             UIManager:setDirty(self.view, "ui")
         end
@@ -1553,6 +1552,8 @@ function Pencil:undoLastStroke()
         end
         self:rebuildPageIndex()
         self:rebuildAnnotationGroups()
+        self:flushDirtyGroups()
+        self:refreshDogear()
         self:saveStrokes()
         UIManager:setDirty(self.view, "ui")
     end
@@ -1780,6 +1781,44 @@ function Pencil:flushDirtyGroups()
         self:syncGroupBookmark(group)
     end
     self.dirty_groups = nil
+end
+
+-- Recheck KOReader's dogear (the folded page corner) for the current page.
+-- The plugin adds and removes its bookmarks directly in the annotation list,
+-- and KOReader only rechecks the dogear on page turns, so without this the
+-- corner stays down after the ink it marked is erased.
+function Pencil:refreshDogear()
+    local bookmark = self.ui and self.ui.bookmark
+    local view = self.view
+    if not (bookmark and bookmark.setDogearVisibility and bookmark.getCurrentPageNumber
+            and view and view.dogear) then
+        return
+    end
+    local was_visible = view.dogear_visible
+    local ok, err = pcall(function()
+        bookmark:setDogearVisibility(bookmark:getCurrentPageNumber())
+    end)
+    if not ok then
+        logger.warn("Pencil: dogear refresh failed:", err)
+        return
+    end
+    if view.dogear_visible ~= was_visible then
+        -- Same refresh KOReader uses when toggling a bookmark by hand.
+        UIManager:setDirty(view.dialog, function()
+            return "ui", view.dogear:getRefreshRegion()
+        end)
+    end
+end
+
+-- Finish an eraser pass: record it for undo, re-add bookmarks for the ink
+-- that survived (erasing rebuilds every group and drops their bookmarks),
+-- update the dogear, and save.
+function Pencil:commitErase(deleted)
+    if not deleted or #deleted == 0 then return end
+    table.insert(self.undo_stack, { type = "delete", strokes = deleted })
+    self:flushDirtyGroups()
+    self:refreshDogear()
+    self:saveStrokes()
 end
 
 -- Reset color picker tracking (called when pen moves too far)
@@ -2667,8 +2706,7 @@ function Pencil:onDrawPanRelease(ges)
     if effective_tool == TOOL_ERASER then
         if self.eraser_deleted and #self.eraser_deleted > 0 then
             -- Add deleted strokes to undo stack
-            table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_deleted })
-            self:saveStrokes()
+            self:commitErase(self.eraser_deleted)
         end
         -- Always refresh screen after erasing to clear any visual artifacts
         UIManager:setDirty(self.view, "partial")
@@ -2916,6 +2954,12 @@ function Pencil:rebuildAnnotationGroups()
             self:removeGroupBookmark(group)
             self:cancelGroupImageCapture(group.id)
         end
+
+        -- Drop bookmarks still queued for the old groups. Without this, ink
+        -- erased before its queued bookmark was added left a bookmark (and the
+        -- page's folded corner) behind. Regrouping below re-queues every group
+        -- that still has ink.
+        self.dirty_groups = nil
 
         self.annotation_groups = {}
 
@@ -3627,6 +3671,8 @@ function Pencil:clearPageStrokes()
 
     self:rebuildPageIndex()
     self:rebuildAnnotationGroups()
+    self:flushDirtyGroups()
+    self:refreshDogear()
     self:saveStrokes()
 
     UIManager:show(InfoMessage:new{
@@ -3647,6 +3693,7 @@ function Pencil:clearAllStrokes()
     self.strokes = {}
     self.page_strokes = {}
     self.annotation_groups = {}
+    self:refreshDogear()
     self:saveStrokes()
     -- Belt-and-suspenders: any leftover files get reaped.
     self:purgeOrphanImages()
