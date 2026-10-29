@@ -6,6 +6,7 @@ Enables freehand drawing and annotation with stylus on supported devices.
 --]]--
 
 local Blitbuffer = require("ffi/blitbuffer")
+local ButtonDialog = require("ui/widget/buttondialog")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local DataStorage = require("datastorage")
 local Device = require("device")
@@ -22,6 +23,10 @@ local Screen = Device.screen
 local Size = require("ui/size")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
+local MultiInputDialog = require("ui/widget/multiinputdialog")
+local TextViewer = require("ui/widget/textviewer")
+local NetworkMgr = require("ui/network/manager")
+local MyScript = require("lib/myscript")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local lfs = require("libs/libkoreader-lfs")
@@ -40,6 +45,8 @@ local TOOL_PEN = "pen"
 local TOOL_HIGHLIGHTER = "highlighter"
 local TOOL_ERASER = "eraser"
 
+local function trimString(v) return tostring(v or ""):match("^%s*(.-)%s*$") end
+
 -- Color picker trigger settings
 local COLOR_PICKER_DELAY_MS = 500  -- How long pen must be held still (milliseconds)
 local COLOR_PICKER_TOLERANCE_PIXELS = 15  -- How many pixels pen can move while "still"
@@ -57,6 +64,7 @@ local IMAGE_CAPTURE_DEBOUNCE_S = 4       -- seconds after last stroke before cap
 local IMAGE_BADGE_SIZE = 48              -- on-page badge edge (px) when annotation is stale
 local IMAGE_BADGE_HIT_PAD = 32           -- extra pixels around badge for tap hit-test
 local IMAGE_BADGE_MARGIN_GAP = 5         -- gap from text/screen edge for margin badge
+local ANNOTATION_HOLD_HIT_PAD = 18  -- extra pixels around annotation bbox
 
 -- Module-level reference to the most recently initialized Pencil instance.
 -- Used by the bookmark-list hook (a class-level monkey-patch installed once)
@@ -997,6 +1005,11 @@ function Pencil:loadSettings()
     self.experimental_pen_width = settings.experimental_pen_width or false
     self.experimental_color_picker = settings.experimental_color_picker or false
     self.experimental_text_highlight = settings.experimental_text_highlight or false
+    -- MyScript handwriting recognition settings.
+    self.myscript_language = settings.myscript_language or "en_US"
+    self.myscript_application_key = settings.myscript_application_key or ""
+    self.myscript_hmac_key = settings.myscript_hmac_key or ""
+
     -- Load pen color by name and look up the actual color value
     local color_name = settings.pen_color_name
     if color_name then
@@ -1030,6 +1043,9 @@ function Pencil:saveSettings()
         experimental_pen_width = self.experimental_pen_width,
         experimental_color_picker = self.experimental_color_picker,
         experimental_text_highlight = self.experimental_text_highlight,
+        myscript_language = self.myscript_language,
+        myscript_application_key = self.myscript_application_key,
+        myscript_hmac_key = self.myscript_hmac_key,
         pen_color_name = self.tool_settings[TOOL_PEN].color_name,
         swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
         pen_width = self.tool_settings[TOOL_PEN].width,
@@ -1266,6 +1282,43 @@ function Pencil:addToMainMenu(menu_items)
                                     timeout = 2,
                                 })
                             end
+                        end,
+                    },
+                },
+                separator = true,
+            },
+            {
+                text = _("Handwriting recognition"),
+                sub_item_table = {
+                    { text = _("Configure MyScript"), callback = function() self:showMyScriptSettingsDialog() end },
+                    { text = _("Recognize latest annotation group"),
+                      enabled_func = function() return self:getLatestAnnotationGroupOnCurrentPage() ~= nil end,
+                      callback = function() local g = self:getLatestAnnotationGroupOnCurrentPage(); if g then self:recognizeAnnotationGroup(g) end end },
+                    {
+                        text = _("Recognize all annotation groups"),
+                        enabled_func = function()
+                            return self.annotation_groups and #self.annotation_groups > 0
+                        end,
+                        callback = function()
+                            self:recognizeAllAnnotationGroups()
+                        end,
+                    },
+                    {
+                        text = _("Show all recognized text"),
+                        enabled_func = function()
+                            return self:hasRecognizedAnnotations()
+                        end,
+                        callback = function()
+                            self:showAllRecognizedText()
+                        end,
+                    },
+                    {
+                        text = _("Edit all recognized text"),
+                        enabled_func = function()
+                            return self:hasRecognizedAnnotations()
+                        end,
+                        callback = function()
+                            self:editAllRecognizedText()
                         end,
                     },
                 },
@@ -1708,14 +1761,19 @@ end
 function Pencil:onDrawHold(ges)
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
-    -- If raw input detected pen, block hold to prevent reader highlight mode
+    -- Annotation/badge interception has priority over ReaderHighlight.
+    if ges and ges.pos then
+        local group = self:findGroupBadgeAtPoint(ges.pos.x, ges.pos.y)
+            or self:findAnnotationGroupAtPoint(ges.pos.x, ges.pos.y)
+        if group then
+            self:showAnnotationHoldMenu(group)
+            return true
+        end
+    end
+
     if self.pen_down then return true end
-
-    -- Fallback: check pen input via gesture system's slot data
-    local is_pen, _ = self:isPenInput(ges)
+    local is_pen = select(1, self:isPenInput(ges))
     if not is_pen then return false end
-
-    -- Block pen hold gestures while drawing mode is active
     return true
 end
 
@@ -2510,6 +2568,98 @@ function Pencil:getEffectiveTool(is_eraser_end, is_highlighter)
     return self.current_tool
 end
 
+-- Find the topmost visible pencil annotation group at a screen position.
+-- Stale-rotation groups are excluded because their saved bbox is not valid in
+-- the current layout; those remain accessible through their rotation badge.
+function Pencil:findAnnotationGroupAtPoint(x, y)
+    local page = self:getCurrentPage()
+    local rotation = Screen:getRotationMode()
+    local groups = self.annotation_groups or {}
+    for i = #groups, 1, -1 do
+        local group = groups[i]
+        local bbox = group.bbox
+        local same_rotation = group.image_rotation == nil
+            or group.image_rotation == rotation
+        if bbox and same_rotation and self:getGroupCurrentPage(group) == page
+                and x >= bbox.x0 - ANNOTATION_HOLD_HIT_PAD
+                and x <= bbox.x1 + ANNOTATION_HOLD_HIT_PAD
+                and y >= bbox.y0 - ANNOTATION_HOLD_HIT_PAD
+                and y <= bbox.y1 + ANNOTATION_HOLD_HIT_PAD then
+            return group
+        end
+    end
+    return nil
+end
+
+-- Show annotation actions after a priority long press.
+function Pencil:showAnnotationHoldMenu(group)
+    if not group then return end
+
+    local dialog
+    local text = trimString(group.transcription)
+    local rows = {}
+
+    if text ~= "" then
+        rows[#rows + 1] = {{
+            text = _("Show recognized text"),
+            callback = function()
+                UIManager:close(dialog)
+                self:showRecognizedText(text, group)
+            end,
+        }}
+        rows[#rows + 1] = {{
+            text = _("Edit recognized text"),
+            callback = function()
+                UIManager:close(dialog)
+                self:showAnnotationTextEditor(group)
+            end,
+        }}
+        rows[#rows + 1] = {{
+            text = _("Recognize again"),
+            callback = function()
+                UIManager:close(dialog)
+                self:recognizeAnnotationGroup(group)
+            end,
+        }}
+    else
+        rows[#rows + 1] = {{
+            text = _("Create text"),
+            callback = function()
+                UIManager:close(dialog)
+                self:showAnnotationTextEditor(group)
+            end,
+        }}
+        rows[#rows + 1] = {{
+            text = _("Recognize this annotation"),
+            callback = function()
+                UIManager:close(dialog)
+                self:recognizeAnnotationGroup(group)
+            end,
+        }}
+    end
+
+    if group.image_path then
+        rows[#rows + 1] = {{
+            text = _("Show saved image"),
+            callback = function()
+                UIManager:close(dialog)
+                self:showGroupImagePreview(group)
+            end,
+        }}
+    end
+
+    rows[#rows + 1] = {{
+        text = _("Cancel"),
+        callback = function() UIManager:close(dialog) end,
+    }}
+
+    dialog = ButtonDialog:new{
+        title = T(_("Pencil annotation - page %1"), self:getPageNumber(group.page)),
+        buttons = rows,
+    }
+    UIManager:show(dialog)
+end
+
 -- Called on tap - create a dot or erase at point
 function Pencil:onDrawTap(ges)
     if not self:isEnabled() or self:isOverlayActive() then return false end
@@ -3033,10 +3183,22 @@ function Pencil:syncGroupBookmark(group)
         local datetime = group.id  -- use group id as unique datetime key
         group.bookmark_datetime = datetime
 
+        local transcription = trimString(group.transcription)
+        local bookmark_text
+
+        if transcription ~= "" then
+            bookmark_text = transcription
+        else
+            bookmark_text = string.format(
+                "Pencil annotation on page %d",
+                pageno
+            )
+        end
+
         local item = {
             page = bookmark_page,
             datetime = datetime,
-            text = string.format("Pencil annotation on page %d", pageno),
+            text = bookmark_text,
             chapter = chapter,
         }
 
@@ -3102,6 +3264,388 @@ function Pencil:syncAllBookmarks()
         self:syncGroupBookmark(group)
     end
     logger.info("Pencil: synced", #self.annotation_groups, "annotation group bookmarks")
+end
+
+------------------------------------------------------------------------------
+-- MyScript handwriting recognition
+------------------------------------------------------------------------------
+
+function Pencil:showMyScriptSettingsDialog()
+    local dialog
+    dialog = MultiInputDialog:new{
+        title = _("MyScript settings"),
+        fields = {
+            { description = _("Recognition language"), text = self.myscript_language or "en_US", hint = "en_US" },
+            { description = _("Application key"), text = self.myscript_application_key or "" },
+            { description = _("HMAC key"), text = self.myscript_hmac_key or "", text_type = "password" },
+        },
+        buttons = {{
+            { text = _("Cancel"), id = "close", callback = function() UIManager:close(dialog) end },
+            { text = _("Save"), is_enter_default = true, callback = function()
+                local f = dialog:getFields()
+                local lang, app, hmac = trimString(f[1]), trimString(f[2]), trimString(f[3])
+                if lang == "" or app == "" or hmac == "" then
+                    UIManager:show(InfoMessage:new{ text = _("Language, application key, and HMAC key are required."), timeout = 3 })
+                    return
+                end
+                self.myscript_language, self.myscript_application_key, self.myscript_hmac_key = lang, app, hmac
+                self:saveSettings(); UIManager:close(dialog)
+                UIManager:show(InfoMessage:new{ text = _("MyScript settings saved."), timeout = 2 })
+            end },
+        }},
+    }
+    UIManager:show(dialog); dialog:onShowKeyboard()
+end
+
+function Pencil:getLatestAnnotationGroupOnCurrentPage()
+    local page, latest = self:getCurrentPage(), nil
+    for _, g in ipairs(self.annotation_groups or {}) do
+        if self:getGroupCurrentPage(g) == page and (not latest or (g.datetime_last or g.datetime or 0) > (latest.datetime_last or latest.datetime or 0)) then latest = g end
+    end
+    return latest
+end
+
+function Pencil:getMyScriptStrokesForGroup(group)
+    if not group or type(group.stroke_indices) ~= "table" then return nil, { message = "Invalid annotation group" } end
+    return MyScript.strokes_from_pencil({ strokes = self.strokes, annotation_groups = { group } }, { group_index = 1, pointer_type = "PEN", pointer_id = 0 })
+end
+
+function Pencil:showRecognizedText(text, group)
+    UIManager:show(TextViewer:new{
+        title = T(_("Handwriting - page %1"), self:getPageNumber(group.page)),
+        text = text,
+        text_settings = {},
+    })
+end
+
+function Pencil:createMyScriptClient()
+    return MyScript.new{
+        application_key = self.myscript_application_key,
+        hmac_key = self.myscript_hmac_key,
+        language = self.myscript_language,
+        content_type = "Text",
+        client_name = "koreader-pencil-plugin",
+        client_version = "1.1.0",
+    }
+end
+
+-- Store text on the group and on every stroke referenced by the group.
+-- A stroke keeps group id + text, which avoids ambiguity if groups are rebuilt.
+function Pencil:setAnnotationGroupText(group, text, engine)
+    text = trimString(text)
+    if not group or text == "" then return false end
+
+    local updated_at = os.time()
+    local source = engine or "manual"
+    group.transcription = text
+    group.transcription_language = self.myscript_language
+    group.transcription_datetime = updated_at
+    group.transcription_engine = source
+
+    for _, stroke_index in ipairs(group.stroke_indices or {}) do
+        local stroke = self.strokes[stroke_index]
+        if stroke then
+            stroke.transcription = text
+            stroke.transcription_group_id = group.id
+            stroke.transcription_language = self.myscript_language
+            stroke.transcription_datetime = updated_at
+            stroke.transcription_engine = source
+        end
+    end
+
+    if self.experimental_bookmark_sync then
+        self:syncGroupBookmark(group)
+    end
+    return true
+end
+
+function Pencil:enrichAnnotationGroup(group, text)
+    return self:setAnnotationGroupText(group, text, "myscript")
+end
+
+function Pencil:showAnnotationTextEditor(group)
+    if not group then return end
+
+    local dialog
+    local existing_text = trimString(group.transcription)
+    dialog = MultiInputDialog:new{
+        title = existing_text ~= ""
+            and _("Edit annotation text")
+            or _("Create annotation text"),
+        fields = {{
+            description = _("Text"),
+            text = existing_text,
+            hint = _("Enter annotation text"),
+        }},
+        buttons = {{
+            { text = _("Cancel"), id = "close", callback = function() UIManager:close(dialog) end },
+            { text = _("Save"), is_enter_default = true, callback = function()
+                local fields = dialog:getFields()
+                local edited_text = trimString(fields and fields[1])
+                if edited_text == "" then
+                    UIManager:show(InfoMessage:new{
+                        text = _("Annotation text cannot be empty."),
+                        timeout = 2,
+                    })
+                    return
+                end
+                self:setAnnotationGroupText(group, edited_text, "manual")
+                self:saveStrokes()
+                UIManager:close(dialog)
+                UIManager:show(InfoMessage:new{
+                    text = _("Annotation text saved."),
+                    timeout = 2,
+                })
+            end },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function Pencil:recognizeGroupWithClient(client, group)
+    local strokes, conversion_error = self:getMyScriptStrokesForGroup(group)
+    if not strokes then
+        return nil, conversion_error
+    end
+
+    local ok, text, api_error = pcall(client.recognize_text, client, strokes, {
+        language = self.myscript_language,
+    })
+    if not ok then
+        logger.warn("Pencil: MyScript call failed:", tostring(text))
+        return nil, { message = tostring(text), kind = "unexpected" }
+    end
+    text = trimString(text)
+    if text == "" then
+        return nil, api_error or { message = _("No text was recognized.") }
+    end
+
+    self:enrichAnnotationGroup(group, text)
+    return text
+end
+
+function Pencil:recognizeAnnotationGroup(group)
+    if trimString(self.myscript_application_key) == ""
+            or trimString(self.myscript_hmac_key) == "" then
+        self:showMyScriptSettingsDialog()
+        return
+    end
+
+    NetworkMgr:runWhenOnline(function()
+        local client, client_error = self:createMyScriptClient()
+        if not client then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Invalid MyScript configuration: %1"), tostring(client_error)),
+            })
+            return
+        end
+
+        UIManager:show(InfoMessage:new{
+            text = _("Recognizing handwriting..."),
+            timeout = 1,
+        })
+
+        local text, error_value = self:recognizeGroupWithClient(client, group)
+        if not text then
+            local message = error_value and error_value.message or error_value
+            UIManager:show(InfoMessage:new{
+                text = T(_("Recognition failed: %1"), tostring(message)),
+            })
+            return
+        end
+
+        self:saveStrokes()
+        self:showRecognizedText(text, group)
+    end)
+end
+
+function Pencil:hasRecognizedAnnotations()
+    for _, group in ipairs(self.annotation_groups or {}) do
+        if trimString(group.transcription) ~= "" then return true end
+    end
+    return false
+end
+
+function Pencil:getAllRecognizedText()
+    local gettext = _
+    local groups = {}
+
+    for _, group in ipairs(self.annotation_groups or {}) do
+        if trimString(group.transcription) ~= "" then
+            groups[#groups + 1] = group
+        end
+    end
+
+    table.sort(groups, function(a, b)
+                   local ap, bp = self:getPageNumber(a.page), self:getPageNumber(b.page)
+
+                   if ap ~= bp then
+                       return ap < bp
+                   end
+
+                   return (a.datetime or 0) < (b.datetime or 0)
+    end)
+
+    local parts = {}
+
+    for index, group in ipairs(groups) do
+        parts[#parts + 1] =
+            T(gettext("Page %1"), self:getPageNumber(group.page))
+            .. "\n"
+            .. trimString(group.transcription)
+    end
+
+    return table.concat(parts, "\n\n")
+end
+
+function Pencil:showAllRecognizedText()
+    local text = self:getAllRecognizedText()
+    if text == "" then
+        UIManager:show(InfoMessage:new{ text = _("No recognized annotations.") })
+        return
+    end
+    UIManager:show(TextViewer:new{
+        title = _("Recognized annotations"),
+        text = text,
+        text_settings = {},
+    })
+end
+
+
+-- Edit every annotation that currently has text. One MultiInput field is bound
+-- to one group directly, avoiding fragile parsing of page labels or separators.
+function Pencil:editAllRecognizedText()
+    local groups = {}
+    for _, group in ipairs(self.annotation_groups or {}) do
+        if trimString(group.transcription) ~= "" then
+            groups[#groups + 1] = group
+        end
+    end
+    table.sort(groups, function(a, b)
+        local ap, bp = self:getPageNumber(a.page), self:getPageNumber(b.page)
+        if ap ~= bp then return ap < bp end
+        return (a.datetime or 0) < (b.datetime or 0)
+    end)
+
+    if #groups == 0 then
+        UIManager:show(InfoMessage:new{ text = _("No recognized annotations.") })
+        return
+    end
+
+    local fields = {}
+    for index, group in ipairs(groups) do
+        fields[index] = {
+            description = T(_("Page %1 - annotation %2"),
+                self:getPageNumber(group.page), index),
+            text = trimString(group.transcription),
+            hint = _("Enter annotation text"),
+        }
+    end
+
+    local dialog
+    dialog = MultiInputDialog:new{
+        title = _("Edit all recognized text"),
+        fields = fields,
+        buttons = {{
+            { text = _("Cancel"), id = "close", callback = function() UIManager:close(dialog) end },
+            { text = _("Save all"), is_enter_default = true, callback = function()
+                local values = dialog:getFields()
+                if not values or #values ~= #groups then
+                    UIManager:show(InfoMessage:new{
+                        text = _("Unable to read all annotation fields."),
+                        timeout = 2,
+                    })
+                    return
+                end
+
+                -- Validate the whole form before mutating any group, so a single
+                -- empty field cannot leave a partially updated document.
+                local normalized = {}
+                for index = 1, #groups do
+                    normalized[index] = trimString(values[index])
+                    if normalized[index] == "" then
+                        UIManager:show(InfoMessage:new{
+                            text = T(_("Text for annotation %1 cannot be empty."), index),
+                            timeout = 3,
+                        })
+                        return
+                    end
+                end
+
+                local changed = 0
+                for index, group in ipairs(groups) do
+                    if normalized[index] ~= trimString(group.transcription) then
+                        self:setAnnotationGroupText(group, normalized[index], "manual")
+                        changed = changed + 1
+                    end
+                end
+                if changed > 0 then self:saveStrokes() end
+                UIManager:close(dialog)
+                UIManager:show(InfoMessage:new{
+                    text = T(_("Updated %1 annotation(s)."), changed),
+                    timeout = 3,
+                })
+            end },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+-- Recognize every current annotation group, enrich groups and their referenced
+-- strokes, then persist once. Processing continues after per-group failures.
+function Pencil:recognizeAllAnnotationGroups()
+    if trimString(self.myscript_application_key) == ""
+            or trimString(self.myscript_hmac_key) == "" then
+        self:showMyScriptSettingsDialog()
+        return
+    end
+    if not self.annotation_groups or #self.annotation_groups == 0 then
+        UIManager:show(InfoMessage:new{ text = _("No annotation groups to recognize.") })
+        return
+    end
+
+    NetworkMgr:runWhenOnline(function()
+        local client, client_error = self:createMyScriptClient()
+        if not client then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Invalid MyScript configuration: %1"), tostring(client_error)),
+            })
+            return
+        end
+
+        local recognized, failed = 0, 0
+        UIManager:show(InfoMessage:new{
+            text = T(_("Recognizing %1 annotation group(s)..."), #self.annotation_groups),
+            timeout = 1,
+        })
+
+        for group_index, group in ipairs(self.annotation_groups) do
+            local text, error_value = self:recognizeGroupWithClient(client, group)
+            if text then
+                group.transcription_error = nil
+                recognized = recognized + 1
+            else
+                local message = error_value and error_value.message or error_value
+                group.transcription_error = tostring(message or _("Unknown recognition error"))
+                group.transcription_error_datetime = os.time()
+                failed = failed + 1
+                logger.warn("Pencil: recognition failed for group", group_index,
+                    group.id or "(no id)", group.transcription_error)
+            end
+        end
+
+        -- Persist all group fields and all stroke-level enrichment atomically
+        -- through the plugin's existing sidecar serialization path.
+        self:saveStrokes()
+
+        local summary = T(_("Recognized %1 annotation group(s)."), recognized)
+        if failed > 0 then
+            summary = summary .. "\n" .. T(_("Failed: %1."), failed)
+        end
+        UIManager:show(InfoMessage:new{ text = summary, timeout = 4 })
+    end)
 end
 
 ------------------------------------------------------------------------------
@@ -4057,6 +4601,11 @@ function Pencil:strokeToSaveable(stroke)
         datetime = stroke.datetime,
         points = stroke.points,
         color_name = stroke.color_name,  -- Save color name for persistence
+        transcription = stroke.transcription,
+        transcription_group_id = stroke.transcription_group_id,
+        transcription_language = stroke.transcription_language,
+        transcription_datetime = stroke.transcription_datetime,
+        transcription_engine = stroke.transcription_engine,
     }
 end
 
@@ -4085,6 +4634,11 @@ function Pencil:strokeFromSaved(saved)
         alpha = saved.alpha or tool_settings.alpha,
         datetime = saved.datetime,
         points = saved.points,
+        transcription = saved.transcription,
+        transcription_group_id = saved.transcription_group_id,
+        transcription_language = saved.transcription_language,
+        transcription_datetime = saved.transcription_datetime,
+        transcription_engine = saved.transcription_engine,
     }
 end
 
@@ -4120,11 +4674,13 @@ function Pencil:saveStrokes()
         saveable_strokes[i] = self:strokeToSaveable(stroke)
     end
 
-    -- Serialize and write. Version 3 marks files that may contain image_path /
-    -- image_rotation fields on annotation groups; older readers can ignore
-    -- those fields and continue to use the strokes directly.
+    -- Serialize and write. Version 5 keeps v4 packed points and adds optional
+    -- MyScript transcription metadata to strokes and annotation groups. Version 4
+    -- "x y x y ..." string (field `p`) instead of an array of {x=,y=} tables,
+    -- cutting serialize time + file size on heavily-annotated documents. v3 and
+    -- earlier (points array) still load via strokeFromSaved's fallback.
     local data = {
-        version = 3,
+        version = 5,
         strokes = saveable_strokes,
         annotation_groups = self.annotation_groups,
     }
