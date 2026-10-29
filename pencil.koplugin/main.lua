@@ -194,6 +194,17 @@ function Pencil:init()
     -- Load tool and stylus button settings
     self:loadSettings()
 
+    -- Android-only behaviour (refresh pacing, experimental region refresh,
+    -- timing readout) lives in android_fastblit.lua and loads only there.
+    if Device.isAndroid and Device:isAndroid() == true then
+        local ok, android = pcall(require, "android_fastblit")
+        if ok and type(android) == "table" then
+            android.setup(self)
+        else
+            logger.warn("Pencil: Android support module failed to load:", tostring(android))
+        end
+    end
+
     -- Ensure pen color has a default value (black) if not set
     if not self.tool_settings[TOOL_PEN].color then
         self.tool_settings[TOOL_PEN].color = Blitbuffer.COLOR_BLACK
@@ -332,6 +343,9 @@ function Pencil:setupStylusCallback()
     -- Callback receives: input (Input object), slot (table with slot, id, x, y, tool, timev)
     -- Return true to "dominate" (remove from gesture detection)
     Input:registerStylusCallback(function(input, slot)
+        if plugin.android then
+            return plugin.android.handleSlot(plugin, input, slot)
+        end
         return plugin:handleStylusSlot(input, slot)
     end)
 
@@ -667,6 +681,7 @@ function Pencil:startRawStroke()
     }
     self.last_refresh_time = time.now()
     self.dirty_region = nil  -- Clear any pending dirty region
+    if self.android then self.android.strokeStart(self) end
     logger.dbg("Pencil: raw stroke started")
 end
 
@@ -740,8 +755,13 @@ function Pencil:addRawPoint(x, y)
             local ry = math.max(0, math.floor(r.y))
             local rw = math.min(Screen:getWidth() - rx, math.ceil(r.w))
             local rh = math.min(Screen:getHeight() - ry, math.ceil(r.h))
-            -- Use UI refresh mode for proper color rendering on color e-ink
-            Screen:refreshUI(rx, ry, rw, rh)
+            if self.stroke_refresh then
+                -- Platform-specific refresh (set up by android_fastblit.lua)
+                self:stroke_refresh(rx, ry, rw, rh)
+            else
+                -- Use UI refresh mode for proper color rendering on color e-ink
+                Screen:refreshUI(rx, ry, rw, rh)
+            end
             self.dirty_region = nil
         end
     end
@@ -777,6 +797,7 @@ function Pencil:endRawStroke()
             self:writeDebugLog("endRawStroke: NOT SAVED (no current_stroke or no points)")
         end
     end
+    if self.android then self.android.strokeEnd(self) end
     self.current_stroke = nil
 end
 
@@ -1070,6 +1091,9 @@ function Pencil:loadSettings()
     self.experimental_pen_width = settings.experimental_pen_width or false
     self.experimental_color_picker = settings.experimental_color_picker or false
     self.experimental_text_highlight = settings.experimental_text_highlight or false
+    -- Android only (see android_fastblit.lua); harmless elsewhere
+    self.experimental_android_fast_refresh = settings.experimental_android_fast_refresh or false
+    self.android_eink_every = settings.android_eink_every or 1
     -- Load pen color by name and look up the actual color value
     local color_name = settings.pen_color_name
     if color_name then
@@ -1103,6 +1127,8 @@ function Pencil:saveSettings()
         experimental_pen_width = self.experimental_pen_width,
         experimental_color_picker = self.experimental_color_picker,
         experimental_text_highlight = self.experimental_text_highlight,
+        experimental_android_fast_refresh = self.experimental_android_fast_refresh,
+        android_eink_every = self.android_eink_every,
         pen_color_name = self.tool_settings[TOOL_PEN].color_name,
         swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
         pen_width = self.tool_settings[TOOL_PEN].width,
@@ -1406,6 +1432,18 @@ function Pencil:addToMainMenu(menu_items)
             },
         },
     }
+    -- Android-only entries go at the end of the Experimental submenu.
+    if self.android then
+        local experimental_text = _("Experimental")
+        for _i, item in ipairs(menu_items.pencil_annotation.sub_item_table) do
+            if item.text == experimental_text then
+                for _j, android_item in ipairs(self.android.menuItems(self)) do
+                    table.insert(item.sub_item_table, android_item)
+                end
+                break
+            end
+        end
+    end
 end
 
 -- Show current annotation status for debugging
