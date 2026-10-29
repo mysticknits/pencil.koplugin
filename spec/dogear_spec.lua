@@ -15,6 +15,7 @@ local function permissive()
 end
 
 local set_dirty_calls
+local scheduled -- tasks passed to UIManager:scheduleIn, run by hand
 
 local function loadPencil()
     local stubbed = {
@@ -35,6 +36,10 @@ local function loadPencil()
         setDirty = function(_, widget, refresh)
             table.insert(set_dirty_calls, { widget = widget, refresh = refresh })
         end,
+        scheduleIn = function(_, _, action)
+            table.insert(scheduled, action)
+        end,
+        unschedule = function() end,
     }
     package.loaded["logger"] = {
         dbg = function() end, info = function() end,
@@ -163,5 +168,31 @@ describe("commitErase", function()
         assert.equals(0, #pencil.undo_stack)
         assert.equals(0, pencil.saves)
         assert.is_true(pencil.view.dogear_visible)
+    end)
+end)
+
+describe("deferred save", function()
+    before_each(function()
+        set_dirty_calls = {}
+        scheduled = {}
+    end)
+
+    it("folds the corner when it adds new ink's bookmark", function()
+        local pencil = makePencil({}, 5)
+        pencil.save_delay_ms = 1500
+        function pencil:syncGroupBookmark()
+            table.insert(self.ui.annotation.annotations, { page = 5, datetime = "pencil_a" })
+        end
+        pencil.dirty_groups = { pencil_a = { id = "pencil_a" } }
+
+        pencil:scheduleDeferredWork()
+        assert.equals(1, #scheduled)
+        assert.is_false(pencil.view.dogear_visible) -- not until the save runs
+
+        scheduled[1]()
+
+        assert.is_true(pencil.view.dogear_visible)
+        assert.equals(1, #set_dirty_calls)
+        assert.equals(1, pencil.saves)
     end)
 end)

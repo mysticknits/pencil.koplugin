@@ -1753,6 +1753,9 @@ function Pencil:scheduleDeferredWork()
     self.pending_save = UIManager:scheduleIn(self.save_delay_ms / 1000, function()
         self.pending_save = nil
         self:flushDirtyGroups()
+        -- New ink's bookmark is only added here, so fold the page corner now
+        -- rather than on the next page turn.
+        self:refreshDogear()
         self:saveStrokes()
     end)
 end
