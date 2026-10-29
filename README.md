@@ -47,6 +47,12 @@ Rotating the device is handled: annotations written in the other orientation sho
 
 What changed in each version is on the [releases page](https://github.com/mysticknits/pencil.koplugin/releases).
 
+### Trying a pre-release
+
+Before each release, a test version comes out first, marked **Pre-release** on the [releases page](https://github.com/mysticknits/pencil.koplugin/releases), with a tag like `0.6.0-beta.1`. Install it the same way, using the `pencil.koplugin.zip` attached to that pre-release. The download button above always gets the latest stable release, never a pre-release.
+
+Pre-releases can have bugs, so back up the `.sdr` folders of books you've written in first. If something goes wrong, please [open an issue](https://github.com/mysticknits/pencil.koplugin/issues) and mention the pre-release you're on. Testing them is one of the most helpful things you can do for Pencil!
+
 ### Upgrading from an older version of this plugin
 
 Earlier releases of this plugin required replacing KOReader's `/frontend/device/input.lua` with a modified copy. That is no longer needed. Updating KOReader to 2026.07 or newer installs a fresh `input.lua`, which replaces the modified one.
@@ -145,6 +151,17 @@ integration/run.sh emu    # open the emulator with a test book
 In the emulator, the mouse acts as the stylus. Hold E while dragging to use the eraser end, and hold H to use the side button. Clicks near the top or bottom edge open KOReader's menus.
 
 See [integration/README.md](integration/README.md) for the one-time setup and more detail. These tests need a local emulator build, so CI doesn't run them. Please run them before opening a pull request that touches drawing, erasing or bookmarks.
+
+### Releases and pre-releases
+
+Every release goes out as a pre-release first, so people can try it on their devices before it reaches everyone:
+
+1. On the [releases page](https://github.com/mysticknits/pencil.koplugin/releases), draft a new release from `main` with a tag like `0.6.0-beta.1`, tick **Set as a pre-release**, and publish it. The Release zip workflow attaches `pencil.koplugin.zip` automatically.
+2. Ask for testers: comment on the issues it fixes, and mention anyone who has offered to test on their device.
+3. Fix what comes up and publish `0.6.0-beta.2`, and so on.
+4. When a beta has held up, publish `0.6.0` from the same commit as a normal release. Its notes should thank the contributors and testers.
+
+Pre-releases never count as the latest release, so the README's download button keeps pointing at the last stable one.
 
 ## Support Pencil ☕
 

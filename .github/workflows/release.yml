@@ -1,8 +1,9 @@
 name: Release zip
 
-# Attach a zip of just the plugin folder to each release, so installing is
-# unzip-and-copy. It always has the same name, so
-# releases/latest/download/pencil.koplugin.zip points at the newest one.
+# Attach a zip of just the plugin folder to each release and pre-release, so
+# installing is unzip-and-copy. It always has the same name, so
+# releases/latest/download/pencil.koplugin.zip points at the newest stable
+# release (GitHub never counts a pre-release as latest).
 # Run it by hand to add the zip to a release published before this existed.
 on:
   release:
@@ -27,6 +28,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.TAG }}
+
+      - name: Keep beta tags out of "latest"
+        # A tag like 0.6.0-beta.1 published without ticking "Set as a
+        # pre-release" would become the latest release, and so the README's
+        # download for everyone. Mark it as the pre-release it is.
+        if: github.event_name == 'release' && contains(github.event.release.tag_name, '-') && !github.event.release.prerelease
+        run: gh release edit "$TAG" --prerelease --repo "$GITHUB_REPOSITORY"
 
       - name: Zip the plugin folder
         run: zip -r pencil.koplugin.zip pencil.koplugin -x '*.DS_Store'
