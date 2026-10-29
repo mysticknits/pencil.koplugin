@@ -10,7 +10,7 @@ This has been tested on:
 
 If you resize your book while reading it, your annotations will be WONKY. This is something I will eventually address but for now, get your book set before you start writing.
 
-### Compatible with Koreader - Snowflake
+### Requires KOReader 2026.07 "Sailing Walrus" or newer
 
 ## Features
 
@@ -27,9 +27,17 @@ If you resize your book while reading it, your annotations will be WONKY. This i
 
 ## Instructions for Installation
 
-1. Download both the `pencil.koplugin` directory and the `input.lua` file from this repository.
-2. Replace the `/frontend/device/input.lua` with the downloaded file. This enables the plugin to intercept the stylus input, separate it from touch inputs, and detect the eraser end.
+1. Make sure you are running KOReader 2026.07 or newer. The stylus input support this plugin needs is built into KOReader from that release on, so no KOReader files need to be replaced.
+2. Download the `pencil.koplugin` directory from this repository.
 3. Copy the `pencil.koplugin` directory into the `/plugins` directory of KOReader.
+
+### Upgrading from an older version of this plugin
+
+Earlier releases of this plugin required replacing KOReader's `/frontend/device/input.lua` with a modified copy. That is no longer needed. Updating KOReader to 2026.07 or newer installs a fresh `input.lua`, which replaces the modified one.
+
+### Older KOReader versions
+
+If you can't update KOReader, use [release 0.5.0](https://github.com/mysticknits/pencil.koplugin/releases/tag/0.5.0) or earlier. Those releases include the `input.lua` file and installation instructions for KOReader 2026.03 "Snowflake".
 
 ## Configuring the Pencil Plugin
 
