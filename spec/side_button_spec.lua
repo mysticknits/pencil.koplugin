@@ -38,13 +38,16 @@ local stubs = {
     ["logger"] = setmetatable({}, { __index = function() return function() end end }),
 }
 
+-- package.loaders in Lua 5.1 (CI), package.searchers in newer Lua.
+local loaders = package.loaders or package.searchers
+
 local function load_pencil()
-    table.insert(package.loaders, 2, function(name)
+    table.insert(loaders, 2, function(name)
         if name == "lib/geometry" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
-    table.remove(package.loaders, 2)
+    table.remove(loaders, 2)
     return Pencil
 end
 
