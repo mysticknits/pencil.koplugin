@@ -84,11 +84,26 @@ describe("isOverlayActive", function()
 end)
 
 describe("showToast", function()
-    it("shows the message as a toast with its timeout", function()
-        UIManager.shown = {}
-        Pencil:showToast("Pen color: Green", 1)
+    local notified
 
-        assert.equals(1, #UIManager.shown)
-        assert.same({ text = "Pen color: Green", timeout = 1, toast = true }, UIManager.shown[1])
+    before_each(function()
+        notified = {}
+        package.loaded["ui/widget/notification"] = {
+            SOURCE_DISPATCHER = 0x0020,
+            SOURCE_ALWAYS_SHOW = 0x8000,
+            notify = function(_, text, source)
+                table.insert(notified, { text = text, source = source })
+            end,
+        }
+    end)
+
+    it("always shows confirmations from the side button and picker", function()
+        Pencil:showToast("Pen color: Green")
+        assert.same({ { text = "Pen color: Green", source = 0x8000 } }, notified)
+    end)
+
+    it("lets gesture confirmations follow the reader's notification settings", function()
+        Pencil:showToast("Eraser selected", true)
+        assert.same({ { text = "Eraser selected", source = 0x0020 } }, notified)
     end)
 end)
