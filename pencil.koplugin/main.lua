@@ -4180,6 +4180,22 @@ function Pencil:saveStrokes()
         return
     end
 
+    -- No ink and no file yet: nothing to save, so don't give every book
+    -- that's merely opened an empty strokes file.
+    if #self.strokes == 0 and not lfs.attributes(filepath, "mode") then
+        return
+    end
+
+    -- A book being written in for the first time may not have its sidecar
+    -- folder yet: KOReader only creates it when it saves its own settings,
+    -- usually on close. Create it, or the ink isn't on disk until then.
+    local sidecar_dir = filepath:match("^(.*)/[^/]+$")
+    if sidecar_dir and lfs.attributes(sidecar_dir, "mode") ~= "directory" then
+        local ok, err = require("util").makePath(sidecar_dir)
+        if not ok then
+            logger.err("Pencil: failed to create sidecar folder:", sidecar_dir, "error:", err)
+        end
+    end
 
     -- Convert strokes to saveable format (remove non-serializable values)
     local saveable_strokes = {}
