@@ -8,28 +8,41 @@ This has been tested on:
 
 **This will currently only work on Kobo devices! I will attempt to add other device support by request and at a later date**
 
-If you resize your book while reading it, your annotations will be WONKY. This is something I will eventually address but for now, get your book set before you start writing.
+If you change the font size or margins after writing, your annotations will be WONKY. This is something I will eventually address but for now, get your book set before you start writing.
 
-### Compatible with Koreader - Snowflake
+Rotating the device is handled: annotations written in the other orientation show as a small badge, and tapping the badge opens a saved picture of what you wrote.
+
+**Interested in helping maintain Pencil?** See [Looking for maintainers](#looking-for-maintainers).
+
+### Requires KOReader 2026.07 "Sailing Walrus" or newer
 
 ## Features
 
 - **Pen tip**: Draw annotations on your ebooks
-- **Eraser end**: Flip your stylus over to erase strokes instantly
-- **Highlighter**: Hold the stylus side button and drag to highlight; tap the side button to toggle pencil/eraser
+- **Eraser end**: Flip your stylus over to erase strokes instantly. It also removes KOReader text highlights it touches
+- **Highlighter**: Hold the stylus side button and drag to draw a highlighter stroke (or a KOReader text highlight, with the experimental option below); tap the side button to toggle pencil/eraser
 - **Swap Eraser/Highlighter**: Reassign which side button acts as eraser vs. highlighter from the menu
 - **Undo**: Undo your last stroke or eraser action
 - **Clear strokes**: Clear annotations for the current page or the entire document
 - **Annotation grouping**: Strokes are automatically grouped into logical annotations based on timing and proximity
 - **Enable/disable toggle**: Turn the plugin on or off via the menu or a mapped gesture
 - **Per-document storage**: Annotations are saved with each book
+- **Annotation previews**: A picture of each annotation is saved, so it can be shown after rotating the device or from the Bookmarks menu. The Pencil menu shows how much space they use and can clear them for the current book
 - **Input debug mode**: Log raw stylus events to help diagnose detection issues
 
 ## Instructions for Installation
 
-1. Download both the `pencil.koplugin` directory and the `input.lua` file from this repository.
-2. Replace the `/frontend/device/input.lua` with the downloaded file. This enables the plugin to intercept the stylus input, separate it from touch inputs, and detect the eraser end.
+1. Make sure you are running KOReader 2026.07 or newer. The stylus input support this plugin needs is built into KOReader from that release on, so no KOReader files need to be replaced.
+2. Download the `pencil.koplugin` directory from this repository.
 3. Copy the `pencil.koplugin` directory into the `/plugins` directory of KOReader.
+
+### Upgrading from an older version of this plugin
+
+Earlier releases of this plugin required replacing KOReader's `/frontend/device/input.lua` with a modified copy. That is no longer needed. Updating KOReader to 2026.07 or newer installs a fresh `input.lua`, which replaces the modified one.
+
+### Older KOReader versions
+
+If you can't update KOReader, use [release 0.5.0](https://github.com/mysticknits/pencil.koplugin/releases/tag/0.5.0) or earlier. Those releases include the `input.lua` file and installation instructions for KOReader 2026.03 "Snowflake".
 
 ## Configuring the Pencil Plugin
 
@@ -45,7 +58,7 @@ If you resize your book while reading it, your annotations will be WONKY. This i
 ## Questions or Issues with the Plugin
 
 If you have any questions or a feature request, please submit an issue in this repo.
-If you're experiencing issues with the plugin, please enable input debug mode in the Pencil menu, reproduce the issue, and include the debug log file in your issue report.
+If you're experiencing issues with the plugin, please enable input debug mode in the Pencil menu, reproduce the issue, and include the debug log file in your issue report. On a Kobo the log is at `.adds/koreader/pencil_input_debug.log`, and **Clear debug log** in the Pencil menu starts a fresh one.
 
 ## Experimental Features
 
@@ -63,6 +76,12 @@ When enabled, the picker also shows pen width options (3, 5, 7, 9), rendered as 
 
 **To enable:** Pencil menu > Experimental > Pen width picker
 
+### Text highlight (side button)
+
+When enabled, holding the stylus side button while dragging across words creates a KOReader text highlight, like long-pressing and choosing Highlight. When disabled, the side button draws a freehand highlighter stroke instead.
+
+**To enable:** Pencil menu > Experimental > Text highlight (side button)
+
 ### Bookmark Sync
 
 When enabled, the plugin automatically groups your pencil strokes into logical annotations (based on timing and proximity) and creates KOReader bookmarks for each one. This means annotated pages show up in the **Bookmarks menu**, so you can quickly navigate back to pages you've written on.
@@ -72,8 +91,9 @@ When enabled, the plugin automatically groups your pencil strokes into logical a
 **What happens when you turn it on:**
 - Existing pencil annotations are grouped and bookmarks are created immediately
 - New strokes are grouped and bookmarked as you draw
-- Bookmarks appear in KOReader's Bookmarks menu as "Pencil annotation on page X"
-- Erasing or undoing strokes updates the bookmarks automatically
+- Bookmarks appear in KOReader's Bookmarks menu as "Pencil annotation on page X". Long-press one to see a picture of the annotation
+- Annotated pages show KOReader's folded page corner
+- Erasing or undoing strokes updates the bookmarks and the page corner automatically
 
 **What happens when you turn it off:**
 - All pencil bookmarks are removed from the Bookmarks menu
@@ -83,7 +103,37 @@ When enabled, the plugin automatically groups your pencil strokes into logical a
 ## Features In the Pipeline
 
 1. Export of annotations
-2. Handling changing canvas size
+2. Keeping annotations in place when the font size or margins change
+
+## Contributing
+
+Contributions are welcome. Please open a pull request against `main`. Nothing in this section affects installing the plugin: only the `pencil.koplugin` folder is copied to a device.
+
+### Looking for maintainers
+
+I'd love help keeping Pencil going. A lot of good work is happening in forks, and I'd rather bring it together here. If you'd like to be an active maintainer, reviewing pull requests, triaging issues, or testing on devices I don't have, please [open an issue](https://github.com/mysticknits/pencil.koplugin/issues/new?title=Maintainer%20interest) and tell me a little about yourself, your device and what you'd like to work on.
+
+### Unit tests
+
+The specs in `spec/` stub out KOReader and run with [busted](https://lunarmodules.github.io/busted/). CI runs them on every pull request.
+
+```
+luarocks install busted
+busted spec
+```
+
+### Integration tests and the emulator
+
+To test against real KOReader without a device, build KOReader's desktop emulator. The `integration/` folder has a script that links your working copy of the plugin into it:
+
+```
+integration/run.sh test   # run integration tests inside KOReader's test harness
+integration/run.sh emu    # open the emulator with a test book
+```
+
+In the emulator, the mouse acts as the stylus. Hold E while dragging to use the eraser end, and hold H to use the side button. Clicks near the top or bottom edge open KOReader's menus.
+
+See [integration/README.md](integration/README.md) for the one-time setup and more detail. These tests need a local emulator build, so CI doesn't run them. Please run them before opening a pull request that touches drawing, erasing or bookmarks.
 
 ## Acknowledgements
 
