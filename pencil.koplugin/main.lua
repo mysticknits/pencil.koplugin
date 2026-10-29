@@ -62,6 +62,7 @@ local IMAGE_CAPTURE_DEBOUNCE_S = 4       -- seconds after last stroke before cap
 local IMAGE_BADGE_SIZE = 48              -- on-page badge edge (px) when annotation is stale
 local IMAGE_BADGE_HIT_PAD = 32           -- extra pixels around badge for tap hit-test
 local IMAGE_BADGE_MARGIN_GAP = 5         -- gap from text/screen edge for margin badge
+local STROKES_PATH_SETTING = "pencil_strokes_path"
 
 -- Module-level reference to the most recently initialized Pencil instance.
 -- Used by the bookmark-list hook (a class-level monkey-patch installed once)
@@ -4009,9 +4010,59 @@ function Pencil:getStrokesFilePath()
     return nil
 end
 
+-- Store the plugin-owned strokes file path in the document metadata.
+function Pencil:rememberStrokesFilePath(filepath)
+    local settings = self.ui and self.ui.doc_settings
+    if settings and filepath then
+        settings:saveSetting(STROKES_PATH_SETTING, filepath)
+    end
+end
+
+-- Recover pencil_strokes.lua after KOReader moves metadata.lua to a new
+-- sidecar following a document rename. Both paths are assumed to be on the
+-- same filesystem, so os.rename provides an atomic move.
+function Pencil:migrateStrokesFileIfNeeded()
+    local current = self:getStrokesFilePath()
+    local settings = self.ui and self.ui.doc_settings
+    if not current or not settings then return current end
+
+    if lfs.attributes(current, "mode") == "file" then
+        self:rememberStrokesFilePath(current)
+        return current
+    end
+
+    local previous = settings:readSetting(STROKES_PATH_SETTING)
+    if type(previous) ~= "string" or previous == "" or previous == current
+            or lfs.attributes(previous, "mode") ~= "file" then
+        return current
+    end
+
+    local old_sidecar = previous:match("^(.*)/[^/]+$")
+    local moved, err = os.rename(previous, current)
+    if not moved then
+        logger.warn("Pencil: failed to move strokes file from", previous,
+            "to", current, "error:", err)
+        return current
+    end
+
+    self:rememberStrokesFilePath(current)
+    logger.info("Pencil: moved strokes file from", previous, "to", current)
+
+    -- rmdir only succeeds when the legacy sidecar is empty. If KOReader or
+    -- another plugin left data there, it is preserved without extra handling.
+    if old_sidecar then
+        local removed = lfs.rmdir(old_sidecar)
+        if removed then
+            logger.info("Pencil: removed empty legacy sidecar", old_sidecar)
+        end
+    end
+
+    return current
+end
+
 -- Load strokes from our own file
 function Pencil:loadStrokes()
-    local filepath = self:getStrokesFilePath()
+    local filepath = self:migrateStrokesFileIfNeeded()
     logger.info("Pencil: loadStrokes - filepath =", filepath)
 
     if not filepath then
@@ -4061,6 +4112,7 @@ function Pencil:loadStrokes()
         end
 
         self.strokes_loaded = true
+        self:rememberStrokesFilePath(filepath)
         logger.info("Pencil: loaded", #self.strokes, "strokes from", filepath)
     else
         logger.warn("Pencil: failed to load strokes from", filepath, "error:", data)
@@ -4128,14 +4180,6 @@ function Pencil:saveStrokes()
         return
     end
 
-    -- Ensure the directory exists
-    local sidecar_dir = self.ui.doc_settings.doc_sidecar_dir
-    if sidecar_dir then
-        local ok, err = lfs.mkdir(sidecar_dir)
-        if not ok and err ~= "File exists" then
-            logger.warn("Pencil: failed to create sidecar dir:", err)
-        end
-    end
 
     -- Convert strokes to saveable format (remove non-serializable values)
     local saveable_strokes = {}
@@ -4156,6 +4200,7 @@ function Pencil:saveStrokes()
     if f then
         f:write("return " .. require("dump")(data))
         f:close()
+        self:rememberStrokesFilePath(filepath)
         logger.info("Pencil: saved", #self.strokes, "strokes to", filepath)
     else
         logger.err("Pencil: failed to open file for writing:", filepath, "error:", err)
