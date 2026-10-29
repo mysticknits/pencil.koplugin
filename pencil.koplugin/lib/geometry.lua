@@ -100,14 +100,17 @@ function Geometry.unpackPoints(str)
 end
 
 --- Number of interpolation steps to rasterize a segment of length `dist`
---- with a pen of the given width. Steps by ~half the width so consecutive
---- width×width squares overlap enough to leave no gaps, without painting
---- every pixel ~width times over (which is what stepping by 1px does).
+--- with a pen of the given width. Steps by ~a quarter of the width, at most
+--- MAX_SEGMENT_STEP px, so wide pens don't paint every pixel ~width times
+--- over (which is what stepping by 1px does). The cap keeps the sawtooth
+--- that width×width squares leave along a diagonal edge to about 2px; a
+--- larger step shows visible teeth on highlighter strokes.
 -- @param dist segment length in pixels
 -- @param width pen width in pixels
 -- @return number step count (>= 1)
+local MAX_SEGMENT_STEP = 3
 function Geometry.segmentStepCount(dist, width)
-    local step = math.max(1, math.floor(width / 2))
+    local step = math.max(1, math.min(math.floor(width / 4), MAX_SEGMENT_STEP))
     return math.max(1, math.ceil(dist / step))
 end
 

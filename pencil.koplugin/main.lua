@@ -63,6 +63,9 @@ local IMAGE_BADGE_SIZE = 48              -- on-page badge edge (px) when annotat
 local IMAGE_BADGE_HIT_PAD = 32           -- extra pixels around badge for tap hit-test
 local IMAGE_BADGE_MARGIN_GAP = 5         -- gap from text/screen edge for margin badge
 local STROKES_PATH_SETTING = "pencil_strokes_path"
+-- Format of pencil_strokes.lua this version writes. A file with a higher
+-- version came from a newer Pencil; it's left untouched (see loadStrokes).
+local STROKES_FILE_VERSION = 4
 
 -- Module-level reference to the most recently initialized Pencil instance.
 -- Used by the bookmark-list hook (a class-level monkey-patch installed once)
@@ -1771,8 +1774,9 @@ function Pencil:scheduleDelayedRefresh()
         local bbox = self.pending_refresh_bbox
         self.pending_refresh_bbox = nil
         if bbox then
-            -- Scope the fast refresh to the region the recent strokes touched.
-            -- The view still repaints fully, but the slow e-ink update is small.
+            -- Scope the fast refresh to the region the recent strokes touched,
+            -- so only that part of the panel updates. The strokes are already
+            -- in the framebuffer; this only pushes them to the e-ink panel.
             bbox = PencilGeometry.bboxClampToScreen(bbox, Screen:getWidth(), Screen:getHeight())
             local rw = bbox.x1 - bbox.x0
             local rh = bbox.y1 - bbox.y0
@@ -1919,9 +1923,14 @@ function Pencil:scheduleColorPickerCheck()
     end
 
     local plugin = self
-    -- Check every 100ms for trigger
-    self.color_picker_check_pending = UIManager:scheduleIn(0.1, function()
-        plugin.color_picker_check_pending = nil
+    -- Check every 100ms for trigger. Store the closure itself, not
+    -- scheduleIn's nil return, so cancelColorPickerTimer can unschedule it
+    -- (see scheduleDeferredWork).
+    local action
+    action = function()
+        if plugin.color_picker_check_pending == action then
+            plugin.color_picker_check_pending = nil
+        end
         if plugin.pen_down and plugin.color_picker_start_time and not plugin.color_picker_showing then
             plugin:checkColorPickerTrigger()
             -- Schedule next check if still waiting
@@ -1929,7 +1938,9 @@ function Pencil:scheduleColorPickerCheck()
                 plugin:scheduleColorPickerCheck()
             end
         end
-    end)
+    end
+    self.color_picker_check_pending = action
+    UIManager:scheduleIn(0.1, action)
 end
 
 -- Cancel color picker check
@@ -3839,14 +3850,19 @@ end
 -- nil when no stroke has geometry, signalling the caller to refresh fully.
 function Pencil:erasedStrokesRefreshRect(strokes)
     local bbox = nil
+    local max_width = 0
     for _, s in ipairs(strokes) do
         local b = PencilGeometry.computeStrokeBbox(s)
         if b then
             bbox = bbox and PencilGeometry.bboxUnion(bbox, b) or b
         end
+        max_width = math.max(max_width, s.width or 0)
     end
     if not bbox then return nil end
-    local margin = (self.tool_settings[TOOL_ERASER] and self.tool_settings[TOOL_ERASER].width) or 20
+    -- Cover the eraser and the widest erased stroke, which can be wider
+    -- (e.g. a highlighter), or its edges stay on the panel.
+    local eraser_width = (self.tool_settings[TOOL_ERASER] and self.tool_settings[TOOL_ERASER].width) or 20
+    local margin = math.max(eraser_width, math.floor(max_width / 2) + 4)
     bbox = PencilGeometry.bboxExpand(bbox, margin)
     bbox = PencilGeometry.bboxClampToScreen(bbox, Screen:getWidth(), Screen:getHeight())
     local w = bbox.x1 - bbox.x0
@@ -4138,6 +4154,8 @@ end
 function Pencil:loadStrokes()
     local filepath = self:migrateStrokesFileIfNeeded()
     logger.info("Pencil: loadStrokes - filepath =", filepath)
+    local was_too_new = self.strokes_file_too_new
+    self.strokes_file_too_new = false
 
     if not filepath then
         logger.warn("Pencil: no filepath available for loading strokes")
@@ -4158,6 +4176,26 @@ function Pencil:loadStrokes()
     file_exists:close()
 
     local ok, data = pcall(dofile, filepath)
+    if ok and type(data) == "table" and type(data.version) == "number"
+            and data.version > STROKES_FILE_VERSION then
+        -- Written by a newer Pencil, in a format this one may not read
+        -- correctly. Loading it could drop what we don't understand, and the
+        -- next save would write that loss to disk, so leave the file alone.
+        logger.warn("Pencil: strokes file is version", data.version,
+            "but this Pencil writes version", STROKES_FILE_VERSION, "- not loading or saving it")
+        self.strokes = {}
+        self.page_strokes = {}
+        self.annotation_groups = {}
+        self.strokes_file_too_new = true
+        if not was_too_new then
+            UIManager:nextTick(function()
+                UIManager:show(InfoMessage:new{
+                    text = _("This book's ink was saved by a newer version of Pencil. Update Pencil to see it.\n\nUntil then, Pencil won't save ink for this book, so the newer ink stays safe."),
+                })
+            end)
+        end
+        return
+    end
     if ok and data and data.strokes then
         -- Convert saved strokes back to usable format
         self.strokes = {}
@@ -4259,6 +4297,12 @@ function Pencil:saveStrokes()
         return
     end
 
+    -- Never overwrite a file from a newer Pencil (see loadStrokes).
+    if self.strokes_file_too_new then
+        logger.warn("Pencil: not saving - strokes file is from a newer Pencil:", filepath)
+        return
+    end
+
     -- Safety: don't save empty data if strokes were never successfully loaded
     -- (prevents data loss if a crash causes save before load completes)
     if #self.strokes == 0 and not self.strokes_loaded then
@@ -4278,7 +4322,7 @@ function Pencil:saveStrokes()
     -- cutting serialize time + file size on heavily-annotated documents. v3 and
     -- earlier (points array) still load via strokeFromSaved's fallback.
     local data = {
-        version = 4,
+        version = STROKES_FILE_VERSION,
         strokes = saveable_strokes,
         annotation_groups = self.annotation_groups,
     }
@@ -4335,7 +4379,9 @@ end
 
 function Pencil:onSuspend()
     -- Same idea as onCloseDocument: don't lose a freshly drawn annotation
-    -- across a device sleep.
+    -- across a device sleep. The debounced save only runs once writing
+    -- pauses, so ink from the last moments before sleep may not be on disk.
+    self:flushDeferredWork()
     self:flushPendingCaptures()
 end
 
@@ -4383,6 +4429,9 @@ end
 
 -- Handle page changes (paging mode)
 function Pencil:onPageUpdate(pageno)
+    -- The page is redrawn in full, so the region the last strokes touched no
+    -- longer needs its own refresh; don't let it widen the next page's.
+    self.pending_refresh_bbox = nil
     -- Clear any in-progress stroke when page changes
     if self.current_stroke and #self.current_stroke.points >= 2 then
         -- Save the stroke before clearing. The inline saveStrokes below covers
