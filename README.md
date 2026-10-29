@@ -1,6 +1,7 @@
 # pencil.koplugin
 
 [![Latest release](https://img.shields.io/github/v/release/mysticknits/pencil.koplugin?style=for-the-badge&label=Latest%20release)](https://github.com/mysticknits/pencil.koplugin/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/mysticknits/pencil.koplugin/total?style=for-the-badge&label=Downloads)](https://github.com/mysticknits/pencil.koplugin/releases)
 [![Support me on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20my%20work-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/mysticknitscodes)
 
 ## Information
@@ -35,11 +36,11 @@ Rotating the device is handled: annotations written in the other orientation sho
 
 ## Instructions for Installation
 
-[![Download the latest release](https://img.shields.io/badge/Download-Latest%20release-2ea44f?style=for-the-badge&logo=github)](https://github.com/mysticknits/pencil.koplugin/releases/latest)
+[![Download pencil.koplugin.zip](https://img.shields.io/badge/Download-pencil.koplugin.zip-2ea44f?style=for-the-badge&logo=github)](https://github.com/mysticknits/pencil.koplugin/releases/latest/download/pencil.koplugin.zip)
 
 1. Make sure you are running KOReader 2026.07 or newer. The stylus input support this plugin needs is built into KOReader from that release on, so no KOReader files need to be replaced.
-2. Open the [latest release](https://github.com/mysticknits/pencil.koplugin/releases/latest) and, under **Assets**, download **Source code (zip)**.
-3. Unzip it. Inside is a `pencil.koplugin` folder. That folder is the plugin; the rest (tests and tools) isn't needed on your device.
+2. Download [`pencil.koplugin.zip`](https://github.com/mysticknits/pencil.koplugin/releases/latest/download/pencil.koplugin.zip) from the latest release.
+3. Unzip it. You'll get a `pencil.koplugin` folder.
 4. Copy the `pencil.koplugin` folder into KOReader's `plugins` folder:
    - Kobo: `.adds/koreader/plugins/pencil.koplugin/`
 5. Restart KOReader, then turn Pencil on (see below).

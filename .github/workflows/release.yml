@@ -1,0 +1,35 @@
+name: Release zip
+
+# Attach a zip of just the plugin folder to each release, so installing is
+# unzip-and-copy. It always has the same name, so
+# releases/latest/download/pencil.koplugin.zip points at the newest one.
+# Run it by hand to add the zip to a release published before this existed.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach the zip to, e.g. 0.6.0
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  zip:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout the release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Zip the plugin folder
+        run: zip -r pencil.koplugin.zip pencil.koplugin -x '*.DS_Store'
+
+      - name: Attach the zip to the release
+        run: gh release upload "$TAG" pencil.koplugin.zip --clobber
