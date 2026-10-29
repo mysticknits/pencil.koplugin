@@ -3,9 +3,11 @@ name: Tests
 on:
   pull_request:
     branches: [main]
+  # main is included so a combination of PRs that each passed on their own,
+  # but against an older main, is caught as soon as it lands. PR branches
+  # don't have to be brought up to date before merging.
   push:
-    branches-ignore:
-      - main
+  workflow_dispatch:
 
 jobs:
   test:
