@@ -366,7 +366,7 @@ function Pencil:handleStylusSlot(input, slot)
     end
 
     -- Don't capture pen input when a menu or overlay is on top of the reader
-    if self:isOverlayActive() then return false end
+    if self:shouldYieldToOverlay() then return false end
 
     -- Detect eraser end via slot.tool BEFORE key events arrive
     -- This handles the timing issue where stylus callback fires before key events
@@ -429,7 +429,7 @@ function Pencil:handleStylusSlot(input, slot)
         return true
     end
 
-    if not self:isEnabled() or self:isOverlayActive() then return false end
+    if not self:isEnabled() or self:shouldYieldToOverlay() then return false end
 
     -- Log in debug mode
     if self.input_debug_mode then
@@ -1067,6 +1067,15 @@ function Pencil:isOverlayActive()
     -- getTopmostVisibleWidget skips widgets marked invisible — transient
     -- decorations that paint but don't capture input, e.g. TrapWidget.
     return (top.name or top.id) ~= "ReaderUI"
+end
+
+-- Whether the stylus callback should hand pen input to an overlay. A pen
+-- contact that started on the page is followed to its lift even if an overlay
+-- opens meanwhile, like the color picker shown while the pen is held still.
+-- Handing over the rest of that contact would make its lift a tap outside the
+-- picker, closing it, and the plugin would never see the pen go up (#72).
+function Pencil:shouldYieldToOverlay()
+    return not self.pen_down and self:isOverlayActive()
 end
 
 -- Set enabled state (global setting)
