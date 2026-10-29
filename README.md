@@ -1,5 +1,8 @@
 # pencil.koplugin
 
+[![Latest release](https://img.shields.io/github/v/release/mysticknits/pencil.koplugin?style=for-the-badge&label=Latest%20release)](https://github.com/mysticknits/pencil.koplugin/releases/latest)
+[![Support me on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20my%20work-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/mysticknitscodes)
+
 ## Information
 
 This has been tested on:
@@ -32,9 +35,16 @@ Rotating the device is handled: annotations written in the other orientation sho
 
 ## Instructions for Installation
 
+[![Download the latest release](https://img.shields.io/badge/Download-Latest%20release-2ea44f?style=for-the-badge&logo=github)](https://github.com/mysticknits/pencil.koplugin/releases/latest)
+
 1. Make sure you are running KOReader 2026.07 or newer. The stylus input support this plugin needs is built into KOReader from that release on, so no KOReader files need to be replaced.
-2. Download the `pencil.koplugin` directory from this repository.
-3. Copy the `pencil.koplugin` directory into the `/plugins` directory of KOReader.
+2. Open the [latest release](https://github.com/mysticknits/pencil.koplugin/releases/latest) and, under **Assets**, download **Source code (zip)**.
+3. Unzip it. Inside is a `pencil.koplugin` folder. That folder is the plugin; the rest (tests and tools) isn't needed on your device.
+4. Copy the `pencil.koplugin` folder into KOReader's `plugins` folder:
+   - Kobo: `.adds/koreader/plugins/pencil.koplugin/`
+5. Restart KOReader, then turn Pencil on (see below).
+
+What changed in each version is on the [releases page](https://github.com/mysticknits/pencil.koplugin/releases).
 
 ### Upgrading from an older version of this plugin
 
@@ -134,6 +144,14 @@ integration/run.sh emu    # open the emulator with a test book
 In the emulator, the mouse acts as the stylus. Hold E while dragging to use the eraser end, and hold H to use the side button. Clicks near the top or bottom edge open KOReader's menus.
 
 See [integration/README.md](integration/README.md) for the one-time setup and more detail. These tests need a local emulator build, so CI doesn't run them. Please run them before opening a pull request that touches drawing, erasing or bookmarks.
+
+## Support Pencil ☕
+
+Pencil is a labour of love, made in my spare time with plenty of coffee and a good dose of stubbornness. If it's made your reading a little more joyful and you'd like to support my work, please consider [buying me a coffee on Ko-fi](https://ko-fi.com/mysticknitscodes)! 💛
+
+Every coffee helps keep Pencil growing. And if donating isn't your thing, starring the repo, reporting a bug or telling a fellow reader about it means the world to me too! ✨
+
+[![Support me on Ko-fi](https://img.shields.io/badge/Ko--fi-Buy%20me%20a%20coffee-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/mysticknitscodes)
 
 ## Acknowledgements
 
