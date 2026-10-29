@@ -342,7 +342,18 @@ end
 -- Transform stylus coordinates based on screen rotation
 -- Raw stylus coordinates are in hardware space; framebuffer expects logical (rotated) space
 function Pencil:transformCoordinates(x, y)
-    local rotation = Screen:getRotationMode()
+    -- Use the same rotation source as KOReader's own GestureDetector
+    -- (adjustGesCoordinate). On Kobo this equals getRotationMode(). On
+    -- Android with native rotation the activity itself rotates, touch
+    -- coordinates arrive already in logical space, and getTouchRotation()
+    -- stays UPRIGHT while getRotationMode() reports the device orientation;
+    -- using the latter would rotate the pen twice.
+    local rotation
+    if Screen.getTouchRotation then
+        rotation = Screen:getTouchRotation()
+    else
+        rotation = Screen:getRotationMode()
+    end
     return PencilGeometry.transformForRotation(x, y, rotation, Screen:getWidth(), Screen:getHeight())
 end
 
