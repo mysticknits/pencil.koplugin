@@ -834,6 +834,11 @@ function Pencil:startTextHighlight(raw_x, raw_y)
     else
         rh.selected_text = nil
     end
+    -- State ReaderHighlight:onHold sets up for onHoldPan's corner scroll
+    -- (see extendTextHighlight). The start xpointer is only there in EPUBs.
+    rh.selected_text_start_xpointer = ok and word and word.pos0 or nil
+    rh.allow_hold_pan_corner_scroll = false
+    rh.was_in_some_corner = nil
 
     self.highlighting = true
     -- Prevent the drawing-path pen-down branch from also firing on subsequent
@@ -854,6 +859,22 @@ function Pencil:extendTextHighlight(raw_x, raw_y)
     if not rh.hold_pos then return end
 
     local screen_x, screen_y = self:transformCoordinates(raw_x, raw_y)
+
+    -- Let ReaderHighlight extend the selection as it does for a finger
+    -- long-press drag. In EPUBs, that scrolls on to the next page when the
+    -- pen goes into the bottom right corner (back at the top left), so a
+    -- highlight can cross pages. Lifting undoes the scroll (rh:clear() in
+    -- finishTextHighlight). It returns false when long-press is set to "Do
+    -- nothing"; we still highlight then, within the page.
+    local ok_pan, handled = pcall(rh.onHoldPan, rh, nil,
+        { pos = Geom:new{ x = screen_x, y = screen_y, w = 0, h = 0 } })
+    if not ok_pan then
+        logger.warn("Pencil: onHoldPan failed:", tostring(handled))
+    elseif handled ~= false then
+        self:_paintTempSelection()
+        return
+    end
+
     local page_pos = self.ui.view:screenToPageTransform({ x = screen_x, y = screen_y })
     if not page_pos then return end
     rh.holdpan_pos = page_pos
@@ -892,6 +913,10 @@ function Pencil:finishTextHighlight()
         end
     end
 
+    -- Stop the long-hold timer onHoldPan starts; we don't show its menu.
+    if rh and rh._resetHoldTimer then
+        pcall(rh._resetHoldTimer, rh, true)
+    end
     if rh and rh.clear then
         pcall(rh.clear, rh)
     end
