@@ -155,7 +155,10 @@ all highlights into PDF file"** in that same menu to push highlights you've alre
 - **Erase, undo and clear work on embedded ink.** Erasing an embedded stroke, undoing it, or
   using Clear page / Clear all removes its annotation from the PDF too (matched via a small tag
   stored in the annotation's `/Contents`). Undoing an erase or a clear brings the strokes back
-  as normal overlay strokes, which are saved again on the next close.
+  as normal overlay strokes, which are saved again on the next close. If KOReader stops before
+  the close write, the pending removals are remembered and finished the next time you open
+  the book. Erasing a text highlight also removes the copy the manual action saved into the
+  PDF.
 - **Ink from elsewhere is left alone.** The plugin only ever deletes the annotations of its
   own strokes. Ink added in other apps, or by Pencil on another device, is never removed.
 - **Requires KOReader 2026.07 or newer.** Writing ink needs MuPDF ink symbols that

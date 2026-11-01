@@ -1024,12 +1024,30 @@ function Pencil:eraseHighlightAtScreenPos(screen_x, screen_y)
     if not (self.ui and self.ui.highlight and self.ui.highlight.deleteHighlight) then
         return false
     end
+    local item = self.ui.annotation.annotations[index]
     local ok = pcall(self.ui.highlight.deleteHighlight, self.ui.highlight, index)
     if ok then
         self._pdf_dirty = true
+        -- KOReader only deletes the PDF copy when "write highlights into PDF"
+        -- is on, but "Save annotations to PDF (this page)" can put it in the
+        -- file with that setting off. Remove whatever copy is still there.
+        local dok, derr = pcall(self.deleteHighlightFromPdf, self, item)
+        if not dok then logger.warn("Pencil: deleting highlight from PDF failed:", derr) end
         UIManager:setDirty(self.ui.dialog or self.ui.view, "ui")
     end
     return ok
+end
+
+-- Delete a text highlight's markup annotation from the PDF, if the file holds
+-- one with its exact quad points. Returns true if one was deleted.
+function Pencil:deleteHighlightFromPdf(item)
+    if not (item and item.page and item.pboxes and #item.pboxes > 0) then return false end
+    if not (InkAnnot and self:isPdfDocument()) then return false end
+    if not self:pdfHasHighlight(item.page, item) then return false end
+    local doc = self.ui.document
+    if doc:deleteHighlight(item.page, item) ~= nil then return false end  -- not writable
+    doc:resetTileCacheValidity()
+    return true
 end
 
 -- Get the path to the plugin's log file
@@ -4394,8 +4412,40 @@ function Pencil:deleteEmbeddedAnnotationsFor(strokes)
     if not (doc._checkIfWritable and doc:_checkIfWritable() == true) then
         return 0
     end
-    local ffi = InkAnnot.ffi
 
+    -- Remember the deletions in the sidecar until the close write lands.
+    -- The strokes leave the sidecar right away, so without this a crash or
+    -- kill before close would leave their ink in the file with nothing left
+    -- to erase it. applyPendingInkDeletes() replays the list.
+    for pageno, tags in pairs(tags_by_page) do
+        for tag in pairs(tags) do self:addPendingInkDelete(pageno, tag) end
+    end
+
+    local deleted = self:_deleteInkTagsByPage(tags_by_page)
+    if deleted > 0 then
+        -- The deleted ink is a baked PDF annotation, so its pixels live in the
+        -- rendered page tile, not our overlay. Schedule a proper "ui" refresh
+        -- -- like KOReader's own deleteHighlight -- so the tile is regenerated
+        -- from the pruned in-memory doc and the ink disappears without a page
+        -- turn.
+        UIManager:setDirty(self.ui.dialog or self.ui.view, "ui")
+        logger.info("Pencil: removed", deleted, "embedded ink annotation(s) (deferred write)")
+    end
+
+    for _, stroke in ipairs(strokes) do
+        stroke.embedded = nil
+        stroke.staged = nil
+        stroke.annot_id = nil
+    end
+    return deleted
+end
+
+-- Delete tagged ink in the in-memory document, given { [pageno] = { [tag] = true } }.
+-- Marks the document for the close write when anything was removed.
+-- Returns the number of annotations deleted.
+function Pencil:_deleteInkTagsByPage(tags_by_page)
+    local doc = self.ui.document
+    local ffi = InkAnnot.ffi
     local deleted = 0
     for pageno, tags in pairs(tags_by_page) do
         local ok, res = pcall(function()
@@ -4410,24 +4460,44 @@ function Pencil:deleteEmbeddedAnnotationsFor(strokes)
             logger.warn("Pencil: deleting embedded ink failed on page", pageno, res)
         end
     end
-
     if deleted > 0 then
         doc.is_edited = true
         self._pdf_dirty = true
         doc:resetTileCacheValidity()
-        -- The deleted ink is a baked PDF annotation, so its pixels live in the
-        -- rendered page tile, not our overlay. Schedule a proper "ui" refresh
-        -- -- like KOReader's own deleteHighlight -- so the tile is regenerated
-        -- from the pruned in-memory doc and the ink disappears without a page
-        -- turn.
-        UIManager:setDirty(self.ui.dialog or self.ui.view, "ui")
-        logger.info("Pencil: removed", deleted, "embedded ink annotation(s) (deferred write)")
     end
+    return deleted
+end
 
-    for _, stroke in ipairs(strokes) do
-        stroke.embedded = nil
-        stroke.staged = nil
-        stroke.annot_id = nil
+-- Queue a tag for deletion from the file (persisted in the sidecar).
+function Pencil:addPendingInkDelete(pageno, tag)
+    self.pending_ink_deletes = self.pending_ink_deletes or {}
+    for _, entry in ipairs(self.pending_ink_deletes) do
+        if entry.page == pageno and entry.tag == tag then return end
+    end
+    table.insert(self.pending_ink_deletes, { page = pageno, tag = tag })
+end
+
+-- Replay deletions that haven't reached the file yet: ones made this session
+-- (already applied, so this finds nothing) and ones left over from a session
+-- that ended before its close write. Deleting is by our own tag, so replaying
+-- is harmless. Run on open, so leftover ink vanishes at once, and on close,
+-- before the single write. Returns the number of annotations deleted, or nil
+-- when the deletions can't be applied here (no ink support, not a writable
+-- PDF), in which case the queue must be kept.
+function Pencil:applyPendingInkDeletes()
+    local pending = self.pending_ink_deletes
+    if not (pending and #pending > 0) then return 0 end
+    if not (InkAnnot and self:isPdfDocument()) then return nil end
+    local doc = self.ui.document
+    if not (doc._checkIfWritable and doc:_checkIfWritable() == true) then return nil end
+    local tags_by_page = {}
+    for _, entry in ipairs(pending) do
+        tags_by_page[entry.page] = tags_by_page[entry.page] or {}
+        tags_by_page[entry.page][entry.tag] = true
+    end
+    local deleted = self:_deleteInkTagsByPage(tags_by_page)
+    if deleted > 0 then
+        logger.info("Pencil: removed", deleted, "ink annotation(s) left by an earlier session")
     end
     return deleted
 end
@@ -4894,6 +4964,14 @@ function Pencil:loadStrokes()
         return
     end
     if ok and data and data.strokes then
+        self.pending_ink_deletes = {}
+        if type(data.pending_ink_deletes) == "table" then
+            for _, entry in ipairs(data.pending_ink_deletes) do
+                if type(entry) == "table" and entry.page and type(entry.tag) == "string" then
+                    self:addPendingInkDelete(entry.page, entry.tag)
+                end
+            end
+        end
         -- Convert saved strokes back to usable format
         self.strokes = {}
         for i, saved in ipairs(data.strokes) do
@@ -5050,6 +5128,9 @@ function Pencil:saveStrokes()
         version = STROKES_FILE_VERSION,
         strokes = saveable_strokes,
         annotation_groups = self.annotation_groups,
+        -- PDF ink deleted in memory but not yet written to the file.
+        pending_ink_deletes = (self.pending_ink_deletes and #self.pending_ink_deletes > 0)
+            and self.pending_ink_deletes or nil,
     }
 
     local f, err = io.open(filepath, "w")
@@ -5094,6 +5175,10 @@ function Pencil:onCloseDocument()
 
     -- An erase gesture still in progress never reaches its pen-up handler.
     self:flushPendingEraseToPdf()
+    -- Make sure every queued ink deletion is in the document for the write.
+    local pok, pres = pcall(self.applyPendingInkDeletes, self)
+    if not pok then logger.err("Pencil: applyPendingInkDeletes error:", pres) end
+    local deletes_applied = pok and pres ~= nil
 
     -- Auto-save pencil ink into the PDF file (opt-in). This only stages the
     -- annotations in memory; the actual disk write is the single flushPdfEdits()
@@ -5117,6 +5202,9 @@ function Pencil:onCloseDocument()
     -- `embedded`; otherwise they're un-staged so the sidecar never claims ink
     -- the file didn't receive, and the next close retries them.
     self:settleStagedStrokes(not self._pdf_dirty)
+    -- Likewise the queued deletions are done once the file has them (or
+    -- nothing needed writing); otherwise they stay queued for next time.
+    if deletes_applied and not self._pdf_dirty then self.pending_ink_deletes = {} end
 
     -- Always save strokes on close (even if empty, to clear any previous data)
     logger.info("Pencil: saving strokes on document close")
@@ -5154,6 +5242,10 @@ function Pencil:onReaderReady()
 
     -- Sync annotation group bookmarks now that UI modules are ready
     self:syncAllBookmarks()
+
+    -- Finish PDF ink deletions an earlier session didn't get to write.
+    local pok, perr = pcall(self.applyPendingInkDeletes, self)
+    if not pok then logger.err("Pencil: applyPendingInkDeletes error:", perr) end
 
     -- Re-setup touch zones if enabled
     if self:isEnabled() and not self.touch_zones_registered then

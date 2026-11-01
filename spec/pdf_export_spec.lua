@@ -74,6 +74,23 @@ local fake_ffi = {
 
 local shown = {}
 
+-- Stand-in for KOReader's dump(): serializes plain data tables.
+local function dump(v)
+    local t = type(v)
+    if t == "table" then
+        local parts = {}
+        for k, val in pairs(v) do
+            local key = type(k) == "string" and string.format("[%q]", k) or "[" .. tostring(k) .. "]"
+            parts[#parts + 1] = key .. "=" .. dump(val)
+        end
+        return "{" .. table.concat(parts, ",") .. "}"
+    elseif t == "string" then
+        return string.format("%q", v)
+    else
+        return tostring(v)
+    end
+end
+
 local stubs = {
     ["ui/widget/container/inputcontainer"] = {
         extend = function(_, o) return setmetatable(o or {}, { __index = make_stub() }) end,
@@ -147,7 +164,7 @@ local function new_doc(opts)
             }
         end,
     }
-    function doc:_checkIfWritable() return true end
+    function doc:_checkIfWritable() return opts.read_only and "read-only" or true end
     function doc:resetTileCacheValidity() end
     function doc:writeDocument()
         if opts.write_fails then error("disk full") end
@@ -157,6 +174,17 @@ local function new_doc(opts)
         self.is_edited = true
         table.insert(page(pageno).annots, { page = page(pageno), type = PDF_ANNOT_HIGHLIGHT })
         self.highlights_saved = self.highlights_saved + 1
+    end
+    function doc:deleteHighlight(pageno)
+        self.is_edited = true
+        local p = page(pageno)
+        for i, a in ipairs(p.annots) do
+            if a.type == PDF_ANNOT_HIGHLIGHT then
+                table.remove(p.annots, i)
+                break
+            end
+        end
+        self.highlights_deleted = (self.highlights_deleted or 0) + 1
     end
     doc.page = page
     return doc
@@ -209,6 +237,11 @@ local function new_pencil(opts)
         _pdf_dirty = false,
         _staged_strokes = false,
         input_debug_mode = false,
+        pending_ink_deletes = {},
+        current_stroke = false,
+        eraser_deleted = false,
+        eraser_button_deleted = false,
+        auto_save_pdf = opts.auto_save or false,
         tool_settings = {
             pen = { color = fakeColor(0, 0, 0), width = 3 },
             highlighter = { color = fakeColor(0xDD, 0xDD, 0xDD), width = 12 },
@@ -217,7 +250,9 @@ local function new_pencil(opts)
     }, { __index = Pencil })
     for _, name in ipairs({ "saveStrokes", "flushDirtyGroups", "refreshDogear",
             "rebuildAnnotationGroups", "removeGroupBookmark", "cancelGroupImageCapture",
-            "removeGroupImage", "purgeOrphanImages", "assignStrokeToGroup" }) do
+            "removeGroupImage", "purgeOrphanImages", "assignStrokeToGroup",
+            "cancelPendingRefresh", "cancelPendingSave", "teardownPenInput",
+            "flushPendingCaptures", "syncAllBookmarks", "rememberStrokesFilePath" }) do
         p[name] = function() end
     end
     return p, doc
@@ -500,5 +535,124 @@ describe("PDF export: manual save (real main.lua)", function()
         p.getCurrentPage = function() return 1 end
         p:saveCurrentPageToPdf()
         assert.equals(0, doc.highlights_saved)
+    end)
+end)
+
+describe("PDF export: deletions survive a crash (real main.lua)", function()
+    it("queues an erased stroke's tag until the close write", function()
+        local p, doc = new_pencil()
+        local s = draw(p, 1, { { x = 1, y = 1 } }, { embedded = true, annot_id = "kop-ink-mine" })
+        add_ink(doc, 1, "kop-ink-mine")
+        table.remove(p.strokes, 1)
+        p:commitErase({ s })
+        assert.same({ { page = 1, tag = "kop-ink-mine" } }, p.pending_ink_deletes)
+        p:onCloseDocument()
+        assert.equals(1, doc.writes)
+        assert.same({}, p.pending_ink_deletes)
+    end)
+
+    it("finishes a deletion an interrupted session left in the file", function()
+        local doc = new_doc()
+        add_ink(doc, 1, "kop-ink-erased-before-crash")
+        add_ink(doc, 1, "kop-ink-from-device-a")
+        local p = new_pencil({ doc = doc })
+        p.pending_ink_deletes = { { page = 1, tag = "kop-ink-erased-before-crash" } }
+        assert.equals(1, p:applyPendingInkDeletes())
+        assert.same({ "kop-ink-from-device-a" }, ink_tags(doc, 1))
+        p:onCloseDocument()
+        assert.equals(1, doc.writes)
+        assert.same({}, p.pending_ink_deletes)
+    end)
+
+    it("keeps the queue when the close write fails", function()
+        local doc = new_doc({ write_fails = true })
+        add_ink(doc, 1, "kop-ink-x")
+        local p = new_pencil({ doc = doc })
+        p.pending_ink_deletes = { { page = 1, tag = "kop-ink-x" } }
+        p:onCloseDocument()
+        assert.equals(1, #p.pending_ink_deletes)
+    end)
+
+    it("keeps the queue when the file can't be written at all", function()
+        local p = new_pencil({ doc = new_doc({ read_only = true }) })
+        p.pending_ink_deletes = { { page = 1, tag = "kop-ink-x" } }
+        p:onCloseDocument()
+        assert.equals(1, #p.pending_ink_deletes)
+    end)
+
+    it("clears a queued tag that is no longer in the file", function()
+        local p, doc = new_pencil()
+        p.pending_ink_deletes = { { page = 1, tag = "kop-ink-gone" } }
+        p:onCloseDocument()
+        assert.equals(0, doc.writes)
+        assert.same({}, p.pending_ink_deletes)
+    end)
+
+    it("round-trips the queue through the sidecar file", function()
+        local path = os.tmpname()
+        local p = new_pencil()
+        p.saveStrokes = Pencil.saveStrokes
+        p.getStrokesFilePath = function() return path end
+        p.strokes_file_too_new = false
+        p.strokes_loaded = true
+        draw(p, 1, { { x = 1, y = 1 } })
+        p.pending_ink_deletes = { { page = 2, tag = "kop-ink-a" } }
+        -- saveStrokes requires these at call time, after the stub loader is gone.
+        local real_util, real_dump = package.loaded["util"], package.loaded["dump"]
+        package.loaded["util"] = { makePath = function() return true end }
+        package.loaded["dump"] = dump
+        p:saveStrokes()
+        package.loaded["util"], package.loaded["dump"] = real_util, real_dump
+        local q = new_pencil()
+        q.migrateStrokesFileIfNeeded = function() return path end
+        q.strokes_file_too_new = false
+        q:loadStrokes()
+        os.remove(path)
+        assert.same({ { page = 2, tag = "kop-ink-a" } }, q.pending_ink_deletes)
+        assert.equals(1, #q.strokes)
+    end)
+
+    it("embeds auto-saved ink on close", function()
+        local p, doc = new_pencil({ auto_save = true })
+        local s = draw(p, 1, { { x = 1, y = 1 } })
+        p:onCloseDocument()
+        assert.is_true(s.embedded)
+        assert.equals(1, doc.writes)
+    end)
+end)
+
+describe("PDF export: erasing a highlight (real main.lua)", function()
+    local function reader_with_highlight(write_into_pdf)
+        local doc = new_doc()
+        local item = { page = 1, drawer = "lighten", pos0 = 0, pos1 = 1,
+                       pboxes = { { x = 1, y = 2, w = 3, h = 4 } } }
+        local annotation = { annotations = { item } }
+        local highlight = {
+            highlight_write_into_pdf = write_into_pdf,
+            -- Like ReaderHighlight:deleteHighlight: the PDF copy is only
+            -- removed when "write highlights into PDF" is on.
+            deleteHighlight = function(self, index)
+                local it = annotation.annotations[index]
+                if self.highlight_write_into_pdf then doc:deleteHighlight(it.page, it) end
+                table.remove(annotation.annotations, index)
+            end,
+        }
+        local p = new_pencil({ doc = doc, annotation = annotation, highlight = highlight })
+        p.findHighlightAtScreenPos = function() return 1 end
+        table.insert(doc.page(1).annots, { page = doc.page(1), type = PDF_ANNOT_HIGHLIGHT })
+        return p, doc
+    end
+
+    it("removes a highlight the manual save put in the PDF", function()
+        local p, doc = reader_with_highlight(false)
+        assert.is_true(p:eraseHighlightAtScreenPos(5, 5))
+        assert.equals(0, #doc.page(1).annots)
+    end)
+
+    it("doesn't delete twice when KOReader already removed it", function()
+        local p, doc = reader_with_highlight(true)
+        assert.is_true(p:eraseHighlightAtScreenPos(5, 5))
+        assert.equals(0, #doc.page(1).annots)
+        assert.equals(1, doc.highlights_deleted)
     end)
 end)
