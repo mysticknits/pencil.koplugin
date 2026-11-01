@@ -6,48 +6,63 @@ Enables freehand drawing and annotation with stylus on supported devices.
 --]]--
 
 local Blitbuffer = require("ffi/blitbuffer")
-local CenterContainer = require("ui/widget/container/centercontainer")
 local DataStorage = require("datastorage")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
-local FrameContainer = require("ui/widget/container/framecontainer")
+
 local Geom = require("ui/geometry")
-local GestureRange = require("ui/gesturerange")
-local HorizontalGroup = require("ui/widget/horizontalgroup")
-local HorizontalSpan = require("ui/widget/horizontalspan")
-local VerticalGroup = require("ui/widget/verticalgroup")
-local VerticalSpan = require("ui/widget/verticalspan")
+local PencilUI = require("ui")
+local PencilInput = require("pencilinput")
+
 -- Some Android file managers flatten the plugin folder on extraction; accept
 -- geometry.lua next to main.lua as well as in lib/.
 local ok_geom, PencilGeometry = pcall(require, "lib/geometry")
 if not ok_geom then
     PencilGeometry = require("geometry")
 end
+local PencilTool = require("lib/penciltool")
+local PencilStrokes = require("lib/pencilstrokes")
+local PencilNotes = require("lib/pencilnotes")
+local PencilLasso = require("lib/pencillasso")
+local PencilPDF = require("lib/pencilpdf")
 local Screen = Device.screen
-local Size = require("ui/size")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
+local NetworkMgr = require("ui/network/manager")
+local MyScript = require("lib/myscript")
 local UIManager = require("ui/uimanager")
-local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local _ = require("gettext")
 local T = require("ffi/util").template
 local time = require("ui/time")
+local function trimString(v) return tostring(v or ""):match("^%s*(.-)%s*$") end
 
 -- Check if device supports touch input
 if not Device:isTouchDevice() then
     return { disabled = true }
 end
 
--- Tool types
-local TOOL_PEN = "pen"
-local TOOL_HIGHLIGHTER = "highlighter"
-local TOOL_ERASER = "eraser"
+-- Tool types (managed by lib/penciltool.lua)
+local TOOL_PEN = PencilTool.TOOLS.PEN
+local TOOL_HIGHLIGHTER = PencilTool.TOOLS.HIGHLIGHTER
+local TOOL_ERASER = PencilTool.TOOLS.ERASER
+local LINUX_TOOLTYPE = PencilTool.LINUX_TOOLTYPE
 
 -- Color picker trigger settings
 local COLOR_PICKER_DELAY_MS = 500  -- How long pen must be held still (milliseconds)
 local COLOR_PICKER_TOLERANCE_PIXELS = 15  -- How many pixels pen can move while "still"
+
+-- Underline by holding the pen at the end of a horizontal stroke
+local UNDERLINE_HOLD_MS = 600          -- How long the pen must rest at the end
+local UNDERLINE_STILL_PIXELS = 10      -- Movement allowed while resting
+local UNDERLINE_MIN_LENGTH = 40        -- Shorter strokes are never underlines
+local UNDERLINE_MAX_SLOPE = 0.25       -- Max stroke height / width
+local UNDERLINE_SEARCH_PIXELS = 48     -- How far above the stroke to look for text
+
+-- Palm rejection: touches that start while the pen is near the screen, or
+-- within this long after the pen was last seen, are dropped.
+local PALM_GRACE_MS = 800
 
 -- Annotation grouping constants
 local GROUP_TIME_THRESHOLD_S = 10   -- seconds between strokes to be grouped
@@ -62,10 +77,7 @@ local IMAGE_CAPTURE_DEBOUNCE_S = 4       -- seconds after last stroke before cap
 local IMAGE_BADGE_SIZE = 48              -- on-page badge edge (px) when annotation is stale
 local IMAGE_BADGE_HIT_PAD = 32           -- extra pixels around badge for tap hit-test
 local IMAGE_BADGE_MARGIN_GAP = 5         -- gap from text/screen edge for margin badge
-local STROKES_PATH_SETTING = "pencil_strokes_path"
--- Format of pencil_strokes.lua this version writes. A file with a higher
--- version came from a newer Pencil; it's left untouched (see loadStrokes).
-local STROKES_FILE_VERSION = 4
+local ANNOTATION_HOLD_HIT_PAD = 18  -- extra pixels around annotation bbox
 
 -- Module-level reference to the most recently initialized Pencil instance.
 -- Used by the bookmark-list hook (a class-level monkey-patch installed once)
@@ -74,25 +86,18 @@ local _active_pencil = nil
 local _bookmark_hook_installed = false
 
 local Pencil = InputContainer:extend{
+    PALM_GRACE_MS = PALM_GRACE_MS,
     name = "pencil_annotation",
     is_doc_only = true,  -- Only available when a document is open
     current_stroke = nil,
-    strokes = nil,       -- All strokes for current document
-    current_tool = TOOL_PEN,
+    store = nil,         -- PencilStrokes instance (strokes of the document, page index, history), set in init()
+    tool = nil,          -- PencilTool instance (tool selection/settings/eraser/highlight state), set in init()
     touch_zones_registered = false,
-    undo_stack = {},     -- For undo functionality
-    eraser_tool_active = false,  -- Track if physical eraser end is in use (via BTN_TOOL_RUBBER)
-    eraser_button_active = false,  -- Hardware eraser button held
     eraser_button_deleted = {},    -- Track deletions for undo
-    -- Text-highlight state: true while a side-button + pen-drag is building a
-    -- KOReader text-highlight selection via ReaderHighlight. Sticky through
-    -- pen lift so releasing the side button mid-drag doesn't abort.
-    highlighting = false,
 
     -- Stylus callback for lowest latency (via Input:registerStylusCallback)
     stylus_callback_registered = false,
     pen_down = false,
-    erasing = false,  -- Track if currently in erase mode (for finger modifier)
     pen_x = 0,
     pen_y = 0,
 
@@ -102,6 +107,11 @@ local Pencil = InputContainer:extend{
 
     -- Delayed refresh - only refresh after user stops writing
     pending_refresh = nil,
+
+    -- Références vers les traits affichés temporairement en noir.
+    -- Ils seront redessinés directement en couleur après le délai.
+    pending_color_strokes = nil,
+    pending_color_repaint = false,
     refresh_delay_ms = 600, -- Wait 600ms after last stroke before final refresh
     -- Screen-space bbox of strokes drawn since the last delayed refresh fired.
     -- The post-lift "clean" refresh is scoped to this region instead of the
@@ -113,28 +123,12 @@ local Pencil = InputContainer:extend{
     pending_save = nil,
     save_delay_ms = 1500,
     dirty_groups = nil, -- Set of groups awaiting syncGroupBookmark (id -> group)
-
-    -- Tool settings
-    tool_settings = {
-        [TOOL_PEN] = {
-            width = 3,
-            color = nil,  -- Blitbuffer color, set in init
-            color_name = "Black",  -- For persistence and display
-            alpha = 255,
-        },
-        [TOOL_HIGHLIGHTER] = {
-            width = 20,
-            color = nil,  -- Set in init (needs Blitbuffer)
-            alpha = 128,
-        },
-        [TOOL_ERASER] = {
-            width = 20,
-        },
-    },
+    pending_group_strokes = nil, -- Stroke indices awaiting grouping outside PEN UP
 
     -- Side button state
     side_button_down = false,
-    side_button_used_for_highlight = false,  -- Track if button was used during a stroke
+    side_button_used_for_highlight = false,  -- button was used while drawing a highlight
+    eraser_touching = false,                 -- eraser role currently touching the screen
 
     -- Color picker state (triggered by holding pen within 5 pixels for 5 seconds)
     color_picker_start_x = nil,  -- Initial X position when pen touched down
@@ -142,10 +136,113 @@ local Pencil = InputContainer:extend{
     color_picker_start_time = nil,  -- Timestamp when pen touched down (nil if moved too far)
     color_picker_check_pending = nil,  -- Scheduled periodic check
     color_picker_showing = false,  -- Whether color picker is currently displayed
+    color_picker_tool = nil,  -- Tool (pen or highlighter) the hold-still picker is timing for
+    color_picker_contact_active = false, -- Consume the triggering hold until pen lift
 
     -- Available colors for the pen (initialized in init() with actual Blitbuffer colors)
     available_colors = {},
 }
+
+-- Input methods live in input.lua; public Pencil method names stay unchanged.
+Pencil.setupStylusCallback = PencilInput.setupStylusCallback
+Pencil.installPalmFilter = PencilInput.installPalmFilter
+Pencil.ensureStylusCallback = PencilInput.ensureStylusCallback
+Pencil.isPalmSlot = PencilInput.isPalmSlot
+Pencil.filterPalmSlots = PencilInput.filterPalmSlots
+Pencil.transformCoordinates = PencilInput.transformCoordinates
+Pencil.handleStylusSlot = PencilInput.handleStylusSlot
+Pencil.routeStylusSlot = PencilInput.routeStylusSlot
+Pencil.teardownStylusCallback = PencilInput.teardownStylusCallback
+
+-- Presentation methods live in ui.lua; public Pencil method names stay unchanged.
+Pencil.buildHighlighterMenu = PencilUI.buildHighlighterMenu
+Pencil.addToMainMenu = PencilUI.addToMainMenu
+Pencil.showAnnotationStatus = PencilUI.showAnnotationStatus
+Pencil.showColorPicker = PencilUI.showColorPicker
+Pencil.showAnnotationHoldMenu = PencilUI.showAnnotationHoldMenu
+Pencil.showMyScriptSettingsDialog = PencilUI.showMyScriptSettingsDialog
+Pencil.showRecognizedText = PencilUI.showRecognizedText
+Pencil.showAnnotationTextEditor = PencilUI.showAnnotationTextEditor
+Pencil.showAllRecognizedText = PencilUI.showAllRecognizedText
+Pencil.editAllRecognizedText = PencilUI.editAllRecognizedText
+Pencil.showGroupImagePreview = PencilUI.showGroupImagePreview
+
+-- PDF export methods live in lib/pencilpdf.lua; public Pencil method names stay unchanged.
+function Pencil:hasInkAnnotSupport(...)
+    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
+    return self.pdf_feature:hasInkAnnotSupport(...)
+end
+function Pencil:strokeToPagePoints(...)
+    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
+    return self.pdf_feature:strokeToPagePoints(...)
+end
+function Pencil:strokeToInkOpts(...)
+    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
+    return self.pdf_feature:strokeToInkOpts(...)
+end
+function Pencil:writeInkAnnotation(...)
+    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
+    return self.pdf_feature:writeInkAnnotation(...)
+end
+function Pencil:getPageTextHighlights(...)
+    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
+    return self.pdf_feature:getPageTextHighlights(...)
+end
+function Pencil:writeHighlightAnnotation(...)
+    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
+    return self.pdf_feature:writeHighlightAnnotation(...)
+end
+function Pencil:flushPdfEdits(...)
+    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
+    return self.pdf_feature:flushPdfEdits(...)
+end
+function Pencil:ensureHighlightAppearances(...)
+    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
+    return self.pdf_feature:ensureHighlightAppearances(...)
+end
+function Pencil:saveCurrentPageToPdf(...)
+    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
+    return self.pdf_feature:saveCurrentPageToPdf(...)
+end
+function Pencil:nextAnnotId(...)
+    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
+    return self.pdf_feature:nextAnnotId(...)
+end
+function Pencil:_pruneInkAnnotsOnPage(...)
+    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
+    return self.pdf_feature:_pruneInkAnnotsOnPage(...)
+end
+function Pencil:deleteEmbeddedAnnotationsFor(...)
+    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
+    return self.pdf_feature:deleteEmbeddedAnnotationsFor(...)
+end
+function Pencil:autoSaveInkToPdf(...)
+    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
+    return self.pdf_feature:autoSaveInkToPdf(...)
+end
+
+-- The document's strokes, their page index and undo/redo history, and what
+-- PencilStrokes needs to know about this plugin and the current view.
+function Pencil:initStrokeStore()
+    self.store = PencilStrokes:new{
+        log = function(message)
+            if self.input_debug_mode then self:writeDebugLog(message) end
+        end,
+        -- Annotation groups keep indices into the stroke list: renumber them
+        on_removed = function(indices) self:shiftGroupStrokeIndices(indices) end,
+    }
+    self.stroke_render_ctx = {
+        tool_settings = function(tool) return self.tool:getToolSettings(tool) end,
+        night_mode = false,
+    }
+    self.stroke_view = {
+        zoom = function(page) return (self:pageAffine(page)) end,
+        sync = function(stroke) return self:syncStrokeToView(stroke) end,
+    }
+    self.stroke_translate = function(strokes, dx, dy, pdeltas, sign)
+        return self:translateStrokes(strokes, dx, dy, pdeltas, sign)
+    end
+end
 
 function Pencil:init()
     -- CRITICAL: Add plugin to ReaderUI widget tree so it receives ALL key events
@@ -155,14 +252,16 @@ function Pencil:init()
     table.insert(self.ui.active_widgets, self) -- Always receive events even when hidden
 
     self.ui.menu:registerToMainMenu(self)
-    self.strokes = {}
-    self.page_strokes = {}  -- Index: page -> array of stroke indices
+    self:initStrokeStore()
     self.annotation_groups = {}  -- Annotation groups for bookmark integration
-    self.strokes_loaded = false  -- Set true after successful loadStrokes
-    self.undo_stack = {}
+    self.pending_group_strokes = {}
+    self.pending_color_strokes = {}
 
-    -- Initialize highlighter color (yellow)
-    self.tool_settings[TOOL_HIGHLIGHTER].color = Blitbuffer.Color8(0xDD)  -- Light gray for e-ink
+    -- Tool selection, per-tool settings, eraser and highlight mode state
+    self.tool = PencilTool:new()
+    self.notes_feature = PencilNotes:new{ plugin = self }
+    self.lasso_feature = PencilLasso:new{ plugin = self }
+    self.pdf_feature = PencilPDF:new{ plugin = self }
 
     -- Calculate gray value from highlight_lighten_factor setting
     local lighten_factor = G_reader_settings:readSetting("highlight_lighten_factor") or 0.2
@@ -193,12 +292,6 @@ function Pencil:init()
 
     -- Load tool and stylus button settings
     self:loadSettings()
-
-    -- Ensure pen color has a default value (black) if not set
-    if not self.tool_settings[TOOL_PEN].color then
-        self.tool_settings[TOOL_PEN].color = Blitbuffer.COLOR_BLACK
-        self.tool_settings[TOOL_PEN].color_name = "Black"
-    end
 
     -- Register as view module to render strokes
     self.view = self.ui.view
@@ -251,6 +344,12 @@ function Pencil:init()
         event = "PencilUndo",
         title = _("Pencil: undo"),
         reader = true,
+    })
+    Dispatcher:registerAction("pencil_redo", {
+        category = "none",
+        event = "PencilRedo",
+        title = _("Pencil: redo"),
+        reader = true,
         separator = true,
     })
 
@@ -263,17 +362,13 @@ function Pencil:init()
     -- pencil bookmarks open the saved image.
     self:installBookmarkHook()
 
-    logger.info("Pencil: initialized, enabled =", self:isEnabled(), "tool =", self.current_tool, "strokes =", #self.strokes)
+    logger.info("Pencil: initialized, enabled =", self:isEnabled(), "tool =", self.tool:getTool(), "strokes =", self.store:count())
 end
 
 -- Dispatcher event handlers (for custom gesture mapping)
 function Pencil:onPencilToggleTool()
-    if self.current_tool == TOOL_ERASER then
-        self.current_tool = TOOL_PEN
-    else
-        self.current_tool = TOOL_ERASER
-    end
-    local display_name = self.current_tool == TOOL_PEN and _("pencil") or _("eraser")
+    local tool = self.tool:togglePenEraser()
+    local display_name = tool == TOOL_PEN and _("pencil") or _("eraser")
     self:showToast(T(_("Tool: %1"), display_name), true)
     return true
 end
@@ -298,13 +393,13 @@ function Pencil:onPencilToggleEnabled()
 end
 
 function Pencil:onPencilSelectPen()
-    self.current_tool = TOOL_PEN
+    self.tool:setTool(TOOL_PEN)
     self:showToast(_("Pencil tool: pencil"), true)
     return true
 end
 
 function Pencil:onPencilSelectEraser()
-    self.current_tool = TOOL_ERASER
+    self.tool:setTool(TOOL_ERASER)
     self:showToast(_("Eraser selected"), true)
     return true
 end
@@ -314,346 +409,53 @@ function Pencil:onPencilUndo()
     return true
 end
 
--- Setup stylus callback for lowest latency pen capture
--- Uses the new Input:registerStylusCallback() API that intercepts stylus events
--- before they reach the gesture detector
-function Pencil:setupStylusCallback()
-    if self.stylus_callback_registered then return end
-
-    local Input = Device.input
-    if not Input or not Input.registerStylusCallback then
-        logger.warn("Pencil: stylus callback API not available")
-        return
-    end
-
-    local plugin = self
-
-    -- Register the stylus callback
-    -- Callback receives: input (Input object), slot (table with slot, id, x, y, tool, timev)
-    -- Return true to "dominate" (remove from gesture detection)
-    Input:registerStylusCallback(function(input, slot)
-        return plugin:handleStylusSlot(input, slot)
-    end)
-
-    self.stylus_callback_registered = true
-    logger.info("Pencil: stylus callback registered")
+function Pencil:onPencilRedo()
+    self:redoLastStroke()
+    return true
 end
 
--- Transform stylus coordinates based on screen rotation
--- Raw stylus coordinates are in hardware space; framebuffer expects logical (rotated) space
-function Pencil:transformCoordinates(x, y)
-    local rotation = Screen:getRotationMode()
-    return PencilGeometry.transformForRotation(x, y, rotation, Screen:getWidth(), Screen:getHeight())
-end
-
-
--- Handle a stylus slot from the callback
--- slot = {slot=N, id=N, x=N, y=N, tool=N, timev=timestamp}
--- id >= 0 means contact active, id == -1 means contact lifted
---
--- Tracks whether the current contact belongs to the plugin: it does once
--- we've handled one of its samples, until it lifts. Every lift clears it,
--- whichever branch handled the lift, so a stale flag like pen_down can't
--- keep the plugin from handing later contacts to an overlay.
-function Pencil:handleStylusSlot(input, slot)
-    local handled = self:routeStylusSlot(input, slot)
-    if slot.id and slot.id >= 0 then
-        if handled then self.owns_contact = true end
-    else
-        self.owns_contact = false
-    end
-    return handled
-end
-
-function Pencil:routeStylusSlot(input, slot)
-    -- Tool types from Linux input subsystem
-    local TOOL_TYPE_PEN = 1
-    local TOOL_TYPE_ERASER = 2
-    local TOOL_TYPE_HIGHLIGHTER = 3
-
-    -- Debug logging at the very start to see slot.tool
-    if self.input_debug_mode then
-        self:writeDebugLog(string.format("STYLUS SLOT: id=%d x=%d y=%d tool=%d eraser_active=%s",
-            slot.id or -1, slot.x or 0, slot.y or 0, slot.tool or -1,
-            tostring(self.eraser_button_active)))
-    end
-
-    -- Leave new contacts to a menu or overlay on top of the reader. A contact
-    -- that started on the page is still followed to its lift if an overlay
-    -- opens meanwhile, like the color picker shown while the pen is held
-    -- still: handing over the rest would make the lift a tap outside the
-    -- picker, closing it, and we'd never see the pen go up (#72). We just
-    -- stop drawing and erasing under the overlay.
-    local overlay = self:isOverlayActive()
-    if overlay and not self.owns_contact then return false end
-
-    -- Detect eraser end via slot.tool BEFORE key events arrive
-    -- This handles the timing issue where stylus callback fires before key events
-    if ((self.swap_eraser_and_highlighter and slot.tool == TOOL_TYPE_HIGHLIGHTER) or (not self.swap_eraser_and_highlighter and slot.tool == TOOL_TYPE_ERASER)) and not self.eraser_button_active then
-        logger.info("Pencil: Eraser end detected via slot.tool, activating eraser mode")
-        self.eraser_button_active = true
-        self.eraser_button_deleted = {}
-    elseif ((self.swap_eraser_and_highlighter and not (slot.tool == TOOL_TYPE_HIGHLIGHTER)) or (not self.swap_eraser_and_highlighter and not (slot.tool == TOOL_TYPE_ERASER))) and self.eraser_button_active then
-        -- Switched from eraser end to pen tip
-        logger.info("Pencil: Pen tip detected via slot.tool, deactivating eraser mode")
-        if self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
-            self:commitErase(self.eraser_button_deleted)
-        end
-        self.eraser_button_active = false
-        self.eraser_button_deleted = nil
-        UIManager:setDirty(self.view, "ui")
-    end
-
-    -- Eraser mode (from eraser end or hardware button) - works even if pencil disabled
-    if self.eraser_button_active then
-        if slot.id and slot.id >= 0 then
-            local raw_x = slot.x or self.pen_x
-            local raw_y = slot.y or self.pen_y
-            local x, y = self:transformCoordinates(raw_x, raw_y)
-            local page = self:getCurrentPage()
-            local deleted = not overlay and self:eraseAtPoint(x, y, page)
-            if deleted then
-                for _, stroke in ipairs(deleted) do
-                    table.insert(self.eraser_button_deleted, stroke)
-                end
-                self.view:paintTo(Screen.bb, 0, 0)
-                self:paintTo(Screen.bb, 0, 0)
-                local rx, ry, rw, rh = self:erasedStrokesRefreshRect(deleted)
-                if rx then
-                    Screen:refreshFast(rx, ry, rw, rh)
-                else
-                    Screen:refreshFast(0, 0, Screen:getWidth(), Screen:getHeight())
-                end
-            end
-            -- Also remove any native KOReader text highlight at this position.
-            -- removeItemByIndex emits AnnotationsModified and triggers its own
-            -- repaint, so we don't need to mirror the refreshFast call above.
-            if not overlay then
-                self:eraseHighlightAtScreenPos(x, y)
-            end
-            self.pen_x = x
-            self.pen_y = y
-        end
-        return true
-    end
-
-    -- Native text-highlight path: runs before any draw/stroke logic.
-    -- When input.lua has promoted slot.tool to HIGHLIGHTER (side button held),
-    -- route pen events through KOReader's ReaderHighlight instead of creating
-    -- a freehand stroke. Sticky: once we enter, we stay until pen lift even
-    -- if the side button is released mid-drag.
-    if self.experimental_text_highlight
-            and (slot.tool == TOOL_TYPE_HIGHLIGHTER or self.highlighting) then
-        local current_slot_id = slot.id or -1
-        -- Mark the side button as used so its release isn't treated as a
-        -- quick press (which would toggle to the eraser).
-        self.side_button_used_for_highlight = true
-        if current_slot_id >= 0 and not self.highlighting then
-            self:startTextHighlight(slot.x or 0, slot.y or 0)
-        elseif current_slot_id >= 0 and self.highlighting then
-            self:extendTextHighlight(slot.x or 0, slot.y or 0)
-        elseif current_slot_id < 0 and self.highlighting then
-            self:finishTextHighlight()
-        end
-        return true
-    end
-
-    if not self:isEnabled() then return false end
-
-    -- Log in debug mode
-    if self.input_debug_mode then
-        self:writeDebugLog(string.format("STYLUS: slot=%d id=%d x=%d y=%d tool=%d pen_down=%s tool=%s",
-            slot.slot or -1, slot.id or -1, slot.x or 0, slot.y or 0, slot.tool or -1,
-            tostring(self.pen_down), self.current_tool))
-    end
-
-    -- Determine effective tool:
-    -- 1. Physical eraser end via slot.tool (TOOL_TYPE_ERASER = 2) takes priority
-    -- 2. Physical eraser end via BTN_TOOL_RUBBER key event (eraser_tool_active) as backup
-    -- 3. Otherwise use selected tool (user can toggle via gesture)
-    local TOOL_TYPE_ERASER = 2
-    local effective_tool
-    if (self.swap_eraser_and_highlighter and slot.tool == TOOL_TYPE_HIGHLIGHTER) or (not self.swap_eraser_and_highlighter and slot.tool == TOOL_TYPE_ERASER) or self.eraser_tool_active then
-        effective_tool = TOOL_ERASER
-        if self.input_debug_mode and slot.tool == TOOL_TYPE_ERASER then
-            self:writeDebugLog(string.format("ERASER END detected via slot.tool=%d", slot.tool))
-        end
-    else
-        effective_tool = self.current_tool
-    end
-
-    -- Handle eraser mode
-    if effective_tool == TOOL_ERASER then
-        if self.input_debug_mode and not self.erasing then
-            self:writeDebugLog(string.format("ERASER MODE: pen_down=%s slot.id=%d",
-                tostring(self.pen_down), slot.id or -1))
-        end
-        if slot.id and slot.id >= 0 then
-            -- Eraser is touching - erase at this position
-            local first_touch = false
-            if not self.pen_down then
-                self.pen_down = true
-                self.erasing = true
-                self.eraser_deleted = {}
-                first_touch = true
-                if self.input_debug_mode then
-                    self:writeDebugLog("=== ERASER DOWN ===")
-                end
-            end
-
-            local raw_x = slot.x or self.pen_x
-            local raw_y = slot.y or self.pen_y
-            local x, y = self:transformCoordinates(raw_x, raw_y)
-            -- Erase on first touch OR when position changes
-            if first_touch or x ~= self.pen_x or y ~= self.pen_y then
-                local page = self:getCurrentPage()
-                if self.input_debug_mode then
-                    self:writeDebugLog(string.format("ERASE ATTEMPT at (%d, %d) page=%s erasing=%s",
-                        x, y, tostring(page), tostring(self.erasing)))
-                end
-                local deleted = not overlay and self:eraseAtPoint(x, y, page)
-                if deleted then
-                    for _, stroke in ipairs(deleted) do
-                        table.insert(self.eraser_deleted, stroke)
-                    end
-                    -- Immediately repaint view and our strokes overlay, then refresh
-                    self.view:paintTo(Screen.bb, 0, 0)
-                    self:paintTo(Screen.bb, 0, 0)
-                    local rx, ry, rw, rh = self:erasedStrokesRefreshRect(deleted)
-                    if rx then
-                        Screen:refreshUI(rx, ry, rw, rh)
-                    else
-                        Screen:refreshUI(0, 0, Screen:getWidth(), Screen:getHeight())
-                    end
-                    if self.input_debug_mode then
-                        self:writeDebugLog(string.format("ERASED %d strokes at (%d, %d)", #deleted, x, y))
-                    end
-                end
-                self.pen_x = x
-                self.pen_y = y
-            end
-        else
-            -- Eraser lifted
-            if self.pen_down and self.erasing then
-                self.pen_down = false
-                self.erasing = false
-                if self.eraser_deleted and #self.eraser_deleted > 0 then
-                    self:commitErase(self.eraser_deleted)
-                end
-                self.eraser_deleted = nil
-                UIManager:setDirty(self.view, "ui")
-                if self.input_debug_mode then
-                    self:writeDebugLog("=== ERASER UP ===")
-                end
-            end
-        end
-        return true  -- Dominate: remove from gesture detection
-    end
-
-    -- Handle pen/highlighter mode
-    if slot.id and slot.id >= 0 then
-        -- Pen down or moving
-        if not self.pen_down then
-            -- Start new stroke. (Pen taps on an open color picker never get
-            -- here: new contacts go to the overlay, whose buttons handle them.)
-            self.pen_down = true
-            self.erasing = false
-            self:cancelPendingRefresh()
-            self:cancelColorPickerTimer()
-            self:startRawStroke()
-            -- Record initial position and timestamp for color picker trigger
-            local raw_x = slot.x or 0
-            local raw_y = slot.y or 0
-            local x, y = self:transformCoordinates(raw_x, raw_y)
-            self.pen_x = x
-            self.pen_y = y
-            -- Only track picker state and schedule the 10Hz poll when the
-            -- hold-pen-still gesture would actually produce something to
-            -- show. Skipping these when both experimental pickers are off
-            -- avoids an UIManager:scheduleIn closure allocation on every
-            -- pen-down — real GC pressure on the A53 during multi-second
-            -- strokes.
-            if self.experimental_color_picker or self.experimental_pen_width then
-                self.color_picker_start_x = x
-                self.color_picker_start_y = y
-                self.color_picker_start_time = time.now()
-                -- Schedule periodic check for color picker trigger
-                self:scheduleColorPickerCheck()
-            end
-            if self.input_debug_mode then
-                self:writeDebugLog("=== PEN DOWN ===")
-            end
-        else
-            -- Pen is moving
-            local raw_x = slot.x or self.pen_x
-            local raw_y = slot.y or self.pen_y
-            local x, y = self:transformCoordinates(raw_x, raw_y)
-            if x ~= self.pen_x or y ~= self.pen_y then
-                -- Check if pen moved more than tolerance from start position
-                if self.color_picker_start_x and self.color_picker_start_y then
-                    local dx = math.abs(x - self.color_picker_start_x)
-                    local dy = math.abs(y - self.color_picker_start_y)
-                    if dx > COLOR_PICKER_TOLERANCE_PIXELS or dy > COLOR_PICKER_TOLERANCE_PIXELS then
-                        -- Pen moved too far - reset tracking (no color picker)
-                        self:resetColorPickerTracking()
-                    end
-                end
-                if not overlay then
-                    self:addRawPoint(x, y)
-                end
-                self.pen_x = x
-                self.pen_y = y
-            end
-        end
-    else
-        -- Pen lifted (id == -1)
-        if self.pen_down and not self.erasing then
-            self.pen_down = false
-            self:cancelColorPickerTimer()
-            self:endRawStroke()
-            if self.input_debug_mode then
-                self:writeDebugLog("=== PEN UP ===")
-            end
-        end
-    end
-
-    return true  -- Dominate: remove from gesture detection
-end
-
--- Teardown stylus callback
-function Pencil:teardownStylusCallback()
-    if not self.stylus_callback_registered then return end
-
-    local Input = Device.input
-    if Input and Input.unregisterStylusCallback then
-        Input:unregisterStylusCallback()
-    end
-
-    self.stylus_callback_registered = false
-    self.pen_down = false
-    logger.info("Pencil: stylus callback unregistered")
+-- Stylus/touch input handling lives in input.lua.
+-- Luminance (0..255) of a Blitbuffer color, or nil when it can't be derived.
+local function colorLuminance(color)
+    if not color or not color.getColor8 then return nil end
+    local ok, c8 = pcall(color.getColor8, color)
+    if not ok or not c8 then return nil end
+    return c8.a
 end
 
 -- Start a new stroke from raw input
-function Pencil:startRawStroke()
+function Pencil:startRawStroke(tool)
     local page = self:getCurrentPage()
-    local tool = self.side_button_down and TOOL_HIGHLIGHTER or self.current_tool
-    local tool_settings = self.tool_settings[tool] or self.tool_settings[TOOL_PEN]
+    tool = tool or (self.side_button_down and TOOL_HIGHLIGHTER or self.tool:getTool())
+    local tool_settings = self.tool:getToolSettings(tool)
 
-    if self.side_button_down then
-        self.side_button_used_for_highlight = true
+    self:noteHighlighterUse(tool)
+    self.current_stroke = PencilStrokes.newStroke(page, tool, tool_settings)
+
+    -- Resolve the effective draw color once per stroke. The night-mode
+    -- invert allocates a new FFI color object, so doing it per point puts
+    -- avoidable pressure on the GC during long strokes.
+    local draw_color = tool_settings.color
+    if Screen.night_mode and tool_settings.color_name ~= "Black" and tool_settings.color_name ~= "Gray"
+            and draw_color and draw_color.invert then
+        draw_color = draw_color:invert()
     end
+    self.stroke_draw_color = draw_color
 
-    self.current_stroke = {
-        page = page,
-        tool = tool,
-        points = {},
-        width = tool_settings.width,
-        color = tool_settings.color,
-        color_name = tool_settings.color_name,
-        alpha = tool_settings.alpha,
-        datetime = os.time(),
-    }
+    -- Decide the in-stroke refresh waveform once per stroke. Dark ink can
+    -- use the fast monochrome waveform (DU/A2 — what Kobo's own notebook
+    -- uses for live ink), which has far lower e-ink latency than the UI
+    -- waveform. Light shades (highlighter, gray) would get thresholded to
+    -- white and turn invisible mid-stroke, and color screens still need the
+    -- UI waveform to show non-black shades while drawing, so those keep
+    -- refreshUI. The final delayed refresh repaints everything at full
+    -- quality either way.
+    local lum = colorLuminance(draw_color)
+    local color_screen = Screen.isColorEnabled and Screen:isColorEnabled()
+    self.stroke_fast_refresh = Screen.refreshFast ~= nil
+        and lum ~= nil and lum < 0x80
+        and not (color_screen and tool_settings.color_name ~= "Black")
+
     self.last_refresh_time = time.now()
     self.dirty_region = nil  -- Clear any pending dirty region
     logger.dbg("Pencil: raw stroke started")
@@ -666,23 +468,52 @@ function Pencil:addRawPoint(x, y)
     local point = { x = x, y = y }
     table.insert(self.current_stroke.points, point)
 
+    local bbox = self.current_stroke.bbox
+    if bbox then
+        if x < bbox.x0 then bbox.x0 = x end
+        if y < bbox.y0 then bbox.y0 = y end
+        if x > bbox.x1 then bbox.x1 = x end
+        if y > bbox.y1 then bbox.y1 = y end
+    else
+        self.current_stroke.bbox = { x0 = x, y0 = y, x1 = x, y1 = y }
+    end
+
     local n = #self.current_stroke.points
 
     local width = self.current_stroke.width
-    local color = self.current_stroke.color
-    local half_w = math.floor(width / 2) + 2  -- padding for antialiasing
+    local color = PencilStrokes.liveColor(self.current_stroke, self.live_black_preview)
+    local half_w = math.floor(width / 2) + 2
 
     -- Reinvert color in night mode (if it's not black or gray)
-    if Screen.night_mode and self.current_stroke.color_name ~= "Black" and self.current_stroke.color_name ~= "Gray" then
+    local using_black_preview =
+        self.live_black_preview
+        and self.current_stroke.tool == TOOL_PEN
+        and self.current_stroke.color_name
+        and self.current_stroke.color_name ~= "Black"
+
+    if using_black_preview then
+        color = Screen.night_mode
+            and Blitbuffer.COLOR_WHITE
+            or Blitbuffer.COLOR_BLACK
+    elseif Screen.night_mode
+        and self.current_stroke.color_name ~= "Black"
+        and self.current_stroke.color_name ~= "Gray" then
         color = color:invert()
     end
 
     -- Draw to framebuffer and track dirty region
     local dirty_x, dirty_y, dirty_w, dirty_h
     if n == 1 then
+        if self.ui and self.ui.paging then
+            self:captureStrokeAnchor(self.current_stroke, x, y)
+        end
         -- Draw first point same size as line segments for consistency
-        local half_w_draw = math.floor(width / 2)
-        Screen.bb:paintRectRGB32(x - half_w_draw, y - half_w_draw, width, width, color)
+        if self.current_stroke.tool == TOOL_HIGHLIGHTER then
+            self.live_highlighter = PencilStrokes.drawLiveHighlighter(self.live_highlighter, Screen.bb, self.current_stroke, x, y, x, y)
+        else
+            local half_w_draw = math.floor(width / 2)
+            Screen.bb:paintRectRGB32(x - half_w_draw, y - half_w_draw, width, width, color)
+        end
         -- Use slightly larger dirty region for refresh padding
         dirty_x = x - half_w
         dirty_y = y - half_w
@@ -692,9 +523,9 @@ function Pencil:addRawPoint(x, y)
         local p1 = self.current_stroke.points[n - 1]
         local p2 = self.current_stroke.points[n]
         if self.current_stroke.tool == TOOL_HIGHLIGHTER then
-            self:drawHighlighterSegment(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
+            self.live_highlighter = PencilStrokes.drawLiveHighlighter(self.live_highlighter, Screen.bb, self.current_stroke, p1.x, p1.y, p2.x, p2.y)
         else
-            self:drawLineSegment(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
+            PencilStrokes.drawThickLine(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
         end
         -- Calculate bounding box of the segment
         dirty_x = math.min(p1.x, p2.x) - half_w
@@ -705,14 +536,15 @@ function Pencil:addRawPoint(x, y)
 
     -- Accumulate dirty region for batch refresh
     if dirty_x then
-        if self.dirty_region then
-            -- Expand existing dirty region
-            local r = self.dirty_region
-            local new_x = math.min(r.x, dirty_x)
-            local new_y = math.min(r.y, dirty_y)
-            local new_x2 = math.max(r.x + r.w, dirty_x + dirty_w)
-            local new_y2 = math.max(r.y + r.h, dirty_y + dirty_h)
-            self.dirty_region = { x = new_x, y = new_y, w = new_x2 - new_x, h = new_y2 - new_y }
+        local r = self.dirty_region
+        if r then
+            -- Expand existing dirty region in place (no per-point alloc)
+            local x2 = math.max(r.x + r.w, dirty_x + dirty_w)
+            local y2 = math.max(r.y + r.h, dirty_y + dirty_h)
+            if dirty_x < r.x then r.x = dirty_x end
+            if dirty_y < r.y then r.y = dirty_y end
+            r.w = x2 - r.x
+            r.h = y2 - r.y
         else
             self.dirty_region = { x = dirty_x, y = dirty_y, w = dirty_w, h = dirty_h }
         end
@@ -722,18 +554,117 @@ function Pencil:addRawPoint(x, y)
     local now = time.now()
     if time.to_ms(now - self.last_refresh_time) >= self.refresh_interval_ms then
         self.last_refresh_time = now
-        if self.dirty_region then
-            local r = self.dirty_region
-            -- Clamp to screen bounds
-            local rx = math.max(0, math.floor(r.x))
-            local ry = math.max(0, math.floor(r.y))
-            local rw = math.min(Screen:getWidth() - rx, math.ceil(r.w))
-            local rh = math.min(Screen:getHeight() - ry, math.ceil(r.h))
-            -- Use UI refresh mode for proper color rendering on color e-ink
-            Screen:refreshUI(rx, ry, rw, rh)
-            self.dirty_region = nil
+        self:refreshDirtyRegion()
+    end
+end
+
+-- Refresh the screen area drawn since the last refresh, if any.
+function Pencil:refreshDirtyRegion()
+    local r = self.dirty_region
+    if not r then return end
+    -- Clamp to screen bounds
+    local rx = math.max(0, math.floor(r.x))
+    local ry = math.max(0, math.floor(r.y))
+    local rw = math.min(Screen:getWidth() - rx, math.ceil(r.w))
+    local rh = math.min(Screen:getHeight() - ry, math.ceil(r.h))
+    if self.stroke_fast_refresh then
+        -- Fast monochrome waveform: lowest e-ink latency for dark ink
+        Screen:refreshFast(rx, ry, rw, rh)
+    else
+        -- UI waveform: needed for proper shading of light/colored ink
+        Screen:refreshUI(rx, ry, rw, rh)
+    end
+    self.dirty_region = nil
+end
+
+-- Restart the underline hold timer whenever the pen moves beyond the
+-- "still" tolerance; leave it running while the pen rests.
+function Pencil:trackUnderlineHold(x, y)
+    if not self.underline_hold or self.side_button_down then return end
+    if self.underline_still_x
+            and math.abs(x - self.underline_still_x) <= UNDERLINE_STILL_PIXELS
+            and math.abs(y - self.underline_still_y) <= UNDERLINE_STILL_PIXELS then
+        return
+    end
+    self.underline_still_x = x
+    self.underline_still_y = y
+    if not self._underline_check then
+        -- One closure per plugin instance, reused for every reschedule.
+        self._underline_check = function() self:checkUnderlineHold() end
+    end
+    UIManager:unschedule(self._underline_check)
+    UIManager:scheduleIn(UNDERLINE_HOLD_MS / 1000, self._underline_check)
+end
+
+function Pencil:cancelUnderlineHold()
+    self.underline_still_x = nil
+    self.underline_still_y = nil
+    if self._underline_check then
+        UIManager:unschedule(self._underline_check)
+    end
+end
+
+-- Fired after the pen rested UNDERLINE_HOLD_MS: if the stroke so far is a
+-- roughly horizontal line under text, turn it into a native highlight.
+function Pencil:checkUnderlineHold()
+    local stroke = self.current_stroke
+    if not (self.pen_down and stroke and not self.tool.highlighting) then return end
+    if stroke.tool ~= TOOL_PEN or #stroke.points < 2 then return end
+    local bbox = PencilGeometry.computeStrokeBbox(stroke)
+    local w, h = bbox.x1 - bbox.x0, bbox.y1 - bbox.y0
+    if w < UNDERLINE_MIN_LENGTH or h > w * UNDERLINE_MAX_SLOPE then return end
+    if not self:underlineTextAbove(bbox) then return end
+
+    -- The ink was only a gesture: drop it and repaint where it was.
+    self.current_stroke = nil
+    self.dirty_region = nil
+    self.view:paintTo(Screen.bb, 0, 0)
+    self:paintTo(Screen.bb)
+    local pad = (stroke.width or 3) + 4
+    local sw, sh = Screen:getWidth(), Screen:getHeight()
+    local rx, ry = math.max(0, bbox.x0 - pad), math.max(0, bbox.y0 - pad)
+    Screen:refreshUI(rx, ry, math.min(sw - rx, w + 2 * pad), math.min(sh - ry, h + 2 * pad))
+end
+
+-- Find the page position of the text just above a screen point, looking
+-- up to UNDERLINE_SEARCH_PIXELS. Returns the page position and the offset.
+function Pencil:findTextAbove(x, y)
+    for dy = 2, UNDERLINE_SEARCH_PIXELS, 4 do
+        local page_pos = self.ui.view:screenToPageTransform({ x = x, y = y - dy })
+        if page_pos then
+            local ok, word = pcall(self.ui.document.getWordFromPosition, self.ui.document, page_pos)
+            if ok and word and word.pos0 then
+                return page_pos, dy
+            end
         end
     end
+end
+
+-- Save a native KOReader highlight over the text above a stroke bbox.
+-- @return true if a highlight was saved
+function Pencil:underlineTextAbove(bbox)
+    if not (self.ui and self.ui.highlight and self.ui.view and self.ui.document) then
+        return false
+    end
+    local start_pos, dy = self:findTextAbove(bbox.x0 + 2, bbox.y0)
+    if not start_pos then return false end
+    -- Use the same text line for the end point.
+    local end_pos = self.ui.view:screenToPageTransform({ x = bbox.x1 - 2, y = bbox.y0 - dy })
+    if not end_pos then return false end
+
+    local ok, selected = pcall(self.ui.document.getTextFromPositions,
+                               self.ui.document, start_pos, end_pos)
+    if not (ok and selected and selected.pos0 and selected.pos1) then return false end
+    -- No drawer set: saveHighlight uses the reader's default highlight style.
+
+    local rh = self.ui.highlight
+    rh.selected_text = selected
+    local saved, err = pcall(rh.saveHighlight, rh, false)
+    if not saved then
+        logger.warn("Pencil: saving underline failed:", tostring(err))
+    end
+    if rh.clear then pcall(rh.clear, rh) end
+    return saved
 end
 
 -- End stroke from raw input
@@ -744,19 +675,31 @@ function Pencil:endRawStroke()
             self.current_stroke and #self.current_stroke.points or 0))
     end
     if self.current_stroke and #self.current_stroke.points >= 1 then
-        table.insert(self.strokes, self.current_stroke)
-        self:indexStroke(#self.strokes, self.current_stroke.page)
-        table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
-        self:assignStrokeToGroup(#self.strokes)
+        self:anchorStrokeToPage(self.current_stroke)
+        local stroke_idx = self.store:add(self.current_stroke)
+        self.store:pushUndo({ type = "add", stroke_idx = stroke_idx })
+        self:assignStrokeToGroup(stroke_idx)
         self:scheduleDeferredWork()
         if self.input_debug_mode then
             self:writeDebugLog(string.format("endRawStroke: SAVED stroke #%d with %d points, total strokes=%d",
-                #self.strokes, #self.current_stroke.points, #self.strokes))
+                self.store:count(), #self.current_stroke.points, self.store:count()))
         end
         logger.dbg("Pencil: raw stroke ended with", #self.current_stroke.points, "points")
         -- Track the region this stroke touched so the delayed refresh below
         -- can be scoped to it instead of the whole screen.
         self:accumulateRefreshBbox(self.current_stroke)
+
+        -- Le trait a été affiché directement en noir dans Screen.bb.
+        -- Conserver sa référence pour pouvoir le redessiner directement
+        -- avec sa vraie couleur après le délai.
+        if self.live_black_preview
+            and self.current_stroke.tool == TOOL_PEN
+            and self.current_stroke.color_name
+            and self.current_stroke.color_name ~= "Black" then
+            self.pending_color_strokes = self.pending_color_strokes or {}
+            self.pending_color_strokes[#self.pending_color_strokes + 1] =
+                self.current_stroke
+        end
         -- Schedule delayed refresh for clean display after writing stops.
         -- Not when nothing was saved, e.g. a hold that opened the color
         -- picker: a fast refresh over it would grey out its swatches.
@@ -766,7 +709,11 @@ function Pencil:endRawStroke()
             self:writeDebugLog("endRawStroke: NOT SAVED (no current_stroke or no points)")
         end
     end
+    -- Show the tail drawn since the last periodic refresh now, rather than
+    -- letting it appear only with the delayed full refresh.
+    self:refreshDirtyRegion()
     self.current_stroke = nil
+    self.live_highlighter = nil
 end
 
 -- Paint the in-progress text selection as "invert" rectangles while a
@@ -813,44 +760,47 @@ end
 -- / saveHighlight) are the same ones KOReader itself invokes internally.
 function Pencil:startTextHighlight(raw_x, raw_y)
     if not (self.ui and self.ui.highlight and self.ui.view and self.ui.document) then
-        return
+        return false
     end
     local screen_x, screen_y = self:transformCoordinates(raw_x, raw_y)
     local page_pos = self.ui.view:screenToPageTransform({ x = screen_x, y = screen_y })
-    if not page_pos then return end  -- Tap outside any page area
+    if not page_pos then return false end  -- Outside any page area
+
+    -- Only a text highlight if there is a word right below the pen; otherwise
+    -- the caller draws a freehand highlighter stroke instead.
+    local ok, word = pcall(self.ui.document.getWordFromPosition, self.ui.document, page_pos)
+    if not (ok and word and word.pos0 and word.pos1) then
+        return false
+    end
 
     local rh = self.ui.highlight
     rh.hold_pos = page_pos
+    rh.selected_text = {
+        text = word.word or "",
+        pos0 = word.pos0,
+        pos1 = word.pos1,
+        sboxes = word.sbox and { word.sbox } or {},
+        pboxes = word.pbox and { word.pbox } or {},
+    }
 
-    local ok, word = pcall(self.ui.document.getWordFromPosition, self.ui.document, page_pos)
-    if ok and word and word.pos0 and word.pos1 then
-        rh.selected_text = {
-            text = word.word or "",
-            pos0 = word.pos0,
-            pos1 = word.pos1,
-            sboxes = word.sbox and { word.sbox } or {},
-            pboxes = word.pbox and { word.pbox } or {},
-        }
-    else
-        rh.selected_text = nil
-    end
     -- State ReaderHighlight:onHold sets up for onHoldPan's corner scroll
     -- (see extendTextHighlight). The start xpointer is only there in EPUBs.
-    rh.selected_text_start_xpointer = ok and word and word.pos0 or nil
+    rh.selected_text_start_xpointer = word.pos0
     rh.allow_hold_pan_corner_scroll = false
     rh.was_in_some_corner = nil
 
-    self.highlighting = true
+    self.tool.highlighting = true
     -- Prevent the drawing-path pen-down branch from also firing on subsequent
     -- events for this contact.
     self.pen_down = true
 
     -- Show the first-word preview immediately.
     self:_paintTempSelection()
+    return true
 end
 
 -- Extend the active text-highlight selection to a new raw stylus position.
--- Called on each stylus slot update while self.highlighting is true.
+-- Called on each stylus slot update while self.tool.highlighting is true.
 function Pencil:extendTextHighlight(raw_x, raw_y)
     if not (self.ui and self.ui.highlight and self.ui.view and self.ui.document) then
         return
@@ -890,8 +840,22 @@ function Pencil:extendTextHighlight(raw_x, raw_y)
     end
 end
 
+-- Drop the text highlight in progress without saving it (the highlighter was
+-- held still to open its picker). The pen stays "down" until it is lifted, so
+-- the rest of this contact is ignored.
+function Pencil:cancelTextHighlight()
+    local rh = self.ui and self.ui.highlight
+    self:_clearTempSelection()
+    if rh and rh.clear then
+        pcall(rh.clear, rh)
+    end
+    self.tool.highlighting = false
+    -- Rest of this contact: not a new highlight, not a stroke
+    self.tool.highlight_freehand = true
+end
+
 -- Persist the current selection as a KOReader highlight annotation and reset.
--- Called on slot.id transitioning to -1 (pen lift) while self.highlighting.
+-- Called on slot.id transitioning to -1 (pen lift) while self.tool.highlighting.
 function Pencil:finishTextHighlight()
     local rh = self.ui and self.ui.highlight
     local has_selection = rh and rh.selected_text
@@ -921,7 +885,7 @@ function Pencil:finishTextHighlight()
         pcall(rh.clear, rh)
     end
 
-    self.highlighting = false
+    self.tool.highlighting = false
     self.pen_down = false
 end
 
@@ -943,31 +907,44 @@ function Pencil:findHighlightAtScreenPos(screen_x, screen_y)
         if not page_pos then return nil end
     end
 
-    for index, item in ipairs(self.ui.annotation.annotations) do
-        -- drawer is nil for page-bookmarks; only text highlights have it set.
-        if item.drawer and item.pos0 and item.pos1 then
-            local boxes
-            if is_paging then
-                if item.page == page_pos.page then
-                    local ok, got = pcall(self.ui.document.getPageBoxesFromPositions,
-                                          self.ui.document, page_pos.page, item.pos0, item.pos1)
+    -- Box lookups go through the document engine for every highlight in the
+    -- book, which is far too slow per eraser sample. Compute them once per
+    -- page and reuse until a highlight is removed or the gesture ends.
+    local cache_page = is_paging and page_pos.page or self:getCurrentPage()
+    local cache = self.highlight_box_cache
+    if not cache or cache.page ~= cache_page then
+        cache = { page = cache_page, entries = {} }
+        for index, item in ipairs(self.ui.annotation.annotations) do
+            -- drawer is nil for page-bookmarks; only text highlights have it set.
+            if item.drawer and item.pos0 and item.pos1 then
+                local boxes
+                if is_paging then
+                    if item.page == page_pos.page then
+                        local ok, got = pcall(self.ui.document.getPageBoxesFromPositions,
+                                              self.ui.document, page_pos.page, item.pos0, item.pos1)
+                        if ok then boxes = got end
+                    end
+                else
+                    -- Rolling mode (EPUB): work in screen coordinates directly.
+                    local ok, got = pcall(self.ui.document.getScreenBoxesFromPositions,
+                                          self.ui.document, item.pos0, item.pos1, true)
                     if ok then boxes = got end
                 end
-            else
-                -- Rolling mode (EPUB): work in screen coordinates directly.
-                local ok, got = pcall(self.ui.document.getScreenBoxesFromPositions,
-                                      self.ui.document, item.pos0, item.pos1, true)
-                if ok then boxes = got end
-            end
-            if boxes then
-                local px = is_paging and page_pos.x or screen_x
-                local py = is_paging and page_pos.y or screen_y
-                for _, box in ipairs(boxes) do
-                    if px >= box.x and px < box.x + box.w
-                            and py >= box.y and py < box.y + box.h then
-                        return index
-                    end
+                if boxes and #boxes > 0 then
+                    table.insert(cache.entries, { index = index, boxes = boxes })
                 end
+            end
+        end
+        self.highlight_box_cache = cache
+    end
+
+    local px = is_paging and page_pos.x or screen_x
+    local py = is_paging and page_pos.y or screen_y
+    for _, entry in ipairs(cache.entries) do
+        for _, box in ipairs(entry.boxes) do
+            if px >= box.x and px < box.x + box.w
+                    and py >= box.y and py < box.y + box.h then
+                return entry.index
             end
         end
     end
@@ -984,11 +961,20 @@ end
 function Pencil:eraseHighlightAtScreenPos(screen_x, screen_y)
     local index = self:findHighlightAtScreenPos(screen_x, screen_y)
     if not index then return false end
-    if not (self.ui and self.ui.bookmark and self.ui.bookmark.removeItemByIndex) then
+    -- Use ReaderHighlight:deleteHighlight, not bookmark:removeItemByIndex.
+    -- The latter only drops the highlight from KOReader's list; the former also
+    -- removes it from the PDF (via writePdfAnnotation "delete") when write-into-
+    -- PDF is on -- otherwise MuPDF keeps rendering the baked annotation and the
+    -- highlight never disappears. The PDF mutation is in-memory; our close
+    -- flush writes it out (mark dirty so it does).
+    if not (self.ui and self.ui.highlight and self.ui.highlight.deleteHighlight) then
         return false
     end
-    local ok = pcall(self.ui.bookmark.removeItemByIndex, self.ui.bookmark, index)
+    local ok = pcall(self.ui.highlight.deleteHighlight, self.ui.highlight, index)
+    -- Annotation indices and rendered boxes shift after a removal.
+    self.highlight_box_cache = nil
     if ok then
+        self._pdf_dirty = true
         UIManager:setDirty(self.ui.dialog or self.ui.view, "ui")
     end
     return ok
@@ -1048,67 +1034,47 @@ end
 -- Load plugin settings
 function Pencil:loadSettings()
     local settings = G_reader_settings:readSetting("pencil_annotation_settings") or {}
-    -- Always start with pencil tool when opening a book
-    self.current_tool = TOOL_PEN
-    -- Input debug mode: log all input details
     self.input_debug_mode = settings.input_debug_mode or false
-    -- Experimental features
     self.experimental_bookmark_sync = settings.experimental_bookmark_sync or false
-    -- Swap eraser and highlighter
-    self.swap_eraser_and_highlighter = settings.swap_eraser_and_highlighter or false
     self.experimental_pen_width = settings.experimental_pen_width or false
     self.experimental_color_picker = settings.experimental_color_picker or false
-    self.experimental_text_highlight = settings.experimental_text_highlight or false
-    -- Load pen color by name and look up the actual color value
-    local color_name = settings.pen_color_name
-    if color_name then
-        self.tool_settings[TOOL_PEN].color_name = color_name
-        for _, color_info in ipairs(self.available_colors) do
-            if color_info.name == color_name then
-                self.tool_settings[TOOL_PEN].color = color_info.color
-                break
-            end
-        end
-    end
-    -- Load pen width if previously chosen via the experimental width picker.
-    -- Validated against available_widths so a malformed settings file can't
-    -- inject arbitrary widths.
-    local saved_width = settings.pen_width
-    if saved_width then
-        for _, w in ipairs(self.available_widths) do
-            if w.width == saved_width then
-                self.tool_settings[TOOL_PEN].width = saved_width
-                break
-            end
-        end
-    end
+    self.auto_save_pdf = settings.auto_save_pdf or false
+    self.myscript_language = settings.myscript_language or "en_US"
+    self.myscript_application_key = settings.myscript_application_key or ""
+    self.myscript_hmac_key = settings.myscript_hmac_key or ""
+    self.underline_hold = settings.underline_hold ~= false
+    self.palm_rejection = settings.palm_rejection ~= false
+    self.hold_menu = settings.hold_menu ~= false
+    self.live_black_preview = settings.live_black_preview or false
+    self.tool:loadSettings(settings, self.available_colors, self.available_widths)
 end
 
--- Save plugin settings
 function Pencil:saveSettings()
-    G_reader_settings:saveSetting("pencil_annotation_settings", {
+    local settings = {
         input_debug_mode = self.input_debug_mode,
         experimental_bookmark_sync = self.experimental_bookmark_sync,
         experimental_pen_width = self.experimental_pen_width,
         experimental_color_picker = self.experimental_color_picker,
-        experimental_text_highlight = self.experimental_text_highlight,
-        pen_color_name = self.tool_settings[TOOL_PEN].color_name,
-        swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
-        pen_width = self.tool_settings[TOOL_PEN].width,
-    })
+        auto_save_pdf = self.auto_save_pdf,
+        myscript_language = self.myscript_language,
+        myscript_application_key = self.myscript_application_key,
+        myscript_hmac_key = self.myscript_hmac_key,
+        underline_hold = self.underline_hold,
+        palm_rejection = self.palm_rejection,
+        hold_menu = self.hold_menu,
+        live_black_preview = self.live_black_preview,
+    }
+    for key, value in pairs(self.tool:exportSettings()) do
+        settings[key] = value
+    end
+    G_reader_settings:saveSetting("pencil_annotation_settings", settings)
 end
 
--- Set current tool
 function Pencil:setTool(tool)
-    self.current_tool = tool
+    self.tool:setTool(tool)
     self:saveSettings()
-    -- Show visual feedback with proper display name
-    local display_name = tool == TOOL_PEN and _("pencil") or _("eraser")
-    UIManager:show(InfoMessage:new{
-        text = T(_("Tool: %1"), display_name),
-        timeout = 1,
-    })
 end
+
 
 function Pencil:isEnabled()
     return G_reader_settings:readSetting("pencil_annotation_enabled") == true
@@ -1149,315 +1115,18 @@ function Pencil:setEnabled(enabled)
     G_reader_settings:saveSetting("pencil_annotation_enabled", enabled)
 end
 
-function Pencil:addToMainMenu(menu_items)
-    menu_items.pencil_annotation = {
-        text = _("Pencil"),
-        sorting_hint = "more_tools",
-        sub_item_table = {
-            {
-                text = _("Enabled"),
-                checked_func = function()
-                    return self:isEnabled()
-                end,
-                callback = function()
-                    self:onPencilToggleEnabled()
-                end,
-                separator = true,
-            },
-            {
-                text = _("Swap Eraser and Highlighter"),
-                checked_func = function()
-                    return self.swap_eraser_and_highlighter
-                end,
-                callback = function()
-                    self.swap_eraser_and_highlighter = not self.swap_eraser_and_highlighter
-                    self:saveSettings()
-                end,
-                separator = true,
-            },
-            {
-                text = _("Tool"),
-                help_text = _("Select pencil or eraser."),
-                sub_item_table = {
-                    {
-                        text = _("Pencil"),
-                        checked_func = function()
-                            return self.current_tool == TOOL_PEN
-                        end,
-                        callback = function()
-                            self:setTool(TOOL_PEN)
-                        end,
-                    },
-                    {
-                        text = _("Eraser"),
-                        checked_func = function()
-                            return self.current_tool == TOOL_ERASER
-                        end,
-                        callback = function()
-                            self:setTool(TOOL_ERASER)
-                        end,
-                    },
-                },
-            },
-            {
-                text = _("Undo last stroke"),
-                callback = function()
-                    self:undoLastStroke()
-                end,
-                enabled_func = function()
-                    return #self.undo_stack > 0
-                end,
-                separator = true,
-            },
-            {
-                text = _("Clear page strokes"),
-                callback = function()
-                    self:clearPageStrokes()
-                end,
-                enabled_func = function()
-                    return self:hasStrokesOnCurrentPage()
-                end,
-            },
-            {
-                text = _("Clear all strokes"),
-                callback = function()
-                    self:clearAllStrokes()
-                end,
-                enabled_func = function()
-                    return #self.strokes > 0
-                end,
-            },
-            {
-                text_func = function()
-                    local bytes = self:getImagesSizeBytes()
-                    if bytes <= 0 then
-                        return _("Annotation images: none")
-                    elseif bytes < 1024 * 1024 then
-                        return T(_("Annotation images: %1 KB"), math.floor(bytes / 1024))
-                    else
-                        return T(_("Annotation images: %1 MB"),
-                            string.format("%.1f", bytes / (1024 * 1024)))
-                    end
-                end,
-                help_text = _("Saved preview images of your annotations are used to show what you wrote even after the device is rotated, and to preview annotations from the bookmark list. Tap to clear them for this book."),
-                keep_menu_open = true,
-                enabled_func = function()
-                    return self:getImagesSizeBytes() > 0
-                end,
-                callback = function(touchmenu_instance)
-                    self:purgeAllImages()
-                    if touchmenu_instance then touchmenu_instance:updateItems() end
-                    UIManager:show(InfoMessage:new{
-                        text = _("Cleared all annotation preview images for this book."),
-                        timeout = 2,
-                    })
-                end,
-                separator = true,
-            },
-            {
-                text = _("Experimental"),
-                sub_item_table = {
-                    {
-                        text = _("Bookmark sync"),
-                        help_text = _("Automatically create KOReader bookmarks for pencil annotations so you can navigate to annotated pages from the Bookmarks menu."),
-                        checked_func = function()
-                            return self.experimental_bookmark_sync
-                        end,
-                        callback = function()
-                            self.experimental_bookmark_sync = not self.experimental_bookmark_sync
-                            self:saveSettings()
-                            if self.experimental_bookmark_sync then
-                                self:syncAllBookmarks()
-                                self:refreshDogear()
-                                UIManager:show(InfoMessage:new{
-                                    text = _("Bookmark sync enabled. Pencil annotations will appear in the Bookmarks menu."),
-                                    timeout = 3,
-                                })
-                            else
-                                self:removeAllPencilBookmarks()
-                                self:refreshDogear()
-                                UIManager:show(InfoMessage:new{
-                                    text = _("Bookmark sync disabled. Pencil bookmarks removed."),
-                                    timeout = 3,
-                                })
-                            end
-                        end,
-                    },
-                    {
-                        text = _("Color picker"),
-                        help_text = _("Allow the hold-pen-still gesture to open a picker for changing pen color (and, if the pen width picker is also enabled, stroke width). When disabled, the pen stays on its last-saved color."),
-                        checked_func = function()
-                            return self.experimental_color_picker
-                        end,
-                        callback = function()
-                            self.experimental_color_picker = not self.experimental_color_picker
-                            self:saveSettings()
-                            if self.experimental_color_picker then
-                                UIManager:show(InfoMessage:new{
-                                    text = _("Color picker enabled. Hold the pen still to open it."),
-                                    timeout = 3,
-                                })
-                            else
-                                UIManager:show(InfoMessage:new{
-                                    text = _("Color picker disabled. Pen will keep its current color."),
-                                    timeout = 2,
-                                })
-                            end
-                        end,
-                    },
-                    {
-                        text = _("Pen width picker"),
-                        help_text = _("Add pen width options (3, 5, 7, 9) to the color picker. The width buttons appear as black bars whose height previews the stroke thickness. Requires the color picker to also be enabled."),
-                        checked_func = function()
-                            return self.experimental_pen_width
-                        end,
-                        callback = function()
-                            self.experimental_pen_width = not self.experimental_pen_width
-                            self:saveSettings()
-                            if self.experimental_pen_width then
-                                UIManager:show(InfoMessage:new{
-                                    text = _("Pen width picker enabled. Hold the pen still to open the picker and choose a stroke width."),
-                                    timeout = 3,
-                                })
-                            else
-                                UIManager:show(InfoMessage:new{
-                                    text = _("Pen width picker disabled."),
-                                    timeout = 2,
-                                })
-                            end
-                        end,
-                    },
-                    {
-                        text = _("Text highlight (side button)"),
-                        help_text = _("When enabled, holding the stylus side button during a pen drag creates a native KOReader text highlight on the underlying words, like a long-press \xe2\x86\x92 Highlight. Off by default because this is a new integration and has edge cases. Requires a stylus that sends BTN_STYLUS2."),
-                        checked_func = function()
-                            return self.experimental_text_highlight
-                        end,
-                        callback = function()
-                            self.experimental_text_highlight = not self.experimental_text_highlight
-                            self:saveSettings()
-                            if self.experimental_text_highlight then
-                                UIManager:show(InfoMessage:new{
-                                    text = _("Text highlight enabled. Hold the side button while dragging the pen across words."),
-                                    timeout = 3,
-                                })
-                            else
-                                UIManager:show(InfoMessage:new{
-                                    text = _("Text highlight disabled."),
-                                    timeout = 2,
-                                })
-                            end
-                        end,
-                    },
-                },
-                separator = true,
-            },
-            {
-                text = _("Input debug mode"),
-                help_text = _("Enable detailed logging of input events to help diagnose stylus detection issues."),
-                checked_func = function()
-                    return self.input_debug_mode
-                end,
-                callback = function()
-                    self.input_debug_mode = not self.input_debug_mode
-                    self:saveSettings()
-                    if self.input_debug_mode then
-                        -- Initialize debug logging
-                        self:initDebugLog()
-                        UIManager:show(InfoMessage:new{
-                            text = T(_("Input debug mode enabled.\n\nLog file: %1\n\nUse both pen tip and eraser end, then check the log."), self:getDebugLogPath()),
-                        })
-                    else
-                        UIManager:show(InfoMessage:new{
-                            text = _("Input debug mode disabled."),
-                        })
-                    end
-                end,
-            },
-            {
-                text = _("Clear debug log"),
-                enabled_func = function()
-                    return self.input_debug_mode
-                end,
-                callback = function()
-                    self:clearDebugLog()
-                    UIManager:show(InfoMessage:new{
-                        text = _("Debug log cleared. Ready to capture new input events."),
-                        timeout = 2,
-                    })
-                end,
-            },
-            {
-                text = _("Show annotation status"),
-                callback = function()
-                    self:showAnnotationStatus()
-                end,
-            },
-        },
-    }
-end
-
--- Show current annotation status for debugging
-function Pencil:showAnnotationStatus()
-    local page = self:getCurrentPage()
-    local page_strokes = self.page_strokes[page] and #self.page_strokes[page] or 0
-    local filepath = self:getStrokesFilePath() or "not available"
-
-    -- Show all pages with strokes for debugging
-    local pages_info = ""
-    for p, indices in pairs(self.page_strokes) do
-        pages_info = pages_info .. string.format("\n  %s (%s): %d", tostring(p), type(p), #indices)
+-- Drawing with the side button held counts as using it for highlighting, so
+-- its release isn't taken for a quick press (which toggles pen/eraser).
+function Pencil:noteHighlighterUse(tool)
+    if self.side_button_down and tool == TOOL_HIGHLIGHTER then
+        self.side_button_used_for_highlight = true
     end
-    if pages_info == "" then
-        pages_info = "\n  (none)"
-    end
-
-    -- Stylus callback status
-    local Input = Device.input
-    local pen_slot = Input and Input.pen_slot or "N/A"
-    local stylus_callback_status = self.stylus_callback_registered and "registered" or "not registered"
-    local pen_down_status = self.pen_down and "YES" or "no"
-
-    local status_text = T(_([[Pencil Annotation Status
-
-Selected tool: %1
-Total strokes: %2
-Strokes on this page: %3
-Current page: %4 (%5)
-Storage file: %6
-Enabled: %7
-
-Stylus callback: %9
-Pen slot: %10
-Pen down: %11
-
-Side button: tap to toggle pen/eraser, hold+drag to highlight.
-
-Enable "Input debug mode" to log raw events for diagnosis.
-
-Pages with strokes:%8]]),
-        self.current_tool,
-        #self.strokes,
-        page_strokes,
-        tostring(page),
-        type(page),
-        filepath,
-        self:isEnabled() and _("Yes") or _("No"),
-        pages_info,
-        stylus_callback_status,
-        tostring(pen_slot),
-        pen_down_status
-    )
-
-    UIManager:show(InfoMessage:new{
-        text = status_text,
-    })
 end
 
 -- Handle stylus button press (down event)
--- Side button behavior:
---   - Hold + drag = temporarily highlight, then return to original tool
---   - Quick press (no drawing while held) = toggle between pen and eraser
+-- Highlighter-role button (the side button, or the eraser end when swapped):
+-- while it is down the pen highlights (a freehand highlighter stroke, or text
+-- with the "Text highlight" option).
 function Pencil:onStylusButtonPress()
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
@@ -1476,13 +1145,14 @@ function Pencil:onStylusButtonRelease()
     self.side_button_down = false
 
     -- If the button was NOT used for highlighting (no drawing while held),
-    -- treat it as a quick press to toggle between pen and eraser
-    if was_down and not self.side_button_used_for_highlight then
+    -- treat it as a quick press to toggle between pen and eraser. (With the
+    -- "Eraser click" option the eraser's click does that instead.)
+    if was_down and not self.side_button_used_for_highlight
+            and not self.tool:isEraserClickMode() then
         logger.dbg("Pencil: side button quick press - toggling pen/eraser")
         self:togglePenEraser()
     else
-        -- Was used for highlighting - show brief feedback that we're back to normal
-        logger.dbg("Pencil: highlight complete, back to", self.current_tool)
+        logger.dbg("Pencil: highlight complete, back to", self.tool:getTool())
     end
 
     self.side_button_used_for_highlight = false
@@ -1491,24 +1161,57 @@ end
 
 -- Toggle between pen and eraser
 function Pencil:togglePenEraser()
-    local old_tool = self.current_tool
-    local new_tool
-    if self.current_tool == TOOL_ERASER then
-        new_tool = TOOL_PEN
-    else
-        new_tool = TOOL_ERASER
-    end
-
-    self.current_tool = new_tool
+    self.tool:togglePenEraser()
     self:saveSettings()
-    logger.dbg("Pencil: toggled from", old_tool, "to", new_tool)
-
-    -- Show brief visual feedback
-    local display_name = new_tool == TOOL_PEN and _("pencil") or _("eraser")
+    local display_name = self.tool:getTool() == TOOL_PEN and _("pencil") or _("eraser")
     self:showToast(T(_("Tool: %1"), display_name))
 end
 
--- Handle stylus button and tool events
+-- Erase strokes (and native highlights) under a screen position on behalf of
+-- the eraser end/button, remembering what was deleted for undo.
+function Pencil:eraseWithEraserRole(x, y)
+    self.eraser_button_deleted = self.eraser_button_deleted or {}
+    -- Group rebuilding is deferred to the end of the gesture (finishEraseGesture)
+    local deleted = self:eraseAtPoint(x, y, self:getCurrentPage(), true)
+    if deleted then
+        for _, stroke in ipairs(deleted) do
+            table.insert(self.eraser_button_deleted, stroke)
+        end
+        self:refreshAfterErase(deleted, true)
+    end
+    -- Also remove any native KOReader text highlight at this position.
+    -- removeItemByIndex emits AnnotationsModified and triggers its own
+    -- repaint, so we don't need to mirror the refreshFast call above.
+    self:eraseHighlightAtScreenPos(x, y)
+    self.pen_x = x
+    self.pen_y = y
+end
+
+-- "Eraser click" mode: a click with the eraser role (eraser end touching
+-- without dragging, or the eraser button pressed and released) switches
+-- between pen and eraser.
+function Pencil:onEraserClick()
+    if not self:isEnabled() then return end
+    logger.dbg("Pencil: eraser click - toggling pen/eraser")
+    self:togglePenEraser()
+end
+
+-- Eraser mode ended (eraser end lifted or eraser button released): push what
+-- it deleted onto the undo stack and repaint.
+function Pencil:endEraserMode()
+    self:finishEraseGesture()
+    if self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
+        self.store:pushUndo({ type = "delete", strokes = self.eraser_button_deleted })
+        self:saveStrokes()
+    end
+    self.eraser_button_deleted = nil
+    UIManager:setDirty(self.view, "ui")
+end
+
+-- Handle stylus button and tool events.
+-- What a physical input does (erase / highlight) is decided by PencilTool, so
+-- the swap eraser/highlighter option applies the same way to key press, key
+-- release and raw stylus slots.
 function Pencil:onKeyPress(key)
     -- Some Kobo key/Event objects have a __tostring that errors on nil fields;
     -- guard so a stray key event can't abort this handler mid-eraser-gesture.
@@ -1520,42 +1223,39 @@ function Pencil:onKeyPress(key)
         self:writeDebugLog(string.format("KEY PRESS: %s key.key=%s", key_str, tostring(key.key)))
     end
 
-    -- Hardware Eraser button - works regardless of pencil enabled state
-    if (not self.swap_eraser_and_highlighter and key.key == "Eraser") then
-        logger.info("Pencil: Eraser button PRESSED")
-        self.eraser_button_active = true
-        self.eraser_button_deleted = {}
-        return true
-    end
+    local role, input = self.tool:roleForKey(key.key, key_str)
 
-    -- BTN_TOOL_RUBBER - physical eraser end - works regardless of pencil enabled state
-    if (self.swap_eraser_and_highlighter and (key_str:match("Highlighter") or key_str:match("Stylus"))) or (not self.swap_eraser_and_highlighter and (key_str:match("BTN_TOOL_RUBBER") or key_str:match("ToolRubber"))) then
-        logger.info("Pencil: BTN_TOOL_RUBBER press - activating eraser mode")
-        self.eraser_button_active = true
-        self.eraser_button_deleted = {}
-        self.eraser_tool_active = true
+    -- Eraser role (eraser end/button, or the side button when swapped) -
+    -- works regardless of pencil enabled state
+    if role == TOOL_ERASER then
+        logger.info("Pencil: eraser input PRESSED:", input)
+        -- BTN_TOOL_RUBBER is the eraser end itself and stays flagged until it leaves
+        if self.tool:activateEraser(input == PencilTool.INPUT.RUBBER) then
+            self.eraser_button_deleted = {}
+        end
         return true
     end
 
     -- BTN_TOOL_PEN - pen tip - deactivate eraser mode
     if key_str:match("BTN_TOOL_PEN") or key_str:match("ToolPen") then
         logger.info("Pencil: BTN_TOOL_PEN press - deactivating eraser mode")
-        if self.eraser_button_active and self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
+        self:finishEraseGesture()
+        if self.tool.eraser_button_active and self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
             -- Save any pending eraser deletions before switching to pen
             self:commitErase(self.eraser_button_deleted)
         end
-        self.eraser_button_active = false
+        self.tool:deactivateEraser()
         self.eraser_button_deleted = nil
-        self.eraser_tool_active = false
+        self.tool.eraser_tool_active = false
         return true
     end
 
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
-    -- BTN_STYLUS (331) - side button on stylus (mapped to "Eraser" on Kobo)
-    -- BTN_STYLUS2 (332) - second side button (mapped to "Highlighter" on Kobo)
-    if (self.swap_eraser_and_highlighter and key.key == "Eraser") or (not self.swap_eraser_and_highlighter and (key_str:match("Highlighter") or key_str:match("Stylus"))) then
-        logger.dbg("Pencil: Stylus button press detected:", key_str)
+    -- Highlighter role (side button, or the eraser end/button when swapped):
+    -- hold+drag highlights
+    if role == TOOL_HIGHLIGHTER then
+        logger.dbg("Pencil: highlighter input press detected:", key_str)
         return self:onStylusButtonPress()
     end
     return false
@@ -1570,29 +1270,28 @@ function Pencil:onKeyRelease(key)
         self:writeDebugLog(string.format("KEY RELEASE: %s key.key=%s", key_str, tostring(key.key)))
     end
 
-    -- Hardware Eraser button released
-    if key.key == "Eraser" and self.eraser_button_active then
-        logger.info("Pencil: Eraser button RELEASED")
-        self.eraser_button_active = false
-        if self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
-            self:commitErase(self.eraser_button_deleted)
-        end
-        self.eraser_button_deleted = nil
-        UIManager:setDirty(self.view, "ui")
-        return true
-    end
+    local role, input = self.tool:roleForKey(key.key, key_str)
 
-    -- BTN_TOOL_RUBBER released (eraser end moved away) - works regardless of pencil enabled state
-    if key_str:match("BTN_TOOL_RUBBER") or key_str:match("ToolRubber") then
-        logger.info("Pencil: BTN_TOOL_RUBBER release - deactivating eraser mode")
-        if self.eraser_button_active and self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
-            self:commitErase(self.eraser_button_deleted)
+    -- Eraser role released - works regardless of pencil enabled state
+    if role == TOOL_ERASER then
+        if input == PencilTool.INPUT.RUBBER then
+            -- BTN_TOOL_RUBBER released (eraser end moved away)
+            logger.info("Pencil: BTN_TOOL_RUBBER release - deactivating eraser mode")
+            local clicked = self.tool:deactivateEraser(false)
+            self.tool.eraser_tool_active = false
+            self:endEraserMode()
+            if clicked and self.tool:isEraserClickMode() then self:onEraserClick() end
+            return true
+        elseif self.tool.eraser_button_active then
+            logger.info("Pencil: eraser input RELEASED:", input)
+            -- (Eraser click mode) The side button, when swapped to be the
+            -- eraser, is a real button: pressing and releasing it without
+            -- touching the screen is a click
+            local clicked = self.tool:deactivateEraser(input == PencilTool.INPUT.SIDE_KEY)
+            self:endEraserMode()
+            if clicked and self.tool:isEraserClickMode() then self:onEraserClick() end
+            return true
         end
-        self.eraser_button_active = false
-        self.eraser_button_deleted = nil
-        self.eraser_tool_active = false
-        UIManager:setDirty(self.view, "ui")
-        return true
     end
 
     -- BTN_TOOL_PEN released
@@ -1603,42 +1302,31 @@ function Pencil:onKeyRelease(key)
 
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
-    -- Side button released
-    if key_str:match("Highlighter") or key_str:match("Stylus") then
-        logger.dbg("Pencil: Stylus button release detected:", key_str)
+    -- Highlighter role released
+    if role == TOOL_HIGHLIGHTER then
+        logger.dbg("Pencil: highlighter input release detected:", key_str)
         return self:onStylusButtonRelease()
     end
     return false
 end
 
--- Undo last stroke
-function Pencil:undoLastStroke()
-    if #self.undo_stack == 0 then return end
+function Pencil:afterHistoryChange()
+    self.store:rebuildPageIndex()
+    -- Group rebuild and save are slow; run them once the pen rests.
+    self.groups_stale = true
+    self:scheduleDeferredWork()
+    self:repaintReader()
+end
 
-    local last_action = table.remove(self.undo_stack)
-    if last_action.type == "add" then
-        -- Remove the stroke that was added
-        local stroke_idx = last_action.stroke_idx
-        if stroke_idx and self.strokes[stroke_idx] then
-            table.remove(self.strokes, stroke_idx)
-            self:rebuildPageIndex()
-            self:rebuildAnnotationGroups()
-            self:flushDirtyGroups()
-            self:refreshDogear()
-            self:saveStrokes()
-            UIManager:setDirty(self.view, "ui")
-        end
-    elseif last_action.type == "delete" then
-        -- Restore deleted strokes
-        for _, stroke in ipairs(last_action.strokes) do
-            table.insert(self.strokes, stroke)
-        end
-        self:rebuildPageIndex()
-        self:rebuildAnnotationGroups()
-        self:flushDirtyGroups()
-        self:refreshDogear()
-        self:saveStrokes()
-        UIManager:setDirty(self.view, "ui")
+function Pencil:undoLastStroke()
+    if self.store:undo(self.stroke_translate) then
+        self:afterHistoryChange()
+    end
+end
+
+function Pencil:redoLastStroke()
+    if self.store:redo(self.stroke_translate) then
+        self:afterHistoryChange()
     end
 end
 
@@ -1647,8 +1335,8 @@ function Pencil:setupPenInput()
 
     logger.dbg("Pencil: setting up touch zones")
 
-    -- Setup stylus callback for lowest latency pen capture
-    self:setupStylusCallback()
+   -- Setup stylus callback for lowest latency pen capture
+    PencilInput.setupStylusCallback(self)
     -- Register touch zones through the UI so they're in the active gesture hierarchy
     -- We need to override ALL gestures that might interfere with drawing
     self.ui:registerTouchZones({
@@ -1721,7 +1409,6 @@ function Pencil:setupPenInput()
         },
         {
             id = "pencil_draw_pan_release",
-            ges = "pan_release",
             screen_zone = {
                 ratio_x = 0, ratio_y = 0,
                 ratio_w = 1, ratio_h = 1,
@@ -1731,8 +1418,8 @@ function Pencil:setupPenInput()
                 "rolling_pan_release",
                 "readerhighlight_pan_release",
             },
-            handler = function(ges)
-                return self:onDrawPanRelease(ges)
+            handler = function()
+                return self:onDrawPanRelease()
             end,
         },
         {
@@ -1747,8 +1434,8 @@ function Pencil:setupPenInput()
                 "rolling_swipe",
                 "readerhighlight_swipe",
             },
-            handler = function(ges)
-                return self:onDrawSwipe(ges)
+            handler = function()
+                return self:onDrawSwipe()
             end,
         },
     })
@@ -1773,14 +1460,14 @@ function Pencil:teardownPenInput()
 end
 
 -- Handle swipe gestures (block them when drawing mode is active)
-function Pencil:onDrawSwipe(ges)
+function Pencil:onDrawSwipe()
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
     -- If raw input detected pen, block swipe to prevent page turns
     if self.pen_down then return true end
 
     -- Fallback: check pen input via gesture system's slot data
-    local is_pen, _ = self:isPenInput(ges)
+    local is_pen, _ = self:isPenInput()
     if not is_pen then return false end
 
     -- Block the swipe - we don't want page turns while drawing
@@ -1791,14 +1478,19 @@ end
 function Pencil:onDrawHold(ges)
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
-    -- If raw input detected pen, block hold to prevent reader highlight mode
+    -- Annotation/badge interception has priority over ReaderHighlight.
+    if ges and ges.pos then
+        local group = self:findGroupBadgeAtPoint(ges.pos.x, ges.pos.y)
+            or self:findAnnotationGroupAtPoint(ges.pos.x, ges.pos.y)
+        if group then
+            self:showAnnotationHoldMenu(group)
+            return true
+        end
+    end
+
     if self.pen_down then return true end
-
-    -- Fallback: check pen input via gesture system's slot data
-    local is_pen, _ = self:isPenInput(ges)
+    local is_pen = select(1, self:isPenInput())
     if not is_pen then return false end
-
-    -- Block pen hold gestures while drawing mode is active
     return true
 end
 
@@ -1807,10 +1499,10 @@ end
 -- small antialiasing pad. The delayed refresh then only updates this region.
 function Pencil:accumulateRefreshBbox(stroke)
     if not stroke then return end
-    local bbox = PencilGeometry.computeStrokeBbox(stroke)
-    if not bbox then return end
+    local source_bbox = stroke.bbox or PencilGeometry.computeStrokeBbox(stroke)
+    if not source_bbox then return end
     local margin = math.floor((stroke.width or 0) / 2) + 4
-    bbox = PencilGeometry.bboxExpand(bbox, margin)
+    local bbox = PencilGeometry.bboxExpand(source_bbox, margin)
     if self.pending_refresh_bbox then
         self.pending_refresh_bbox = PencilGeometry.bboxUnion(self.pending_refresh_bbox, bbox)
     else
@@ -1818,38 +1510,68 @@ function Pencil:accumulateRefreshBbox(stroke)
     end
 end
 
--- Schedule a delayed refresh after writing stops
+-- Schedule a delayed refresh after writing stops.
+-- Colored strokes are first displayed in black for low latency, then
+-- redrawn directly into Screen.bb with their saved color. Only the
+-- accumulated stroke bbox is sent through the color refresh waveform.
 function Pencil:scheduleDelayedRefresh()
-    -- Cancel any existing pending refresh
     self:cancelPendingRefresh()
 
-    -- Schedule new refresh. Store the closure itself (not scheduleIn's nil
-    -- return) so cancelPendingRefresh can actually unschedule it.
     local action
     action = function()
-        if self.pending_refresh == action then self.pending_refresh = nil end
-        local bbox = self.pending_refresh_bbox
-        self.pending_refresh_bbox = nil
-        if bbox then
-            -- Scope the fast refresh to the region the recent strokes touched,
-            -- so only that part of the panel updates. The strokes are already
-            -- in the framebuffer; this only pushes them to the e-ink panel.
-            bbox = PencilGeometry.bboxClampToScreen(bbox, Screen:getWidth(), Screen:getHeight())
-            local rw = bbox.x1 - bbox.x0
-            local rh = bbox.y1 - bbox.y0
-            if rw > 0 and rh > 0 then
-                local region = Geom:new{ x = bbox.x0, y = bbox.y0, w = rw, h = rh }
-                UIManager:setDirty(self.view, "fast", region)
-            else
-                UIManager:setDirty(self.view, "fast")
-            end
-        else
-            -- No tracked region (e.g. refresh scheduled without a finished
-            -- stroke) — fall back to a full-view fast refresh.
-            UIManager:setDirty(self.view, "fast")
+        if self.pending_refresh == action then
+            self.pending_refresh = nil
         end
-        logger.dbg("Pencil: delayed refresh triggered")
+
+        local bbox = self.pending_refresh_bbox
+        local color_strokes = self.pending_color_strokes
+
+        self.pending_refresh_bbox = nil
+        self.pending_color_strokes = {}
+
+        if not bbox then
+            logger.dbg("Pencil: delayed color refresh skipped: no bbox")
+            return
+        end
+
+        bbox = PencilGeometry.bboxClampToScreen(
+            bbox,
+            Screen:getWidth(),
+            Screen:getHeight()
+        )
+
+        local rx = math.floor(bbox.x0)
+        local ry = math.floor(bbox.y0)
+        local rw = math.ceil(bbox.x1 - bbox.x0)
+        local rh = math.ceil(bbox.y1 - bbox.y0)
+
+        if rw <= 0 or rh <= 0 then
+            logger.dbg("Pencil: delayed color refresh skipped: empty bbox")
+            return
+        end
+
+        -- Replace the temporary black pixels directly with the definitive
+        -- colored strokes. This avoids depending on setDirty/paintTo to
+        -- reconstruct pixels previously written directly into Screen.bb.
+        if color_strokes then
+            for _, stroke in ipairs(color_strokes) do
+                if stroke
+                        and stroke.page == self:getCurrentPage()
+                        and not stroke.embedded then
+                    self:renderStroke(Screen.bb, stroke)
+                end
+            end
+        end
+
+        -- Update only the area occupied by the recently finished strokes.
+        Screen:refreshUI(rx, ry, rw, rh)
+
+        logger.dbg(
+            "Pencil: delayed color refresh triggered for bbox",
+            rx, ry, rw, rh
+        )
     end
+
     self.pending_refresh = action
     UIManager:scheduleIn(self.refresh_delay_ms / 1000, action)
 end
@@ -1859,6 +1581,18 @@ function Pencil:cancelPendingRefresh()
     if self.pending_refresh then
         UIManager:unschedule(self.pending_refresh)
         self.pending_refresh = nil
+    end
+end
+
+-- Process strokes whose annotation grouping was intentionally kept out of PEN UP.
+function Pencil:flushPendingGroups()
+    local pending = self.pending_group_strokes
+    if not pending or #pending == 0 then return end
+    self.pending_group_strokes = {}
+    for _, stroke_idx in ipairs(pending) do
+        if self.store.strokes[stroke_idx] then
+            self:assignStrokeToGroup(stroke_idx)
+        end
     end
 end
 
@@ -1872,6 +1606,12 @@ function Pencil:scheduleDeferredWork()
     local action
     action = function()
         if self.pending_save == action then self.pending_save = nil end
+        if self.pen_down then
+            self:scheduleDeferredWork()
+            return
+        end
+        self:flushPendingGroups()
+        self:rebuildStaleGroups()
         self:flushDirtyGroups()
         -- New ink's bookmark is only added here, so fold the page corner now
         -- rather than on the next page turn.
@@ -1889,13 +1629,33 @@ function Pencil:cancelPendingSave()
     end
 end
 
+-- Rebuild annotation groups if a cheap in-place update (erase, undo/redo,
+-- lasso) left them stale. Rebuilding re-creates every group bookmark in the
+-- book, so it's batched here instead of run per action.
+function Pencil:rebuildStaleGroups()
+    if self.groups_stale then
+        self.groups_stale = false
+        self:rebuildAnnotationGroups()
+    end
+end
+
+-- Repaint the page with our strokes. ReaderView is not a window, so marking
+-- it dirty only refreshes the old pixels; ReaderUI (its dialog) is.
+function Pencil:repaintReader()
+    UIManager:setDirty(self.ui and (self.ui.dialog or self.ui) or self.view, "ui")
+end
+
 -- Run any pending deferred work immediately. Called before close, page change,
 -- or any path that must persist state synchronously.
 function Pencil:flushDeferredWork()
-    if not self.pending_save and not (self.dirty_groups and next(self.dirty_groups)) then
+    if not self.pending_save and not self.groups_stale
+            and not (self.pending_group_strokes and #self.pending_group_strokes > 0)
+            and not (self.dirty_groups and next(self.dirty_groups)) then
         return
     end
     self:cancelPendingSave()
+    self:flushPendingGroups()
+    self:rebuildStaleGroups()
     self:flushDirtyGroups()
     self:saveStrokes()
 end
@@ -1946,7 +1706,9 @@ end
 -- update the dogear, and save.
 function Pencil:commitErase(deleted)
     if not deleted or #deleted == 0 then return end
-    table.insert(self.undo_stack, { type = "delete", strokes = deleted })
+    self.store:pushUndo({ type = "delete", strokes = deleted })
+    -- Erasing defers the group rebuild; the bookmarks below need current groups.
+    self:rebuildStaleGroups()
     self:flushDirtyGroups()
     self:refreshDogear()
     self:saveStrokes()
@@ -1959,19 +1721,50 @@ function Pencil:resetColorPickerTracking()
     self.color_picker_start_time = nil
 end
 
+-- Whether holding the given tool (pen or highlighter) still opens a picker.
+-- The pen has two experimental pickers (color, width); the highlighter's
+-- picker (color and opacity) follows the color picker option.
+function Pencil:isPickerEnabledFor(tool)
+    if tool == TOOL_HIGHLIGHTER then
+        return self.experimental_color_picker or self.hold_menu
+    end
+    return self.hold_menu or self.experimental_color_picker or self.experimental_pen_width
+end
+
+-- Start timing a hold-still at (x, y) with `tool`. Does nothing (and so costs
+-- nothing) when that tool has no picker to show: skipping the 10Hz poll avoids
+-- an UIManager:scheduleIn closure allocation on every pen-down, real GC
+-- pressure on the A53 during multi-second strokes.
+function Pencil:beginPickerTracking(x, y, tool)
+    if not self:isPickerEnabledFor(tool) then return end
+    self.color_picker_tool = tool
+    self.color_picker_start_x = x
+    self.color_picker_start_y = y
+    self.color_picker_start_time = time.now()
+    self:scheduleColorPickerCheck()
+end
+
+-- The pen moved: if it left the hold-still tolerance, forget the hold.
+function Pencil:movePickerTracking(x, y)
+    if self.color_picker_start_x and self.color_picker_start_y then
+        local dx = math.abs(x - self.color_picker_start_x)
+        local dy = math.abs(y - self.color_picker_start_y)
+        if dx > COLOR_PICKER_TOLERANCE_PIXELS or dy > COLOR_PICKER_TOLERANCE_PIXELS then
+            self:resetColorPickerTracking()
+        end
+    end
+end
+
 -- Check if color picker should be shown (called periodically while pen is down)
 function Pencil:checkColorPickerTrigger()
-    -- Gated behind the two experimental flags. At least one must be on for
-    -- the hold-pen-still gesture to produce anything; otherwise the pen
-    -- stays on its last-saved color/width.
-    if not (self.experimental_color_picker or self.experimental_pen_width) then return end
+    local tool = self.color_picker_tool or TOOL_PEN
+    if not self:isPickerEnabledFor(tool) then return end
     if not self.color_picker_start_time then return end
     if self.color_picker_showing then return end
 
     local elapsed_ms = time.to_ms(time.now() - self.color_picker_start_time)
     if elapsed_ms >= COLOR_PICKER_DELAY_MS then
-        -- Time elapsed without moving too far - show color picker
-        self:showColorPicker(self.pen_x, self.pen_y)
+        self:showColorPicker(self.pen_x, self.pen_y, tool)
         self:resetColorPickerTracking()
     end
 end
@@ -1993,7 +1786,6 @@ function Pencil:scheduleColorPickerCheck()
         end
         if plugin.pen_down and plugin.color_picker_start_time and not plugin.color_picker_showing then
             plugin:checkColorPickerTrigger()
-            -- Schedule next check if still waiting
             if plugin.color_picker_start_time then
                 plugin:scheduleColorPickerCheck()
             end
@@ -2017,507 +1809,56 @@ end
 -- widths below. The width row contains black bars whose vertical thickness
 -- matches the actual stroke thickness in device pixels (what-you-see is
 -- what-you-draw).
-local ColorPickerWidget = InputContainer:extend {
-    width = nil,
-    height = nil,
-    colors = nil, -- Array of {color, name} objects
-    widths = nil, -- Optional array of {name, width} objects (experimental width picker)
-    current_color_name = nil, -- Currently selected color name (for comparison)
-    current_width = nil, -- Currently selected pen width (for width selection indicator)
-    callback = nil,
-    close_callback = nil,
-    -- Layout constants cached after init so handlePenTap / paintTo don't
-    -- recompute them. Kept on self so tests can read them too.
-    _button_size = nil,
-    _spacing = nil,
-    _row_gap = nil,
-    _padding = nil,
-}
-
--- Build one button (color or width). Returns the InputContainer button, which
--- also stores its own color / width metadata so the callback can route without
--- string-matching on name.
-function ColorPickerWidget:_makeButton(item, button_size, selection_border)
-    -- Selection: colors compare by name, widths compare by width value
-    local is_selected
-    if item.kind == "width" then
-        is_selected = (item.width_value == self.current_width)
-    else
-        is_selected = (item.name == self.current_color_name)
-    end
-    local border_size = is_selected and selection_border or Size.border.thick
-
-    local swatch
-    if item.kind == "width" then
-        -- Truthful preview: a horizontal black bar whose height equals the
-        -- stroke's actual device-pixel thickness. We deliberately do NOT
-        -- scale by Screen:scaleBySize — the stroke itself is drawn in raw
-        -- pixels (see paintRectRGB32 in drawLineSegment), so scaling here
-        -- would lie about the line weight.
-        local inner = button_size - border_size * 2
-        local bar_h = item.width_value
-        local bar_w = math.floor(inner * 0.7)
-        local bar = FrameContainer:new{
-            width = bar_w,
-            height = bar_h,
-            padding = 0,
-            margin = 0,
-            bordersize = 0,
-            background = Blitbuffer.COLOR_BLACK,
-            WidgetContainer:new{
-                dimen = Geom:new{ w = bar_w, h = bar_h },
-            },
-        }
-        swatch = FrameContainer:new{
-            width = button_size,
-            height = button_size,
-            padding = 0,
-            margin = 0,
-            bordersize = border_size,
-            color = Blitbuffer.COLOR_BLACK,
-            background = Blitbuffer.COLOR_WHITE,
-            CenterContainer:new{
-                dimen = Geom:new{ w = inner, h = inner },
-                bar,
-            },
-        }
-    else
-        -- Regular color swatch
-        local border_color = Blitbuffer.COLOR_BLACK
-        if item.name == "Black" then
-            border_color = Blitbuffer.Color8(0x44)
-        end
-        swatch = FrameContainer:new{
-            width = button_size,
-            height = button_size,
-            padding = 0,
-            margin = 0,
-            bordersize = border_size,
-            color = border_color,
-            background = item.color_value,
-            WidgetContainer:new{
-                dimen = Geom:new{ w = button_size - border_size * 2, h = button_size - border_size * 2 },
-            },
-        }
-        if Screen.night_mode and item.name ~= "Black" and item.name ~= "Gray" then
-            swatch.background = swatch.background:invert()
-        end
-    end
-
-    local button = InputContainer:new{
-        dimen = Geom:new{ w = button_size, h = button_size },
-        swatch,
-        kind = item.kind,
-        color_value = item.color_value,  -- nil for width items
-        color_name = item.name,
-        width_value = item.width_value,  -- nil for color items
-    }
-
-    button.ges_events = {
-        TapSelectColor = {
-            GestureRange:new{
-                ges = "tap",
-                range = function() return button.dimen end,
-            },
-        },
-    }
-
-    local widget = self
-    button.onTapSelectColor = function(btn)
-        if widget.callback then
-            widget.callback(btn.color_value, btn.color_name, btn.width_value)
-        end
-        if widget.close_callback then
-            widget.close_callback()
-        end
-        return true
-    end
-
-    return button
-end
-
--- Build a HorizontalGroup row of buttons from an item list. Populates the
--- supplied `info_list` in-tap-index order.
-function ColorPickerWidget:_buildRow(items, button_size, spacing, selection_border, info_list)
-    local group = HorizontalGroup:new{ align = "center" }
-    for i, item in ipairs(items) do
-        if i > 1 then
-            table.insert(group, HorizontalSpan:new{ width = spacing })
-        end
-        local button = self:_makeButton(item, button_size, selection_border)
-        table.insert(group, button)
-        table.insert(info_list, button)
-    end
-    return group
-end
-
-function ColorPickerWidget:init()
-    local button_size = Screen:scaleBySize(36)
-    local spacing = Screen:scaleBySize(8)
-    local row_gap = Screen:scaleBySize(8)  -- vertical gap between color row and width row
-    local padding = Screen:scaleBySize(10)
-    local selection_border = Size.border.thick * 3
-
-    self._button_size = button_size
-    self._spacing = spacing
-    self._row_gap = row_gap
-    self._padding = padding
-
-    -- Build optional color row. `colors` is nil when the color-picker
-    -- experimental flag is off; in that case we render a widths-only picker.
-    local has_colors = self.colors and #self.colors > 0
-    self.color_buttons_info = {}
-    local color_row_group
-    local colors_row_width = 0
-    if has_colors then
-        local color_items = {}
-        for _, color_info in ipairs(self.colors) do
-            table.insert(color_items, {
-                kind = "color",
-                name = color_info.name,
-                color_value = color_info.color,
-            })
-        end
-        color_row_group = self:_buildRow(color_items, button_size, spacing, selection_border, self.color_buttons_info)
-        colors_row_width = #color_items * button_size + (#color_items - 1) * spacing
-    end
-
-    -- Build optional width row
-    local has_widths = self.widths and #self.widths > 0
-    self.width_buttons_info = {}
-    local width_row_group
-    local widths_row_width = 0
-    if has_widths then
-        local width_items = {}
-        for _, width_info in ipairs(self.widths) do
-            table.insert(width_items, {
-                kind = "width",
-                name = width_info.name,
-                width_value = width_info.width,
-            })
-        end
-        width_row_group = self:_buildRow(width_items, button_size, spacing, selection_border, self.width_buttons_info)
-        widths_row_width = #width_items * button_size + (#width_items - 1) * spacing
-    end
-
-    -- Inner width accommodates the wider of the visible rows. Height
-    -- accumulates one button_size per visible row plus a gap when both
-    -- are showing.
-    local visible_rows = (has_colors and 1 or 0) + (has_widths and 1 or 0)
-    local inner_w = math.max(colors_row_width, widths_row_width)
-    self.width = inner_w
-    self.height = visible_rows * button_size + (visible_rows > 1 and row_gap or 0)
-
-    local content
-    if has_colors and has_widths then
-        content = VerticalGroup:new{
-            align = "center",
-            CenterContainer:new{
-                dimen = Geom:new{ w = inner_w, h = button_size },
-                color_row_group,
-            },
-            VerticalSpan:new{ width = row_gap },
-            CenterContainer:new{
-                dimen = Geom:new{ w = inner_w, h = button_size },
-                width_row_group,
-            },
-        }
-    elseif has_colors then
-        content = CenterContainer:new{
-            dimen = Geom:new{ w = inner_w, h = button_size },
-            color_row_group,
-        }
-    else
-        -- widths-only picker (color picker experimental flag off)
-        content = CenterContainer:new{
-            dimen = Geom:new{ w = inner_w, h = button_size },
-            width_row_group,
-        }
-    end
-
-    self.frame = FrameContainer:new{
-        background = Blitbuffer.COLOR_WHITE,
-        bordersize = Size.border.window,
-        padding = padding,
-        content,
-    }
-
-    self[1] = self.frame
-    self.dimen = self.frame:getSize()
-
-    -- Register gesture to close when tapping outside
-    self.ges_events = {
-        TapCloseOutside = {
-            GestureRange:new{
-                ges = "tap",
-                range = function() return Geom:new{
-                    x = 0, y = 0,
-                    w = Screen:getWidth(),
-                    h = Screen:getHeight(),
-                } end,
-            },
-        },
-    }
-end
-
--- Hit-test one row of buttons. `row_y` is the top y of the row in absolute
--- coordinates. Returns the matching button info or nil.
-function ColorPickerWidget:_hitRow(x, y, row_y, info_list)
-    local button_size = self._button_size
-    local spacing = self._spacing
-    if #info_list == 0 then return nil end
-    if y < row_y or y >= row_y + button_size then return nil end
-
-    local row_buttons_width = #info_list * button_size + (#info_list - 1) * spacing
-    local row_start_x = self.dimen.x + (self.dimen.w - row_buttons_width) / 2
-    local relative_x = x - row_start_x
-    if relative_x < 0 or relative_x >= row_buttons_width then return nil end
-
-    local stride = button_size + spacing
-    local idx = math.floor(relative_x / stride) + 1
-    local pos_in_slot = relative_x - (idx - 1) * stride
-    if pos_in_slot >= button_size then return nil end
-    if idx < 1 or idx > #info_list then return nil end
-    return info_list[idx]
-end
-
--- Handle pen/stylus tap on color picker
--- Returns true if the tap was handled (hit a button or was inside picker)
-function ColorPickerWidget:handlePenTap(x, y)
-    if not self.dimen then
-        return false
-    end
-
-    -- Check if tap is inside the widget
-    local inside = x >= self.dimen.x and x < self.dimen.x + self.dimen.w
-            and y >= self.dimen.y and y < self.dimen.y + self.dimen.h
-
-    if not inside then
-        -- Tap outside - close the picker
-        if self.close_callback then
-            self.close_callback()
-        end
-        return true  -- Consume the event to prevent drawing
-    end
-
-    local border = Size.border.window
-    local button_size = self._button_size
-    local row_gap = self._row_gap
-    local padding = self._padding
-
-    -- When colors are hidden (color-picker flag off, width-picker on),
-    -- the widths row slides up to the top-row position. The info-lists
-    -- drive which row is where.
-    local top_row_y = self.dimen.y + border + padding
-    local colors_present = #self.color_buttons_info > 0
-    local widths_row_y = colors_present and (top_row_y + button_size + row_gap) or top_row_y
-
-    local btn = self:_hitRow(x, y, top_row_y, self.color_buttons_info)
-        or self:_hitRow(x, y, widths_row_y, self.width_buttons_info)
-
-    if btn then
-        if self.callback then
-            self.callback(btn.color_value, btn.color_name, btn.width_value)
-        end
-        if self.close_callback then
-            self.close_callback()
-        end
-        return true
-    end
-
-    -- Inside picker but didn't hit a button - still consume the event
-    return true
-end
-
--- Handle tap - close if outside the widget
-function ColorPickerWidget:onTapCloseOutside(_, ges)
-    if ges and ges.pos and self.dimen then
-        -- Check if tap is inside the widget using coordinate comparison
-        local x, y = ges.pos.x, ges.pos.y
-        local inside = x >= self.dimen.x and x < self.dimen.x + self.dimen.w
-                and y >= self.dimen.y and y < self.dimen.y + self.dimen.h
-        if inside then
-            -- Tap is inside, let the color buttons handle it
-            return false
-        end
-    end
-    -- Tap is outside, close the widget without changing color
-    if self.close_callback then
-        self.close_callback()
-    end
-    return true
-end
-
--- Update button dimens for one row so individual TapSelectColor gesture ranges
--- match the painted positions. Mirrors the centered layout built in init().
-function ColorPickerWidget:_placeRow(info_list, paint_x, frame_inner_width, padding, border, row_y)
-    if #info_list == 0 then return end
-    local button_size = self._button_size
-    local spacing = self._spacing
-    local total_buttons_width = #info_list * button_size + (#info_list - 1) * spacing
-    local row_start_x = paint_x + border + padding + (frame_inner_width - total_buttons_width) / 2
-    for i, btn in ipairs(info_list) do
-        btn.dimen.x = row_start_x + (i - 1) * (button_size + spacing)
-        btn.dimen.y = row_y
+function Pencil:runHoldMenuAction(action, x, y)
+    if action == "undo" then
+        self:undoLastStroke()
+    elseif action == "redo" then
+        self:redoLastStroke()
+    elseif action == "lasso" then
+        self.lasso_feature:start()
+    elseif action == "note" then
+        self.notes_feature:openAt(x, y)
     end
 end
 
-function ColorPickerWidget:paintTo(bb, x, y)
-    -- Use absolute position from dimen if set, otherwise use passed coordinates
-    local paint_x = self.dimen and self.dimen.x or x
-    local paint_y = self.dimen and self.dimen.y or y
+-- Lasso selection is owned by self.lasso_feature (lib/pencillasso.lua).
 
-    -- Paint the frame at the absolute position
-    self.frame:paintTo(bb, paint_x, paint_y)
-
-    if not self.color_buttons_info then return end
-
-    local button_size = self._button_size
-    local row_gap = self._row_gap
-    local padding = self._padding
-    local border = Size.border.window
-    local frame_inner_width = self.dimen.w - 2 * padding - 2 * border
-
-    -- Symmetric with handlePenTap: widths slide up to the top slot when
-    -- no colors are visible.
-    local top_row_y = paint_y + border + padding
-    local colors_present = #self.color_buttons_info > 0
-
-    if colors_present then
-        self:_placeRow(self.color_buttons_info, paint_x, frame_inner_width, padding, border, top_row_y)
-    end
-
-    if self.width_buttons_info and #self.width_buttons_info > 0 then
-        local widths_row_y = colors_present and (top_row_y + button_size + row_gap) or top_row_y
-        self:_placeRow(self.width_buttons_info, paint_x, frame_inner_width, padding, border, widths_row_y)
-    end
+-- Shift strokes by (dx, dy) screen pixels; sign = -1 reverses a move.
+-- Page-anchored strokes move in page space by pdeltas[i] (computed from the
+-- view zoom on the first move and reused for undo/redo). Returns pdeltas.
+function Pencil:translateStrokes(strokes, dx, dy, pdeltas, sign)
+    return PencilStrokes.translate(strokes, dx, dy, pdeltas, sign, self.stroke_view)
 end
 
-function ColorPickerWidget:onCloseWidget()
-    UIManager:setDirty(nil, "ui", self.dimen)
+-- Notes are owned by self.notes_feature (lib/pencilnotes.lua).
+
+-- Highlighter colors offered to the user: all but Black, which would hide the text.
+function Pencil:getHighlighterColors()
+    local colors = {}
+    for _, color_info in ipairs(self.available_colors) do
+        if color_info.name ~= "Black" then
+            table.insert(colors, color_info)
+        end
+    end
+    return colors
 end
 
--- Show color picker popup near the pen position
-function Pencil:showColorPicker(x, y)
-    if self.color_picker_showing then return end
+function Pencil:setHighlighterColor(color, color_name)
+    self.tool:setHighlighterColor(color_name, color)
+    logger.info("Pencil: setHighlighterColor - color_name =", color_name)
+    self:saveSettings()
+end
 
-    -- Discard any current stroke that was made while holding still
-    -- The user was holding still to trigger color picker, not intentionally drawing
-    if self.current_stroke then
-        self.current_stroke = nil
-        -- Repaint to remove the stroke from screen immediately
-        self.view:paintTo(Screen.bb, 0, 0)
-        self:paintTo(Screen.bb, 0, 0)
-        Screen:refreshUI(0, 0, Screen:getWidth(), Screen:getHeight())
+function Pencil:setHighlighterOpacity(percent)
+    if self.tool:setHighlighterOpacity(percent) then
+        logger.info("Pencil: setHighlighterOpacity -", percent)
+        self:saveSettings()
     end
-
-    self.color_picker_showing = true
-
-    local plugin = self
-
-    -- Which rows to render is driven by the two experimental toggles,
-    -- independently. The hold-pen-still gesture only gets here when at
-    -- least one of them is on (see checkColorPickerTrigger), so at least
-    -- one row is guaranteed non-empty.
-    local show_colors = self.experimental_color_picker
-    local show_widths = self.experimental_pen_width
-    local colors_for_picker = show_colors and self.available_colors or nil
-    local widths_for_picker = show_widths and self.available_widths or nil
-
-    -- Picker uses up to two rows (colors on top, widths below). Row width
-    -- is the wider of the two visible rows; height accumulates one
-    -- button_size per visible row plus a gap between them.
-    local button_size = Screen:scaleBySize(36)
-    local spacing = Screen:scaleBySize(8)
-    local row_gap = Screen:scaleBySize(8)
-    local padding = Screen:scaleBySize(10)
-    local border = Size.border.window
-    local colors_row_width = show_colors and
-        (#self.available_colors * button_size + (#self.available_colors - 1) * spacing) or 0
-    local widths_row_width = show_widths and
-        (#self.available_widths * button_size + (#self.available_widths - 1) * spacing) or 0
-    local buttons_width = math.max(colors_row_width, widths_row_width)
-    local picker_width = buttons_width + padding * 2 + border * 2
-    local rows = (show_colors and 1 or 0) + (show_widths and 1 or 0)
-    local picker_height = rows * button_size + padding * 2 + border * 2
-    if rows > 1 then
-        picker_height = picker_height + row_gap
-    end
-    local margin_above = Screen:scaleBySize(30)  -- Gap between picker and pen
-    local screen_margin = 10  -- Minimum margin from screen edges
-
-    -- Try to position above the pen first, centered horizontally
-    local picker_x = x - picker_width / 2
-    local picker_y = y - picker_height - margin_above
-
-    -- Adjust horizontal position to keep picker fully on screen
-    if picker_x < screen_margin then
-        picker_x = screen_margin
-    end
-    if picker_x + picker_width > Screen:getWidth() - screen_margin then
-        picker_x = Screen:getWidth() - picker_width - screen_margin
-    end
-
-    -- If no room above, position below the pen
-    if picker_y < screen_margin then
-        picker_y = y + margin_above
-    end
-
-    -- Final check: ensure it fits on screen vertically
-    if picker_y + picker_height > Screen:getHeight() - screen_margin then
-        picker_y = Screen:getHeight() - picker_height - screen_margin
-    end
-
-    local color_picker = ColorPickerWidget:new{
-        colors = colors_for_picker,
-        widths = widths_for_picker,
-        current_color_name = self.tool_settings[TOOL_PEN].color_name,
-        current_width = self.tool_settings[TOOL_PEN].width,
-        callback = function(color_value, color_name, width_value)
-            -- Width taps are routed through width_value; color taps leave it nil.
-            -- This avoids the string-match ambiguity the earlier prototype had.
-            if width_value then
-                plugin:setPenWidth(width_value)
-                plugin:showToast(T(_("Pen width: %1"), width_value))
-                return
-            end
-
-            plugin:setPenColor(color_value, color_name)
-
-            -- Display white as the color name if black is picked in night mode
-            if Screen.night_mode and color_name == "Black" then
-                color_name = "White"
-            end
-
-            plugin:showToast(T(_("Pen color: %1"), color_name))
-        end,
-        close_callback = function()
-            plugin.color_picker_showing = false
-            UIManager:close(plugin.color_picker_widget)
-            plugin.color_picker_widget = nil
-            -- Refresh to clean up
-            UIManager:setDirty(plugin.view, "ui")
-        end,
-    }
-
-    -- Position the widget at the calculated coordinates
-    -- Set dimen with absolute position before showing
-    color_picker.dimen = color_picker.dimen or Geom:new{}
-    color_picker.dimen.x = picker_x
-    color_picker.dimen.y = picker_y
-
-    self.color_picker_widget = color_picker
-
-    UIManager:show(self.color_picker_widget)
-    UIManager:setDirty(self.color_picker_widget, "ui")
-
-    logger.dbg("Pencil: color picker shown at", picker_x, picker_y)
 end
 
 -- Set pen color
 function Pencil:setPenColor(color, color_name)
-    self.tool_settings[TOOL_PEN].color = color
-    self.tool_settings[TOOL_PEN].color_name = color_name
+    self.tool:setColor(color_name, color)
     logger.info("Pencil: setPenColor - color_name =", color_name)
     self:saveSettings()
 end
@@ -2525,7 +1866,7 @@ end
 -- Set pen width. Only callable while experimental_pen_width is on
 -- (the picker is the only UI path that invokes this).
 function Pencil:setPenWidth(width)
-    self.tool_settings[TOOL_PEN].width = width
+    self.tool:setWidth(width)
     logger.info("Pencil: setPenWidth - width =", width)
     self:saveSettings()
 end
@@ -2538,7 +1879,7 @@ function Pencil:onDrawTouch(ges)
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
     -- Check if this is a finger touch (not pen) - let gesture system handle it
-    local is_pen, _ = self:isPenInput(ges)
+    local is_pen, is_eraser_end, is_highlighter = self:isPenInput()
     if not is_pen then
         return false
     end
@@ -2551,14 +1892,12 @@ function Pencil:onDrawTouch(ges)
         return true
     end
 
-    -- Fallback: check pen input via gesture system's slot data
-    local is_pen, is_eraser_end, is_highlighter = self:isPenInput(ges)
-    if not is_pen then return false end
-
     -- Cancel any pending refresh - user is still writing
     self:cancelPendingRefresh()
 
-    local effective_tool = self:getEffectiveTool(is_eraser_end, is_highlighter)
+    local effective_tool = self.tool:getEffectiveTool(is_eraser_end, is_highlighter, self.side_button_down)
+
+    self:noteHighlighterUse(effective_tool)
 
     -- For eraser, we handle in pan (need movement to erase)
     if effective_tool == TOOL_ERASER then
@@ -2568,13 +1907,8 @@ function Pencil:onDrawTouch(ges)
     -- Fallback: handle via gesture system if raw input not working
     local page = self:getCurrentPage()
 
-    -- If side button is held for highlighting
-    if self.side_button_down then
-        self.side_button_used_for_highlight = true
-    end
-
     -- Start new stroke immediately with first point
-    local tool_settings = self.tool_settings[effective_tool] or self.tool_settings[TOOL_PEN]
+    local tool_settings = self.tool:getToolSettings(effective_tool)
     self.current_stroke = {
         page = page,
         tool = effective_tool,
@@ -2591,15 +1925,25 @@ function Pencil:onDrawTouch(ges)
     -- Refresh only happens after user stops writing (delayed refresh)
     local width = tool_settings.width
     local color = tool_settings.color
-    local half_w = math.floor(width / 2)
-    Screen.bb:paintRectRGB32(ges.pos.x - half_w, ges.pos.y - half_w, width, width, color)
+
+    if self.live_black_preview
+        and effective_tool == TOOL_PEN
+        and self.tool:getSettings().color_name ~= "Black" then
+        color = Blitbuffer.COLOR_BLACK
+    end
+    if effective_tool == TOOL_HIGHLIGHTER then
+        self.live_highlighter = PencilStrokes.drawLiveHighlighter(self.live_highlighter, Screen.bb, self.current_stroke, ges.pos.x, ges.pos.y, ges.pos.x, ges.pos.y)
+    else
+        local half_w = math.floor(width / 2)
+        Screen.bb:paintRectRGB32(ges.pos.x - half_w, ges.pos.y - half_w, width, width, color)
+    end
 
     return true
 end
 
 -- Check if this is a stylus/pen event (not finger)
 -- Returns: is_pen (boolean), is_eraser_end (boolean), is_highlighter (boolean)
-function Pencil:isPenInput(ges)
+function Pencil:isPenInput()
     if Device:isEmulator() then
         return true, false, false
     end
@@ -2609,17 +1953,13 @@ function Pencil:isPenInput(ges)
         return false, false, false
     end
 
-    local TOOL_TYPE_PEN = 1
-    local TOOL_TYPE_ERASER = 2
-    local TOOL_TYPE_HIGHLIGHTER = 3
-
     local pen_slot_data = Input:getMtSlot(Input.pen_slot)
     if pen_slot_data and pen_slot_data.id and pen_slot_data.id ~= -1 then
-        if pen_slot_data.tool == TOOL_TYPE_PEN then
+        if pen_slot_data.tool == LINUX_TOOLTYPE.PEN then
             return true, false, false
-        elseif pen_slot_data.tool == TOOL_TYPE_ERASER then
+        elseif pen_slot_data.tool == LINUX_TOOLTYPE.ERASER then
             return true, true, false
-        elseif pen_slot_data.tool == TOOL_TYPE_HIGHLIGHTER then
+        elseif pen_slot_data.tool == LINUX_TOOLTYPE.HIGHLIGHTER then
             return true, false, true
         end
     end
@@ -2627,22 +1967,30 @@ function Pencil:isPenInput(ges)
     return false, false, false
 end
 
--- Get the effective tool (considers physical eraser end and side button)
-function Pencil:getEffectiveTool(is_eraser_end, is_highlighter)
-    -- Check both the tool type detection AND the BTN_TOOL_RUBBER state
-    if self.eraser_tool_active or ((self.swap_eraser_and_highlighter and is_highlighter) or (not self.swap_eraser_and_highlighter and is_eraser_end)) then
-        return TOOL_ERASER
+-- Find the topmost visible pencil annotation group at a screen position.
+-- Stale-rotation groups are excluded because their saved bbox is not valid in
+-- the current layout; those remain accessible through their rotation badge.
+function Pencil:findAnnotationGroupAtPoint(x, y)
+    local page = self:getCurrentPage()
+    local rotation = Screen:getRotationMode()
+    local groups = self.annotation_groups or {}
+    for i = #groups, 1, -1 do
+        local group = groups[i]
+        local bbox = group.bbox
+        local same_rotation = group.image_rotation == nil
+            or group.image_rotation == rotation
+        if bbox and same_rotation and self:getGroupCurrentPage(group) == page
+                and x >= bbox.x0 - ANNOTATION_HOLD_HIT_PAD
+                and x <= bbox.x1 + ANNOTATION_HOLD_HIT_PAD
+                and y >= bbox.y0 - ANNOTATION_HOLD_HIT_PAD
+                and y <= bbox.y1 + ANNOTATION_HOLD_HIT_PAD then
+            return group
+        end
     end
-
-    -- Side button held = highlighter mode (for hold+drag highlighting)
-    if self.side_button_down or ((self.swap_eraser_and_highlighter and is_eraser_end) or (not self.swap_eraser_and_highlighter and is_highlighter)) then
-        return TOOL_HIGHLIGHTER
-    end
-
-    return self.current_tool
+    return nil
 end
 
--- Called on tap - create a dot or erase at point
+-- Show annotation actions after a priority long press.
 function Pencil:onDrawTap(ges)
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
@@ -2666,19 +2014,20 @@ function Pencil:onDrawTap(ges)
     end
 
     -- Check if finger tap - let gesture system handle it
-    local is_pen, is_eraser_end, is_highlighter = self:isPenInput(ges)
+    local is_pen, is_eraser_end, is_highlighter = self:isPenInput()
     if not is_pen then
         return false
     end
 
     local page = self:getCurrentPage()
-    local effective_tool = self:getEffectiveTool(is_eraser_end, is_highlighter)
+    local effective_tool = self.tool:getEffectiveTool(is_eraser_end, is_highlighter, self.side_button_down)
+    self:noteHighlighterUse(effective_tool)
     logger.dbg("Pencil: onDrawTap - effective_tool =", effective_tool)
 
     -- Log to debug file for analysis
     self:writeDebugLog(string.format("=== TAP at (%d, %d) ===", ges.pos.x, ges.pos.y))
     self:writeDebugLog(string.format("  is_eraser_end=%s eraser_tool_active=%s effective_tool=%s",
-        tostring(is_eraser_end), tostring(self.eraser_tool_active), effective_tool))
+        tostring(is_eraser_end), tostring(self.tool.eraser_tool_active), effective_tool))
 
     if effective_tool == TOOL_ERASER then
         -- Eraser: delete strokes near tap point
@@ -2686,7 +2035,7 @@ function Pencil:onDrawTap(ges)
         local erased = self:eraseAtPoint(ges.pos.x, ges.pos.y, page)
         if erased then
             logger.info("Pencil: erased", #erased, "strokes")
-            table.insert(self.undo_stack, { type = "delete", strokes = erased })
+            self.store:pushUndo({ type = "delete", strokes = erased })
             self:saveStrokes()
             UIManager:setDirty(self.view, "ui")
         else
@@ -2696,23 +2045,16 @@ function Pencil:onDrawTap(ges)
     end
 
     -- Pen or Highlighter: create a dot
-    local tool_settings = self.tool_settings[effective_tool] or self.tool_settings[TOOL_PEN]
-    local stroke = {
-        page = page,
-        tool = effective_tool,
-        points = { { x = ges.pos.x, y = ges.pos.y } },
-        width = tool_settings.width,
-        color = tool_settings.color,
-        alpha = tool_settings.alpha,
-        datetime = os.time(),
-    }
+    local tool_settings = self.tool:getToolSettings(effective_tool)
+    local stroke = PencilStrokes.newStroke(page, effective_tool, tool_settings,
+        { { x = ges.pos.x, y = ges.pos.y } })
 
-    table.insert(self.strokes, stroke)
-    self:indexStroke(#self.strokes, page)
+    self:anchorStrokeToPage(stroke)
+    local stroke_idx = self.store:add(stroke)
     self:saveStrokes()
 
     -- Add to undo stack
-    table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
+    self.store:pushUndo({ type = "add", stroke_idx = stroke_idx })
 
     -- Draw directly to screen buffer
     self:renderStroke(Screen.bb, stroke)
@@ -2737,16 +2079,12 @@ function Pencil:onDrawPan(ges)
     end
 
     -- Fallback: check pen input via gesture system's slot data
-    local is_pen, is_eraser_end, is_highlighter = self:isPenInput(ges)
+    local is_pen, is_eraser_end, is_highlighter = self:isPenInput()
     if not is_pen then return false end
 
     local page = self:getCurrentPage()
-    local effective_tool = self:getEffectiveTool(is_eraser_end, is_highlighter)
-
-    -- If side button is held and we're drawing, mark it as used for highlighting
-    if self.side_button_down and effective_tool == TOOL_HIGHLIGHTER then
-        self.side_button_used_for_highlight = true
-    end
+    local effective_tool = self.tool:getEffectiveTool(is_eraser_end, is_highlighter, self.side_button_down)
+    self:noteHighlighterUse(effective_tool)
 
     -- Eraser mode: erase along path (raw input doesn't handle eraser)
     if effective_tool == TOOL_ERASER then
@@ -2771,7 +2109,7 @@ function Pencil:onDrawPan(ges)
     end
 
     -- Fallback: handle via gesture system if raw input not working
-    local tool_settings = self.tool_settings[effective_tool] or self.tool_settings[TOOL_PEN]
+    local tool_settings = self.tool:getToolSettings(effective_tool)
 
     -- Stroke should already exist from onDrawTouch, but handle fallback cases
     if not self.current_stroke or self.current_stroke.page ~= page or self.current_stroke.tool ~= effective_tool then
@@ -2808,14 +2146,18 @@ function Pencil:onDrawPan(ges)
         local p2 = self.current_stroke.points[n]
 
         if effective_tool == TOOL_HIGHLIGHTER then
-            self:drawHighlighterSegment(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
+            self.live_highlighter = PencilStrokes.drawLiveHighlighter(self.live_highlighter, Screen.bb, self.current_stroke, p1.x, p1.y, p2.x, p2.y)
         else
-            self:drawLineSegment(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
+            PencilStrokes.drawThickLine(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
         end
     elseif n == 1 then
         local p = self.current_stroke.points[1]
-        local half_w = math.floor(width / 2)
-        Screen.bb:paintRectRGB32(p.x - half_w, p.y - half_w, width, width, color)
+        if effective_tool == TOOL_HIGHLIGHTER then
+            self.live_highlighter = PencilStrokes.drawLiveHighlighter(self.live_highlighter, Screen.bb, self.current_stroke, p.x, p.y, p.x, p.y)
+        else
+            local half_w = math.floor(width / 2)
+            Screen.bb:paintRectRGB32(p.x - half_w, p.y - half_w, width, width, color)
+        end
     end
 
     return true
@@ -2823,21 +2165,22 @@ end
 
 -- Called when pan ends - finalize stroke
 -- NOTE: For pen/highlighter, raw input hook may have already finalized the stroke
-function Pencil:onDrawPanRelease(ges)
+function Pencil:onDrawPanRelease()
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
     -- Let finger releases be handled by gesture system
-    local is_pen, is_eraser_end, is_highlighter = self:isPenInput(ges)
+    local is_pen, is_eraser_end, is_highlighter = self:isPenInput()
     if not is_pen then
         return false
     end
 
-    local effective_tool = self:getEffectiveTool(is_eraser_end, is_highlighter)
+    local effective_tool = self.tool:getEffectiveTool(is_eraser_end, is_highlighter, self.side_button_down)
+
+    self:noteHighlighterUse(effective_tool)
 
     -- Log pan end to debug file
-    self:writeDebugLog(string.format("=== PAN END at (%d, %d) ===", ges.pos.x, ges.pos.y))
     self:writeDebugLog(string.format("  is_eraser_end=%s eraser_tool_active=%s effective_tool=%s",
-        tostring(is_eraser_end), tostring(self.eraser_tool_active), effective_tool))
+        tostring(is_eraser_end), tostring(self.tool.eraser_tool_active), effective_tool))
 
     -- Handle eraser pan release (raw input doesn't handle eraser)
     if effective_tool == TOOL_ERASER then
@@ -2862,13 +2205,13 @@ function Pencil:onDrawPanRelease(ges)
     -- Fallback: finalize stroke via gesture system
     if #self.current_stroke.points >= 1 then
         -- Finalize the stroke
-        table.insert(self.strokes, self.current_stroke)
-        self:indexStroke(#self.strokes, self.current_stroke.page)
+        self:anchorStrokeToPage(self.current_stroke)
+        local stroke_idx = self.store:add(self.current_stroke)
         self:saveStrokes()
 
         -- Add to undo stack
-        table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
-        self:assignStrokeToGroup(#self.strokes)
+        self.store:pushUndo({ type = "add", stroke_idx = stroke_idx })
+        self:assignStrokeToGroup(stroke_idx)
 
         logger.dbg("Pencil: stroke completed with", #self.current_stroke.points, "points")
         self:accumulateRefreshBbox(self.current_stroke)
@@ -2884,6 +2227,72 @@ function Pencil:onDrawPanRelease(ges)
 end
 
 -- Get current page number (stable reference for both paged and rolling modes)
+-- PDF strokes are anchored to page coordinates so they follow zoom, pan,
+-- crop and rotation. On a paged view, screen = page * zoom + offset for
+-- each visible page; this returns zoom, offset_x, offset_y for `page`, or
+-- nil when the page isn't shown. Mirrors ReaderView:getSinglePageRect /
+-- getScrollPageRect without allocating per point.
+function Pencil:pageAffine(page)
+    local view = self.view
+    if not (self.ui and self.ui.paging and view and view.state) then return nil end
+    if view.page_scroll then
+        local acc_y = 0
+        local gap = view.page_gap and view.page_gap.height or 0
+        for _, st in ipairs(view.page_states or {}) do
+            if st.page == page then
+                return st.zoom, st.offset.x - st.visible_area.x,
+                       acc_y + st.offset.y - st.visible_area.y
+            end
+            acc_y = acc_y + st.visible_area.h + gap
+        end
+        return nil
+    end
+    if view.state.page ~= page or not view.visible_area then return nil end
+    return view.state.zoom, view.state.offset.x - view.visible_area.x,
+           view.state.offset.y - view.visible_area.y
+end
+
+-- Remember which page a new stroke starts on and that page's transform, so
+-- the stroke is anchored with the view it was drawn in even if it is saved
+-- after a page turn.
+function Pencil:captureStrokeAnchor(stroke, x, y)
+    local pos = self.view:screenToPageTransform({ x = x, y = y })
+    if not (pos and pos.page) then return end
+    local zoom, ox, oy = self:pageAffine(pos.page)
+    if not zoom or zoom == 0 then return end
+    stroke._anchor_page, stroke._anchor_zoom = pos.page, zoom
+    stroke._anchor_ox, stroke._anchor_oy = ox, oy
+end
+
+-- Give a finished PDF stroke page coordinates (page_points). No-op for
+-- reflowable documents.
+function Pencil:anchorStrokeToPage(stroke)
+    if not (self.ui and self.ui.paging) or stroke.page_points then return end
+    if not stroke._anchor_zoom and stroke.points and stroke.points[1] then
+        self:captureStrokeAnchor(stroke, stroke.points[1].x, stroke.points[1].y)
+    end
+    PencilStrokes.anchorToPage(stroke)
+end
+
+-- Bring a page-anchored stroke's screen points (stroke.points) in line with
+-- the current view. Cheap when the view hasn't changed.
+-- @return false if the stroke's page isn't visible
+function Pencil:syncStrokeToView(stroke)
+    if not stroke.page_points then return true end
+    return PencilStrokes.syncToView(stroke, self:pageAffine(stroke.page))
+end
+
+-- Pages whose strokes should be drawn / erased: every visible page in PDF
+-- continuous mode, otherwise just the current page.
+function Pencil:getVisiblePages()
+    local page = self:getCurrentPage()
+    if self.ui and self.ui.paging and self.view and self.view.page_scroll then
+        local list = self.view:getCurrentPageList()
+        if list and #list > 0 then return list, page end
+    end
+    return { page }, page
+end
+
 function Pencil:getCurrentPage()
     if self.ui.paging then
         return self.view.state.page
@@ -2896,14 +2305,6 @@ function Pencil:getCurrentPage()
         -- Fallback to XPointer if conversion not available
         return xp
     end
-end
-
--- Index a stroke by page for quick lookup
-function Pencil:indexStroke(stroke_idx, page)
-    if not self.page_strokes[page] then
-        self.page_strokes[page] = {}
-    end
-    table.insert(self.page_strokes[page], stroke_idx)
 end
 
 -- Get an XPointer for a screen-space position on the current rolling-mode
@@ -2991,14 +2392,14 @@ function Pencil:backfillGroupXPointers()
 end
 
 -- Assign a newly-added stroke to an annotation group (or create a new one).
--- Called after a stroke is finalized and inserted into self.strokes.
--- @param stroke_idx number  index of the stroke in self.strokes
+-- Called after a stroke is finalized and inserted into self.store.strokes.
+-- @param stroke_idx number  index of the stroke in self.store.strokes
 -- @param skip_bookmark boolean  if true, skip bookmark sync (used during bootstrap)
 function Pencil:assignStrokeToGroup(stroke_idx, skip_bookmark)
-    local stroke = self.strokes[stroke_idx]
+    local stroke = self.store.strokes[stroke_idx]
     if not stroke then return end
 
-    local bbox = PencilGeometry.computeStrokeBbox(stroke)
+    local bbox = stroke.bbox or PencilGeometry.computeStrokeBbox(stroke)
     if not bbox then return end
 
     local stroke_time = stroke.datetime or 0
@@ -3025,7 +2426,7 @@ function Pencil:assignStrokeToGroup(stroke_idx, skip_bookmark)
         -- Update tool to majority
         local pen_count, hl_count = 0, 0
         for _, si in ipairs(best_group.stroke_indices) do
-            local s = self.strokes[si]
+            local s = self.store.strokes[si]
             if s then
                 if s.tool == TOOL_HIGHLIGHTER then hl_count = hl_count + 1
                 else pen_count = pen_count + 1 end
@@ -3103,7 +2504,7 @@ function Pencil:rebuildAnnotationGroups()
 
         -- Build list of {index, datetime} sorted by datetime
         local sorted = {}
-        for i, stroke in ipairs(self.strokes) do
+        for i, stroke in ipairs(self.store.strokes) do
             table.insert(sorted, { idx = i, dt = stroke.datetime or 0 })
         end
         table.sort(sorted, function(a, b) return a.dt < b.dt end)
@@ -3189,10 +2590,22 @@ function Pencil:syncGroupBookmark(group)
         local datetime = group.id  -- use group id as unique datetime key
         group.bookmark_datetime = datetime
 
+        local transcription = trimString(group.transcription)
+        local bookmark_text
+
+        if transcription ~= "" then
+            bookmark_text = transcription
+        else
+            bookmark_text = string.format(
+                "Pencil annotation on page %d",
+                pageno
+            )
+        end
+
         local item = {
             page = bookmark_page,
             datetime = datetime,
-            text = string.format("Pencil annotation on page %d", pageno),
+            text = bookmark_text,
             chapter = chapter,
         }
 
@@ -3258,6 +2671,217 @@ function Pencil:syncAllBookmarks()
         self:syncGroupBookmark(group)
     end
     logger.info("Pencil: synced", #self.annotation_groups, "annotation group bookmarks")
+end
+
+------------------------------------------------------------------------------
+-- MyScript handwriting recognition
+------------------------------------------------------------------------------
+
+function Pencil:getLatestAnnotationGroupOnCurrentPage()
+    local page, latest = self:getCurrentPage(), nil
+    for _, g in ipairs(self.annotation_groups or {}) do
+        if self:getGroupCurrentPage(g) == page and (not latest or (g.datetime_last or g.datetime or 0) > (latest.datetime_last or latest.datetime or 0)) then latest = g end
+    end
+    return latest
+end
+
+function Pencil:getMyScriptStrokesForGroup(group)
+    if not group or type(group.stroke_indices) ~= "table" then return nil, { message = "Invalid annotation group" } end
+    return MyScript.strokes_from_pencil({ strokes = self.store.strokes, annotation_groups = { group } }, { group_index = 1, pointer_type = "PEN", pointer_id = 0 })
+end
+
+function Pencil:createMyScriptClient()
+    return MyScript.new{
+        application_key = self.myscript_application_key,
+        hmac_key = self.myscript_hmac_key,
+        language = self.myscript_language,
+        content_type = "Text",
+        client_name = "koreader-pencil-plugin",
+        client_version = "1.1.0",
+    }
+end
+
+-- Store text on the group and on every stroke referenced by the group.
+-- A stroke keeps group id + text, which avoids ambiguity if groups are rebuilt.
+function Pencil:setAnnotationGroupText(group, text, engine)
+    text = trimString(text)
+    if not group or text == "" then return false end
+
+    local updated_at = os.time()
+    local source = engine or "manual"
+    group.transcription = text
+    group.transcription_language = self.myscript_language
+    group.transcription_datetime = updated_at
+    group.transcription_engine = source
+
+    for _, stroke_index in ipairs(group.stroke_indices or {}) do
+        local stroke = self.store.strokes[stroke_index]
+        if stroke then
+            stroke.transcription = text
+            stroke.transcription_group_id = group.id
+            stroke.transcription_language = self.myscript_language
+            stroke.transcription_datetime = updated_at
+            stroke.transcription_engine = source
+        end
+    end
+
+    if self.experimental_bookmark_sync then
+        self:syncGroupBookmark(group)
+    end
+    return true
+end
+
+function Pencil:enrichAnnotationGroup(group, text)
+    return self:setAnnotationGroupText(group, text, "myscript")
+end
+
+function Pencil:recognizeGroupWithClient(client, group)
+    local strokes, conversion_error = self:getMyScriptStrokesForGroup(group)
+    if not strokes then
+        return nil, conversion_error
+    end
+
+    local ok, text, api_error = pcall(client.recognize_text, client, strokes, {
+        language = self.myscript_language,
+    })
+    if not ok then
+        logger.warn("Pencil: MyScript call failed:", tostring(text))
+        return nil, { message = tostring(text), kind = "unexpected" }
+    end
+    text = trimString(text)
+    if text == "" then
+        return nil, api_error or { message = _("No text was recognized.") }
+    end
+
+    self:enrichAnnotationGroup(group, text)
+    return text
+end
+
+function Pencil:recognizeAnnotationGroup(group)
+    if trimString(self.myscript_application_key) == ""
+            or trimString(self.myscript_hmac_key) == "" then
+        self:showMyScriptSettingsDialog()
+        return
+    end
+
+    NetworkMgr:runWhenOnline(function()
+        local client, client_error = self:createMyScriptClient()
+        if not client then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Invalid MyScript configuration: %1"), tostring(client_error)),
+            })
+            return
+        end
+
+        UIManager:show(InfoMessage:new{
+            text = _("Recognizing handwriting..."),
+            timeout = 1,
+        })
+
+        local text, error_value = self:recognizeGroupWithClient(client, group)
+        if not text then
+            local message = error_value and error_value.message or error_value
+            UIManager:show(InfoMessage:new{
+                text = T(_("Recognition failed: %1"), tostring(message)),
+            })
+            return
+        end
+
+        self:saveStrokes()
+        self:showRecognizedText(text, group)
+    end)
+end
+
+function Pencil:hasRecognizedAnnotations()
+    for _, group in ipairs(self.annotation_groups or {}) do
+        if trimString(group.transcription) ~= "" then return true end
+    end
+    return false
+end
+
+function Pencil:getAllRecognizedText()
+    local gettext = _
+    local groups = {}
+
+    for _, group in ipairs(self.annotation_groups or {}) do
+        if trimString(group.transcription) ~= "" then
+            groups[#groups + 1] = group
+        end
+    end
+
+    table.sort(groups, function(a, b)
+                   local ap, bp = self:getPageNumber(a.page), self:getPageNumber(b.page)
+
+                   if ap ~= bp then
+                       return ap < bp
+                   end
+
+                   return (a.datetime or 0) < (b.datetime or 0)
+    end)
+
+    local parts = {}
+
+    for _, group in ipairs(groups) do
+        parts[#parts + 1] =
+            T(gettext("Page %1"), self:getPageNumber(group.page))
+            .. "\n"
+            .. trimString(group.transcription)
+    end
+
+    return table.concat(parts, "\n\n")
+end
+
+function Pencil:recognizeAllAnnotationGroups()
+    if trimString(self.myscript_application_key) == ""
+            or trimString(self.myscript_hmac_key) == "" then
+        self:showMyScriptSettingsDialog()
+        return
+    end
+    if not self.annotation_groups or #self.annotation_groups == 0 then
+        UIManager:show(InfoMessage:new{ text = _("No annotation groups to recognize.") })
+        return
+    end
+
+    NetworkMgr:runWhenOnline(function()
+        local client, client_error = self:createMyScriptClient()
+        if not client then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Invalid MyScript configuration: %1"), tostring(client_error)),
+            })
+            return
+        end
+
+        local recognized, failed = 0, 0
+        UIManager:show(InfoMessage:new{
+            text = T(_("Recognizing %1 annotation group(s)..."), #self.annotation_groups),
+            timeout = 1,
+        })
+
+        for group_index, group in ipairs(self.annotation_groups) do
+            local text, error_value = self:recognizeGroupWithClient(client, group)
+            if text then
+                group.transcription_error = nil
+                recognized = recognized + 1
+            else
+                local message = error_value and error_value.message or error_value
+                group.transcription_error = tostring(message or _("Unknown recognition error"))
+                group.transcription_error_datetime = os.time()
+                failed = failed + 1
+                logger.warn("Pencil: recognition failed for group", group_index,
+                    group.id or "(no id)", group.transcription_error)
+            end
+        end
+
+        -- Persist all group fields and all stroke-level enrichment atomically
+        -- through the plugin's existing sidecar serialization path.
+        self:saveStrokes()
+
+        local summary = T(_("Recognized %1 annotation group(s)."), recognized)
+        if failed > 0 then
+            summary = summary .. "\n" .. T(_("Failed: %1."), failed)
+        end
+        UIManager:show(InfoMessage:new{ text = summary, timeout = 4 })
+    end)
 end
 
 ------------------------------------------------------------------------------
@@ -3343,7 +2967,7 @@ function Pencil:captureGroupImage(group)
 
     -- Render this group's strokes over the painted page background.
     for _, idx in ipairs(group.stroke_indices or {}) do
-        local stroke = self.strokes[idx]
+        local stroke = self.store.strokes[idx]
         if stroke then
             self:renderStrokeOffset(off_bb, stroke, -x0, -y0)
         end
@@ -3384,40 +3008,9 @@ function Pencil:captureGroupImage(group)
     return true
 end
 
--- Variant of renderStroke that translates points by (dx, dy) before drawing.
--- Used during capture to render a group's strokes onto an offscreen buffer
--- whose origin corresponds to the bbox top-left.
 function Pencil:renderStrokeOffset(bb, stroke, dx, dy)
-    if not stroke or not stroke.points or #stroke.points < 1 then return end
-
-    local tool = stroke.tool or TOOL_PEN
-    local width = stroke.width or self.tool_settings[tool].width or 3
-    local color = stroke.color or self.tool_settings[tool].color or Blitbuffer.COLOR_BLACK
-
-    if Screen.night_mode and stroke.color_name ~= "Black" and stroke.color_name ~= "Gray" then
-        color = color:invert()
-    end
-
-    local is_highlighter = (tool == TOOL_HIGHLIGHTER)
-    if is_highlighter then
-        color = stroke.color or Blitbuffer.Color8(0xDD)
-    end
-
-    if #stroke.points == 1 then
-        local p = stroke.points[1]
-        local half_w = math.floor(width / 2)
-        bb:paintRectRGB32(p.x + dx - half_w, p.y + dy - half_w, width, width, color)
-    else
-        for i = 2, #stroke.points do
-            local p1 = stroke.points[i - 1]
-            local p2 = stroke.points[i]
-            if is_highlighter then
-                self:drawHighlighterSegment(bb, p1.x + dx, p1.y + dy, p2.x + dx, p2.y + dy, width, color)
-            else
-                self:drawLineSegment(bb, p1.x + dx, p1.y + dy, p2.x + dx, p2.y + dy, width, color)
-            end
-        end
-    end
+    self.stroke_render_ctx.night_mode = Screen.night_mode
+    PencilStrokes.render(bb, stroke, self.stroke_render_ctx, dx, dy)
 end
 
 -- Schedule a deferred capture for the group. If a capture is already pending
@@ -3432,8 +3025,18 @@ function Pencil:scheduleGroupImageCapture(group, delay)
 
     self:cancelGroupImageCapture(group.id)
 
-    local cb = function()
+    local cb
+    cb = function()
+        -- Offscreen page repaint + JPEG encode is heavy; postpone if pen is active.
+        if self.pen_down or self.current_stroke then
+            UIManager:scheduleIn(IMAGE_CAPTURE_DEBOUNCE_S, cb)
+            return
+        end
         self.pending_image_captures[group.id] = nil
+        if self.pen_down then
+            self:scheduleGroupImageCapture(group, 0.5)
+            return
+        end
         -- The group might have been deleted by the eraser by now.
         local current = nil
         for _, g in ipairs(self.annotation_groups) do
@@ -3512,39 +3115,6 @@ function Pencil:purgeOrphanImages()
 end
 
 -- Open the saved image for a group in an ImageViewer popup.
-function Pencil:showGroupImagePreview(group)
-    if not group then return end
-    local path = self:getGroupImagePath(group)
-    if not path then
-        UIManager:show(InfoMessage:new{
-            text = _("No saved image for this annotation yet."),
-            timeout = 2,
-        })
-        return
-    end
-    local attr = lfs.attributes(path)
-    if not attr then
-        UIManager:show(InfoMessage:new{
-            text = _("Annotation image is missing on disk."),
-            timeout = 2,
-        })
-        return
-    end
-    local ImageViewer = require("ui/widget/imageviewer")
-    local pageno = self:getPageNumber(group.page) or 0
-    UIManager:show(ImageViewer:new{
-        file = path,
-        with_title_bar = true,
-        title_text = T(_("Annotation - page %1"), pageno),
-        fullscreen = false,
-    })
-end
-
--- Compute the on-screen badge rect for a stale-rotation group. The badge is
--- pinned to the right edge of the screen (i.e. in the margin) at a vertical
--- position proportional to the original bbox center Y, so multiple stale
--- annotations stack along the right side in roughly their original reading
--- order.
 function Pencil:getGroupBadgeRect(group)
     if not group or not group.bbox or not group.image_rotation then return nil end
     local current_rot = Screen:getRotationMode()
@@ -3582,7 +3152,7 @@ end
 function Pencil:getGroupColor(group)
     if not group or not group.stroke_indices then return nil end
     for _, idx in ipairs(group.stroke_indices) do
-        local stroke = self.strokes[idx]
+        local stroke = self.store.strokes[idx]
         if stroke and stroke.color then
             return stroke.color
         end
@@ -3609,6 +3179,13 @@ function Pencil:renderRotationBadge(bb, group)
         rect.w - 2 * inset, rect.h - 2 * inset, Blitbuffer.COLOR_WHITE)
 end
 
+-- Page-anchored (PDF) strokes render correctly in any rotation, so their
+-- groups never need a rotation badge.
+function Pencil:isGroupPageAnchored(group)
+    local first = group.stroke_indices and self.store.strokes[group.stroke_indices[1]]
+    return first ~= nil and first.page_points ~= nil
+end
+
 -- Compute the list of stale-rotation groups whose badges should be drawn on
 -- the current page in the current rotation. Returns nil if no badges should
 -- show (no stale groups, or suppressed because a native annotation is also
@@ -3623,7 +3200,8 @@ function Pencil:getStaleGroupsForCurrentView()
         local gpage = self:getGroupCurrentPage(group)
         if gpage == page then
             if group.image_rotation == nil
-                    or group.image_rotation == current_rot then
+                    or group.image_rotation == current_rot
+                    or self:isGroupPageAnchored(group) then
                 has_native = true
             elseif group.image_path then
                 stale = stale or {}
@@ -3635,7 +3213,7 @@ function Pencil:getStaleGroupsForCurrentView()
     return stale
 end
 
--- Hit-test the rotation badges on the current page. Mirrors the drawing
+-- Hit-test the rotation badges on the current page. Mirrors the drawing-
 -- logic in paintTo: a badge is tappable iff its group would have its badge
 -- drawn by the current render pass.
 function Pencil:findGroupBadgeAtPoint(x, y)
@@ -3652,24 +3230,6 @@ function Pencil:findGroupBadgeAtPoint(x, y)
         end
     end
     return nil
-end
-
--- Called by the bookmark-list hook on menu select. Returns true if we
--- handled the tap (and the original navigation should be skipped).
-function Pencil:tryShowImageForBookmark(item)
-    if not item or not item.datetime then return false end
-    if not item.datetime:match("^pencil_") then return false end
-    -- Find the matching group by id (group.id is stored as the bookmark datetime).
-    for _, group in ipairs(self.annotation_groups or {}) do
-        if group.id == item.datetime then
-            if group.image_path then
-                self:showGroupImagePreview(group)
-                return true
-            end
-            return false  -- pencil bookmark but no image yet; fall through to navigate
-        end
-    end
-    return false
 end
 
 -- Total disk usage of pencil_images/ for the current document, in bytes.
@@ -3767,38 +3327,10 @@ function Pencil:installBookmarkHook()
     logger.info("Pencil: installed bookmark list hook")
 end
 
--- Rebuild page index from strokes
-function Pencil:rebuildPageIndex()
-    self.page_strokes = {}
-    for i, stroke in ipairs(self.strokes) do
-        self:indexStroke(i, stroke.page)
-    end
-end
-
--- Get strokes for a specific page
-function Pencil:getStrokesForPage(page)
-    local result = {}
-    local indices = self.page_strokes[page] or {}
-    for _, idx in ipairs(indices) do
-        if self.strokes[idx] then
-            table.insert(result, self.strokes[idx])
-        end
-    end
-    return result
-end
-
--- Check if current page has strokes
-function Pencil:hasStrokesOnCurrentPage()
-    local page = self:getCurrentPage()
-    return self.page_strokes[page] and #self.page_strokes[page] > 0
-end
-
--- Clear strokes on current page
 function Pencil:clearPageStrokes()
-    local page = self:getCurrentPage()
-    local indices_to_remove = self.page_strokes[page]
+    local deleted_strokes = self.store:clearPage(self:getCurrentPage())
 
-    if not indices_to_remove or #indices_to_remove == 0 then
+    if not deleted_strokes then
         UIManager:show(InfoMessage:new{
             text = _("No annotations found on this page."),
             timeout = 1,
@@ -3806,26 +3338,6 @@ function Pencil:clearPageStrokes()
         return
     end
 
-    -- Copy and sort in reverse order to maintain indices during removal
-    local sorted_indices = {}
-    for _, idx in ipairs(indices_to_remove) do
-        table.insert(sorted_indices, idx)
-    end
-    table.sort(sorted_indices, function(a, b) return a > b end)
-
-    local deleted_strokes = {}
-    for _, idx in ipairs(sorted_indices) do
-        if self.strokes[idx] then
-            table.insert(deleted_strokes, self.strokes[idx])
-            table.remove(self.strokes, idx)
-        end
-    end
-
-    if #deleted_strokes > 0 then
-        table.insert(self.undo_stack, { type = "delete", strokes = deleted_strokes })
-    end
-
-    self:rebuildPageIndex()
     self:rebuildAnnotationGroups()
     self:flushDirtyGroups()
     self:refreshDogear()
@@ -3835,7 +3347,7 @@ function Pencil:clearPageStrokes()
         text = T(_("Cleared %1 annotation(s) from page."), #deleted_strokes),
         timeout = 1,
     })
-    UIManager:setDirty(self.view, "ui")
+    self:repaintReader()
 end
 
 -- Clear all strokes
@@ -3846,192 +3358,123 @@ function Pencil:clearAllStrokes()
         self:cancelGroupImageCapture(group.id)
         self:removeGroupImage(group)
     end
-    self.strokes = {}
-    self.page_strokes = {}
+    self.store:clearAll()
     self.annotation_groups = {}
     self:refreshDogear()
     self:saveStrokes()
     -- Belt-and-suspenders: any leftover files get reaped.
     self:purgeOrphanImages()
 
-    UIManager:setDirty(self.view, "ui")
-end
-
--- Render a line segment using rectangles (since BlitBuffer has no native line drawing)
--- Rasterize a thick line by stamping width×width squares along the segment.
--- Steps by ~half the pen width (via Geometry.segmentStepCount) so the squares
--- overlap without the ~width-fold per-pixel overdraw that stepping by 1px gives.
-function Pencil:drawThickLine(bb, x1, y1, x2, y2, width, color)
-    local dx = x2 - x1
-    local dy = y2 - y1
-    local dist = math.sqrt(dx * dx + dy * dy)
-    local half_w = math.floor(width / 2)
-
-    if dist < 1 then
-        -- Just draw a single point
-        bb:paintRectRGB32(x1 - half_w, y1 - half_w, width, width, color)
-        return
-    end
-
-    -- Inclusive 0..steps loop emits both endpoints (t=0 and t=1).
-    local steps = PencilGeometry.segmentStepCount(dist, width)
-    for i = 0, steps do
-        local t = i / steps
-        local x = math.floor(x1 + dx * t)
-        local y = math.floor(y1 + dy * t)
-        bb:paintRectRGB32(x - half_w, y - half_w, width, width, color)
-    end
-end
-
-function Pencil:drawLineSegment(bb, x1, y1, x2, y2, width, color)
-    self:drawThickLine(bb, x1, y1, x2, y2, width, color)
-end
-
--- Render a highlighter segment (semi-transparent, wider)
-function Pencil:drawHighlighterSegment(bb, x1, y1, x2, y2, width, color)
-    -- Highlighter is drawn as a lighter gray to simulate transparency on e-ink
-    local highlight_color = color or Blitbuffer.Color8(0xDD)
-    self:drawThickLine(bb, x1, y1, x2, y2, width, highlight_color)
-end
-
--- Check if a point is near a stroke (for eraser)
-function Pencil:isPointNearStroke(px, py, stroke, threshold)
-    return PencilGeometry.isPointNearStroke(px, py, stroke, threshold)
+    self:repaintReader()
 end
 
 -- Screen-space refresh rect (x, y, w, h) covering a set of just-deleted
 -- strokes, expanded by the eraser width and clamped to the screen. Returns
 -- nil when no stroke has geometry, signalling the caller to refresh fully.
 function Pencil:erasedStrokesRefreshRect(strokes)
-    local bbox = nil
-    local max_width = 0
-    for _, s in ipairs(strokes) do
-        local b = PencilGeometry.computeStrokeBbox(s)
-        if b then
-            bbox = bbox and PencilGeometry.bboxUnion(bbox, b) or b
-        end
-        max_width = math.max(max_width, s.width or 0)
-    end
-    if not bbox then return nil end
-    -- Cover the eraser and the widest erased stroke, which can be wider
-    -- (e.g. a highlighter), or its edges stay on the panel.
-    local eraser_width = (self.tool_settings[TOOL_ERASER] and self.tool_settings[TOOL_ERASER].width) or 20
-    local margin = math.max(eraser_width, math.floor(max_width / 2) + 4)
-    bbox = PencilGeometry.bboxExpand(bbox, margin)
-    bbox = PencilGeometry.bboxClampToScreen(bbox, Screen:getWidth(), Screen:getHeight())
-    local w = bbox.x1 - bbox.x0
-    local h = bbox.y1 - bbox.y0
-    if w <= 0 or h <= 0 then return nil end
-    return bbox.x0, bbox.y0, w, h
+    return PencilStrokes.erasedRefreshRect(strokes,
+        self.tool:getToolSettings(TOOL_ERASER).width or 20, Screen:getWidth(), Screen:getHeight())
 end
 
 -- Erase strokes at a given point
 -- Returns array of deleted strokes (for undo), or nil if none
-function Pencil:eraseAtPoint(x, y, page)
-    -- Only erase strokes on the current page
-    if self.input_debug_mode then
-        self:writeDebugLog(string.format("ERASE: searching %d strokes at (%d, %d)",
-            #self.strokes, x, y))
-    end
-
-    if #self.strokes == 0 then
-        if self.input_debug_mode then
-            self:writeDebugLog("ERASE: no strokes exist")
-        end
-        return nil
-    end
-
-    local eraser_width = self.tool_settings[TOOL_ERASER].width
-    local deleted = {}
-    local indices_to_remove = {}
-
-    -- Iterate only strokes on the current page via the page index. Keeps the
-    -- per-sample erase cost O(strokes-on-page) instead of O(total-strokes).
-    local page_indices = self.page_strokes and self.page_strokes[page] or nil
-    if page_indices then
-        for _, i in ipairs(page_indices) do
-            local stroke = self.strokes[i]
-            if stroke then
-                if self.input_debug_mode and stroke.points and #stroke.points > 0 then
-                    local min_x, max_x, min_y, max_y = stroke.points[1].x, stroke.points[1].x, stroke.points[1].y, stroke.points[1].y
-                    for _, pt in ipairs(stroke.points) do
-                        if pt.x < min_x then min_x = pt.x end
-                        if pt.x > max_x then max_x = pt.x end
-                        if pt.y < min_y then min_y = pt.y end
-                        if pt.y > max_y then max_y = pt.y end
+-- Drop removed strokes from each group's stroke_indices and renumber the
+-- rest to match self.store.strokes after table.remove.
+-- @param removed array of removed stroke indices (any order)
+function Pencil:shiftGroupStrokeIndices(removed)
+    local sorted = {}
+    for i, idx in ipairs(removed) do sorted[i] = idx end
+    table.sort(sorted)
+    local removed_set = {}
+    for _, idx in ipairs(sorted) do removed_set[idx] = true end
+    for _, group in ipairs(self.annotation_groups or {}) do
+        if group.stroke_indices then
+            local kept = {}
+            for _, idx in ipairs(group.stroke_indices) do
+                if not removed_set[idx] then
+                    local shift = 0
+                    for _, r in ipairs(sorted) do
+                        if r < idx then shift = shift + 1 else break end
                     end
-                    self:writeDebugLog(string.format("ERASE: stroke %d bounds: (%d-%d, %d-%d), eraser at (%d,%d) threshold=%d",
-                        i, min_x, max_x, min_y, max_y, x, y, eraser_width))
-                end
-                if self:isPointNearStroke(x, y, stroke, eraser_width) then
-                    table.insert(deleted, stroke)
-                    table.insert(indices_to_remove, i)
-                    if self.input_debug_mode then
-                        self:writeDebugLog(string.format("ERASE: found stroke %d to delete", i))
-                    end
+                    table.insert(kept, idx - shift)
                 end
             end
+            group.stroke_indices = kept
         end
     end
+end
 
-    -- Remove strokes (in reverse order to maintain indices)
-    if #indices_to_remove > 0 then
-        table.sort(indices_to_remove, function(a, b) return a > b end)
-        for _, idx in ipairs(indices_to_remove) do
-            table.remove(self.strokes, idx)
+-- End of a stylus erase gesture: do the work deferred while erasing.
+-- Must run before saveStrokes so the saved groups match the strokes.
+function Pencil:finishEraseGesture()
+    self.tool.eraser_contact = nil
+    self.highlight_box_cache = nil
+    self:rebuildStaleGroups()
+end
+
+-- Repaint after strokes were erased and refresh only the area they covered.
+-- @param deleted array of erased strokes
+-- @param fast use the fast waveform instead of the UI one
+function Pencil:refreshAfterErase(deleted, fast)
+    self.view:paintTo(Screen.bb, 0, 0)
+    self:paintTo(Screen.bb)
+    local bbox, margin = nil, 0
+    for _, stroke in ipairs(deleted) do
+        local b = PencilGeometry.computeStrokeBbox(stroke)
+        if b then
+            bbox = bbox and PencilGeometry.bboxUnion(bbox, b) or b
         end
-        self:rebuildPageIndex()
+        margin = math.max(margin, stroke.width or 0)
+    end
+    local sw, sh = Screen:getWidth(), Screen:getHeight()
+    local x, y, w, h = 0, 0, sw, sh
+    if bbox then
+        bbox = PencilGeometry.bboxClampToScreen(PencilGeometry.bboxExpand(bbox, margin + 2), sw, sh)
+        x, y = math.floor(bbox.x0), math.floor(bbox.y0)
+        w, h = math.ceil(bbox.x1) - x, math.ceil(bbox.y1) - y
+    end
+    if fast then
+        Screen:refreshFast(x, y, w, h)
+    else
+        Screen:refreshUI(x, y, w, h)
+    end
+end
+
+function Pencil:eraseAtPoint(x, y, page, defer_groups)
+    -- Only strokes on the visible pages can be erased. Legacy screen-space
+    -- strokes are only drawn on the current page, so they're only erasable there.
+    local pages = self.ui and self.ui.paging and self:getVisiblePages() or { page }
+    local deleted, indices = self.store:eraseAtPoint(x, y, pages,
+        self.tool:getToolSettings(TOOL_ERASER).width,
+        function(stroke, p)
+            return stroke.page_points and self:syncStrokeToView(stroke)
+                or (not stroke.page_points and p == page)
+        end)
+    if not deleted then return nil end
+
+    if defer_groups then
+        -- Rebuilding groups re-creates every group bookmark in the book,
+        -- far too slow to do per eraser sample. Keep group indices valid
+        -- now and rebuild once in finishEraseGesture.
+        self:shiftGroupStrokeIndices(indices)
+        self.groups_stale = true
+    else
         self:rebuildAnnotationGroups()
-        if self.input_debug_mode then
-            self:writeDebugLog(string.format("ERASE: deleted %d strokes", #deleted))
-        end
-        return deleted
     end
-
-    return nil
+    -- Delete the baked-in PDF ink annotations for any embedded strokes we
+    -- just erased. Done HERE (the single choke point every eraser input
+    -- path funnels through) rather than at the various gesture-end sites,
+    -- so it works for the stylus-eraser, hardware-button and touch paths
+    -- alike. In-memory delete + tile refresh; the disk write is deferred to
+    -- flushPdfEdits() on close.
+    self:deleteEmbeddedAnnotationsFor(deleted)
+    return deleted
 end
 
 -- Render a complete stroke
 function Pencil:renderStroke(bb, stroke)
-    if not stroke.points or #stroke.points < 1 then
-        return
-    end
-
-    local tool = stroke.tool or TOOL_PEN
-    local width = stroke.width or self.tool_settings[tool].width or 3
-
-    -- Get color directly (it's already a Blitbuffer color)
-    local color = stroke.color or self.tool_settings[tool].color or Blitbuffer.COLOR_BLACK
-
-    -- Reinvert color in night mode (if it's not black or gray)
-    if Screen.night_mode and stroke.color_name ~= "Black" and stroke.color_name ~= "Gray" then
-        color = color:invert()
-    end
-
-    -- Highlighter uses lighter color
-    local is_highlighter = (tool == TOOL_HIGHLIGHTER)
-    if is_highlighter then
-        -- For highlighter, use stored color or default gray
-        color = stroke.color or Blitbuffer.Color8(0xDD)
-    end
-
-    if #stroke.points == 1 then
-        -- Single point (dot)
-        local p = stroke.points[1]
-        local half_w = math.floor(width / 2)
-        bb:paintRectRGB32(p.x - half_w, p.y - half_w, width, width, color)
-    else
-        -- Multiple points - draw line segments
-        for i = 2, #stroke.points do
-            local p1 = stroke.points[i - 1]
-            local p2 = stroke.points[i]
-            if is_highlighter then
-                self:drawHighlighterSegment(bb, p1.x, p1.y, p2.x, p2.y, width, color)
-            else
-                self:drawLineSegment(bb, p1.x, p1.y, p2.x, p2.y, width, color)
-            end
-        end
-    end
+    self.stroke_render_ctx.night_mode = Screen.night_mode
+    PencilStrokes.render(bb, stroke, self.stroke_render_ctx)
 end
 
 -- View module paintTo method - called by ReaderView during repaints.
@@ -4039,7 +3482,7 @@ end
 -- offscreen buffer, this method is invoked recursively as part of the view
 -- module loop; the _capturing guard suppresses re-entry so we can paint the
 -- group's strokes deliberately onto the captured page background.
-function Pencil:paintTo(bb, x, y)
+function Pencil:paintTo(bb)
     if self._capturing then return end
 
     local page = self:getCurrentPage()
@@ -4073,7 +3516,8 @@ function Pencil:paintTo(bb, x, y)
                 groups_with_image = groups_with_image + 1
             end
             if group.image_rotation == nil
-                    or group.image_rotation == current_rot then
+                    or group.image_rotation == current_rot
+                    or self:isGroupPageAnchored(group) then
                 -- Renders natively (same rotation as capture, or legacy group
                 -- without rotation info — render strokes as-is).
                 has_native_annotation = true
@@ -4115,13 +3559,24 @@ function Pencil:paintTo(bb, x, y)
         }
     end
 
-    -- Render saved strokes for current page (skipping stale ones).
-    local indices = self.page_strokes[page] or {}
-    for _, idx in ipairs(indices) do
-        if not (stale_indices and stale_indices[idx]) then
-            local stroke = self.strokes[idx]
-            if stroke then
-                self:renderStroke(bb, stroke)
+    -- Render saved strokes for the visible pages (skipping stale ones).
+    -- Page-anchored (PDF) strokes are valid in any rotation, so they are
+    -- never treated as stale; legacy screen-space strokes only draw on the
+    -- current page.
+    for _, p in ipairs(self:getVisiblePages()) do
+        for _, idx in ipairs(self.store.page_strokes[p] or {}) do
+            local stroke = self.store.strokes[idx]
+            -- Skip strokes already embedded into the PDF: MuPDF renders the
+            -- baked-in ink annotation, so drawing our overlay copy too would
+            -- double it (and it wouldn't rotate correctly).
+            if stroke and not stroke.embedded then
+                if stroke.page_points then
+                    if self:syncStrokeToView(stroke) then
+                        self:renderStroke(bb, stroke)
+                    end
+                elseif p == page and not (stale_indices and stale_indices[idx]) then
+                    self:renderStroke(bb, stroke)
+                end
             end
         end
     end
@@ -4138,125 +3593,38 @@ function Pencil:paintTo(bb, x, y)
     if self.current_stroke and self.current_stroke.page == page then
         self:renderStroke(bb, self.current_stroke)
     end
+
+    if self.notes_feature then
+        self.notes_feature:paintTo(bb)
+    end
+
+    if self.lasso_feature then
+        self.lasso_feature:paintTo(bb)
+    end
 end
 
--- Get the pencil strokes file path for this document
 function Pencil:getStrokesFilePath()
-    if not self.ui or not self.ui.doc_settings then
-        logger.warn("Pencil: doc_settings not available")
-        return nil
-    end
-    local sidecar_dir = self.ui.doc_settings.doc_sidecar_dir
-    if sidecar_dir then
-        return sidecar_dir .. "/pencil_strokes.lua"
-    end
-    logger.warn("Pencil: sidecar_dir not available")
-    return nil
-end
-
--- Store the plugin-owned strokes file path in the document metadata.
-function Pencil:rememberStrokesFilePath(filepath)
-    local settings = self.ui and self.ui.doc_settings
-    if settings and filepath then
-        settings:saveSetting(STROKES_PATH_SETTING, filepath)
-    end
-end
-
--- Recover pencil_strokes.lua after KOReader moves metadata.lua to a new
--- sidecar following a document rename. Both paths are assumed to be on the
--- same filesystem, so os.rename provides an atomic move.
-function Pencil:migrateStrokesFileIfNeeded()
-    local current = self:getStrokesFilePath()
-    local settings = self.ui and self.ui.doc_settings
-    if not current or not settings then return current end
-
-    if lfs.attributes(current, "mode") == "file" then
-        self:rememberStrokesFilePath(current)
-        return current
-    end
-
-    local previous = settings:readSetting(STROKES_PATH_SETTING)
-    if type(previous) ~= "string" or previous == "" or previous == current
-            or lfs.attributes(previous, "mode") ~= "file" then
-        return current
-    end
-
-    local old_sidecar = previous:match("^(.*)/[^/]+$")
-    local moved, err = os.rename(previous, current)
-    if not moved then
-        logger.warn("Pencil: failed to move strokes file from", previous,
-            "to", current, "error:", err)
-        return current
-    end
-
-    self:rememberStrokesFilePath(current)
-    logger.info("Pencil: moved strokes file from", previous, "to", current)
-
-    -- Bring the annotation preview pictures along. Groups store each
-    -- picture's filename relative to pencil_images/, so moving the folder is
-    -- enough. Never overwrite pictures already in the new sidecar.
-    local new_images = self:getImagesDir()
-    if old_sidecar and new_images then
-        local old_images = old_sidecar .. "/pencil_images"
-        if lfs.attributes(old_images, "mode") == "directory"
-                and not lfs.attributes(new_images, "mode") then
-            local moved_images, images_err = os.rename(old_images, new_images)
-            if moved_images then
-                logger.info("Pencil: moved annotation images to", new_images)
-            else
-                logger.warn("Pencil: failed to move annotation images from", old_images,
-                    "to", new_images, "error:", images_err)
-            end
-        end
-    end
-
-    -- rmdir only succeeds when the legacy sidecar is empty. If KOReader or
-    -- another plugin left data there, it is preserved without extra handling.
-    if old_sidecar then
-        local removed = lfs.rmdir(old_sidecar)
-        if removed then
-            logger.info("Pencil: removed empty legacy sidecar", old_sidecar)
-        end
-    end
-
-    return current
+    return PencilStrokes.getFilePath(self.ui and self.ui.doc_settings)
 end
 
 -- Load strokes from our own file
 function Pencil:loadStrokes()
-    local filepath = self:migrateStrokesFileIfNeeded()
+    self.notes_feature = self.notes_feature or PencilNotes:new{ plugin = self }
+    self.notes_feature:deserialize(nil)
+    local doc_settings = self.ui and self.ui.doc_settings
+    local filepath = PencilStrokes.migrateFileIfNeeded(doc_settings)
     logger.info("Pencil: loadStrokes - filepath =", filepath)
     local was_too_new = self.strokes_file_too_new
     self.strokes_file_too_new = false
 
-    if not filepath then
-        logger.warn("Pencil: no filepath available for loading strokes")
-        self.strokes = {}
-        self.page_strokes = {}
-        return
-    end
+    local status, data = self.store:load(filepath, {
+        tool_settings = self.stroke_render_ctx.tool_settings,
+        available_colors = self.available_colors,
+    })
 
-    -- Check if file exists
-    local file_exists = io.open(filepath, "r")
-    if not file_exists then
-        logger.info("Pencil: strokes file does not exist yet:", filepath)
-        self.strokes = {}
-        self.page_strokes = {}
-        self.strokes_loaded = true
-        return
-    end
-    file_exists:close()
-
-    local ok, data = pcall(dofile, filepath)
-    if ok and type(data) == "table" and type(data.version) == "number"
-            and data.version > STROKES_FILE_VERSION then
-        -- Written by a newer Pencil, in a format this one may not read
-        -- correctly. Loading it could drop what we don't understand, and the
-        -- next save would write that loss to disk, so leave the file alone.
-        logger.warn("Pencil: strokes file is version", data.version,
-            "but this Pencil writes version", STROKES_FILE_VERSION, "- not loading or saving it")
-        self.strokes = {}
-        self.page_strokes = {}
+    if status == "too_new" then
+        -- Written by a newer Pencil: left untouched, and not saved over
+        -- (PencilStrokes refuses to write it).
         self.annotation_groups = {}
         self.strokes_file_too_new = true
         if not was_too_new then
@@ -4268,13 +3636,10 @@ function Pencil:loadStrokes()
         end
         return
     end
-    if ok and data and data.strokes then
-        -- Convert saved strokes back to usable format
-        self.strokes = {}
-        for i, saved in ipairs(data.strokes) do
-            self.strokes[i] = self:strokeFromSaved(saved)
-        end
-        self:rebuildPageIndex()
+    if status == "error" then
+        self.annotation_groups = {}
+    elseif status == "ok" then
+        self.notes_feature:deserialize(data.notes)
 
         -- Load annotation groups or bootstrap from v1 data
         if data.annotation_groups and #data.annotation_groups > 0 then
@@ -4286,7 +3651,7 @@ function Pencil:loadStrokes()
             logger.info("Pencil: bootstrapping annotation groups from strokes")
             self.annotation_groups = {}
             local sorted = {}
-            for i, stroke in ipairs(self.strokes) do
+            for i, stroke in ipairs(self.store.strokes) do
                 table.insert(sorted, { idx = i, dt = stroke.datetime or 0 })
             end
             table.sort(sorted, function(a, b) return a.dt < b.dt end)
@@ -4295,140 +3660,24 @@ function Pencil:loadStrokes()
             end
         end
 
-        self.strokes_loaded = true
-        self:rememberStrokesFilePath(filepath)
-        logger.info("Pencil: loaded", #self.strokes, "strokes from", filepath)
-    else
-        logger.warn("Pencil: failed to load strokes from", filepath, "error:", data)
-        self.strokes = {}
-        self.page_strokes = {}
-        self.annotation_groups = {}
+        PencilStrokes.rememberFilePath(doc_settings, filepath)
     end
 end
 
--- Convert stroke for saving (remove non-serializable values)
-function Pencil:strokeToSaveable(stroke)
-    return {
-        page = stroke.page,
-        tool = stroke.tool,
-        width = stroke.width,
-        alpha = stroke.alpha,
-        datetime = stroke.datetime,
-        -- v4: points packed as a single "x y x y ..." string instead of an
-        -- array of {x=,y=} tables, so the serializer doesn't walk every point.
-        p = PencilGeometry.packPoints(stroke.points),
-        color_name = stroke.color_name,  -- Save color name for persistence
-    }
-end
-
--- Convert saved stroke back to usable format
-function Pencil:strokeFromSaved(saved)
-    local tool = saved.tool or TOOL_PEN
-    local tool_settings = self.tool_settings[tool] or self.tool_settings[TOOL_PEN]
-
-    -- Look up color from color_name
-    local color = tool_settings.color
-    if saved.color_name then
-        for _, color_info in ipairs(self.available_colors) do
-            if color_info.name == saved.color_name then
-                color = color_info.color
-                break
-            end
-        end
-    end
-
-    -- Points: v4 stores a packed "x y ..." string in `p`; v3 and earlier store
-    -- an array of {x=,y=} tables in `points`. Reconstruct the in-memory
-    -- {x=,y=} array either way.
-    local points
-    if saved.p ~= nil then
-        points = PencilGeometry.unpackPoints(saved.p)
-    else
-        points = saved.points or {}
-    end
-
-    return {
-        page = saved.page,
-        tool = saved.tool,
-        width = saved.width or tool_settings.width,
-        color = color,
-        color_name = saved.color_name,
-        alpha = saved.alpha or tool_settings.alpha,
-        datetime = saved.datetime,
-        points = points,
-    }
-end
-
--- Save strokes to our own file
+-- Save strokes (and the annotation groups and notes) to our own file
 function Pencil:saveStrokes()
     local filepath = self:getStrokesFilePath()
-    logger.info("Pencil: saveStrokes - filepath =", filepath, "strokes count =", #self.strokes)
-
-    if not filepath then
-        logger.warn("Pencil: no filepath available for saving strokes")
-        return
-    end
-
-    -- Never overwrite a file from a newer Pencil (see loadStrokes).
-    if self.strokes_file_too_new then
-        logger.warn("Pencil: not saving - strokes file is from a newer Pencil:", filepath)
-        return
-    end
-
-    -- Safety: don't save empty data if strokes were never successfully loaded
-    -- (prevents data loss if a crash causes save before load completes)
-    if #self.strokes == 0 and not self.strokes_loaded then
-        logger.warn("Pencil: refusing to save empty strokes (strokes never loaded)")
-        return
-    end
-
-    -- No ink and no file yet: nothing to save, so don't give every book
-    -- that's merely opened an empty strokes file.
-    if #self.strokes == 0 and not lfs.attributes(filepath, "mode") then
-        return
-    end
-
-    -- A book being written in for the first time may not have its sidecar
-    -- folder yet: KOReader only creates it when it saves its own settings,
-    -- usually on close. Create it, or the ink isn't on disk until then.
-    local sidecar_dir = filepath:match("^(.*)/[^/]+$")
-    if sidecar_dir and lfs.attributes(sidecar_dir, "mode") ~= "directory" then
-        local ok, err = require("util").makePath(sidecar_dir)
-        if not ok then
-            logger.err("Pencil: failed to create sidecar folder:", sidecar_dir, "error:", err)
-        end
-    end
-
-    -- Convert strokes to saveable format (remove non-serializable values)
-    local saveable_strokes = {}
-    for i, stroke in ipairs(self.strokes) do
-        saveable_strokes[i] = self:strokeToSaveable(stroke)
-    end
-
-    -- Serialize and write. Version 4 packs each stroke's points into a single
-    -- "x y x y ..." string (field `p`) instead of an array of {x=,y=} tables,
-    -- cutting serialize time + file size on heavily-annotated documents. v3 and
-    -- earlier (points array) still load via strokeFromSaved's fallback.
-    local data = {
-        version = STROKES_FILE_VERSION,
-        strokes = saveable_strokes,
+    if self.store:save(filepath, {
         annotation_groups = self.annotation_groups,
-    }
-
-    local f, err = io.open(filepath, "w")
-    if f then
-        f:write("return " .. require("dump")(data))
-        f:close()
-        self:rememberStrokesFilePath(filepath)
-        logger.info("Pencil: saved", #self.strokes, "strokes to", filepath)
-    else
-        logger.err("Pencil: failed to open file for writing:", filepath, "error:", err)
+        notes = self.notes_feature and self.notes_feature:serialize() or {},
+    }) then
+        PencilStrokes.rememberFilePath(self.ui and self.ui.doc_settings, filepath)
     end
 end
 
 -- Handle document close
 function Pencil:onCloseDocument()
-    logger.info("Pencil: onCloseDocument called, strokes count =", #self.strokes)
+    logger.info("Pencil: onCloseDocument called, strokes count =", self.store:count())
 
     -- Cancel any pending refresh
     self:cancelPendingRefresh()
@@ -4439,12 +3688,17 @@ function Pencil:onCloseDocument()
     -- Save any in-progress stroke
     if self.current_stroke and #self.current_stroke.points >= 2 then
         logger.info("Pencil: saving in-progress stroke before close")
-        table.insert(self.strokes, self.current_stroke)
-        self:indexStroke(#self.strokes, self.current_stroke.page)
+        self:anchorStrokeToPage(self.current_stroke)
+        self.store:add(self.current_stroke)
         self.current_stroke = nil
     end
 
     self:teardownPenInput()
+    if self.notes_feature and self.notes_feature:isOpen() then
+        self.notes_feature:close(false)
+    end
+    if self.lasso_feature then self.lasso_feature:clear() end
+    self:rebuildStaleGroups()
 
     -- Run any pending deferred image captures synchronously before close so
     -- we don't lose a fresh annotation. Must happen before the final save so
@@ -4454,13 +3708,47 @@ function Pencil:onCloseDocument()
     -- Final bookmark sync before close
     self:syncAllBookmarks()
 
+    -- Auto-save pencil ink into the PDF file (opt-in). This only stages the
+    -- annotations in memory; the actual disk write is the single flushPdfEdits()
+    -- below. Must run while the document is still open/writable.
+    if self.auto_save_pdf then
+        local ok, err = pcall(function() self:autoSaveInkToPdf() end)
+        if not ok then
+            logger.err("Pencil: autoSaveInkToPdf error:", err)
+        end
+    end
+
+    -- Give KOReader's text highlights an appearance stream so they're visible in
+    -- desktop PDF viewers too (KOReader writes them without one). Staged only;
+    -- the flush below writes everything in one pass.
+    local hok, herr = pcall(function() self:ensureHighlightAppearances() end)
+    if not hok then logger.err("Pencil: ensureHighlightAppearances error:", herr) end
+
+    -- Single, final write of any in-memory PDF edits the plugin made this
+    -- session (auto-saved ink, erased ink, manual per-page saves). One
+    -- incremental write, then is_edited is cleared so KOReader's own close
+    -- doesn't stack a second write (which corrupts the xref). Runs regardless
+    -- of the auto-save toggle, since the eraser/manual paths also set dirty.
+    local ok, ferr = pcall(function() self:flushPdfEdits() end)
+    if not ok then logger.err("Pencil: flushPdfEdits error:", ferr) end
+    -- flushPdfEdits clears _pdf_dirty on a successful write; if it's still set,
+    -- the write didn't happen, so un-embed the strokes we staged this close (the
+    -- sidecar must not claim they're in a file that never received them).
+    if self._pdf_dirty and self._auto_embedded_this_close then
+        for _, stroke in ipairs(self._auto_embedded_this_close) do
+            stroke.embedded = nil
+            stroke.annot_id = nil
+        end
+    end
+    self._auto_embedded_this_close = nil
+
     -- Always save strokes on close (even if empty, to clear any previous data)
     logger.info("Pencil: saving strokes on document close")
     self:saveStrokes()
 
     -- Clear state
     self.eraser_deleted = nil
-    self.undo_stack = {}
+    self.store:clearHistory()
 
     if _active_pencil == self then _active_pencil = nil end
 end
@@ -4482,10 +3770,10 @@ function Pencil:onReaderReady()
     end
 
     -- Force reload strokes (in case they weren't loaded in init)
-    if #self.strokes == 0 then
+    if self.store:count() == 0 then
         self:loadStrokes()
     end
-    logger.info("Pencil: after loadStrokes, strokes count =", #self.strokes,
+    logger.info("Pencil: after loadStrokes, strokes count =", self.store:count(),
         "groups =", #self.annotation_groups)
 
     -- Sync annotation group bookmarks now that UI modules are ready
@@ -4503,10 +3791,10 @@ function Pencil:onReaderReady()
 end
 
 -- Handle read settings (document opened) - backup in case onReaderReady not called
-function Pencil:onReadSettings(config)
+function Pencil:onReadSettings()
     logger.dbg("Pencil: onReadSettings called")
     -- Only load if not already loaded
-    if not self.strokes or #self.strokes == 0 then
+    if self.store:count() == 0 then
         self:loadStrokes()
     end
     -- Re-setup touch zones if enabled (in case they were torn down)
@@ -4516,18 +3804,18 @@ function Pencil:onReadSettings(config)
 end
 
 -- Handle page changes (paging mode)
-function Pencil:onPageUpdate(pageno)
+function Pencil:onPageUpdate()
+    if self.lasso_feature then self.lasso_feature:clear() end
     -- The page is redrawn in full, so the region the last strokes touched no
     -- longer needs its own refresh; don't let it widen the next page's.
     self.pending_refresh_bbox = nil
     -- Clear any in-progress stroke when page changes
     if self.current_stroke and #self.current_stroke.points >= 2 then
         -- Save the stroke before clearing. The inline saveStrokes below covers
-        -- everything in self.strokes, so drop any queued debounced save first.
+        -- everything in self.store.strokes, so drop any queued debounced save first.
         self:cancelPendingSave()
-        table.insert(self.strokes, self.current_stroke)
-        self:indexStroke(#self.strokes, self.current_stroke.page)
-        table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
+        self:anchorStrokeToPage(self.current_stroke)
+        self.store:pushUndo({ type = "add", stroke_idx = self.store:add(self.current_stroke) })
         self:flushDirtyGroups()
         self:saveStrokes()
     else
@@ -4548,9 +3836,8 @@ function Pencil:onUpdatePos()
     -- Clear any in-progress stroke when position changes
     if self.current_stroke and #self.current_stroke.points >= 2 then
         self:cancelPendingSave()
-        table.insert(self.strokes, self.current_stroke)
-        self:indexStroke(#self.strokes, self.current_stroke.page)
-        table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
+        self:anchorStrokeToPage(self.current_stroke)
+        self.store:pushUndo({ type = "add", stroke_idx = self.store:add(self.current_stroke) })
         self:flushDirtyGroups()
         self:saveStrokes()
     else
