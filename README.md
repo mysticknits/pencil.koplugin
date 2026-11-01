@@ -27,6 +27,7 @@ Rotating the device is handled: annotations written in the other orientation sho
 - **Highlighter**: Hold the stylus side button and drag to draw a highlighter stroke (or a KOReader text highlight, with the experimental option below); tap the side button to toggle pencil/eraser
 - **Swap Eraser/Highlighter**: Reassign which side button acts as eraser vs. highlighter from the menu
 - **Undo**: Undo your last stroke or eraser action
+- **Quick tool box**: Switch tool, preset, color, width and eraser size from a small panel (see below)
 - **Clear strokes**: Clear annotations for the current page or the entire document
 - **Annotation grouping**: Strokes are automatically grouped into logical annotations based on timing and proximity
 - **Enable/disable toggle**: Turn the plugin on or off via the menu or a mapped gesture
@@ -71,6 +72,21 @@ If you can't update KOReader, use [release 0.5.0](https://github.com/mysticknits
    - **Pencil: select pencil** — switch to pencil
    - **Pencil: select eraser** — switch to eraser
    - **Pencil: undo** — undo last stroke or eraser action
+   - **Pencil: select highlighter** — switch to the highlighter (marker)
+   - **Pencil: swap to previous tool** — flip between the tool in hand and the one before it
+   - **Pencil: open tool box** — open the quick tool box (below)
+
+## Quick tool box
+
+A small panel for switching tool without leaving the page. Open it from **Pencil menu > Tool box > Open tool box**, with the **Pencil: open tool box** gesture, or (optional) by holding the pen still on the page for half a second (**Tool box > Open by holding the pen still**, off by default so pausing mid-sentence doesn't open it; it replaces the experimental color picker while on).
+
+- **Tools**: Pen, Marker (highlighter), Eraser, Undo, and a close button
+- **Presets**: a row of up to six saved tools (default pens and markers). Tap to take one up; **hold** a slot, or tap the **+**, to save the tool in hand there
+- **Colors and widths**: ten pen colors, five marker colors, pen widths 3/5/7/9 and marker widths 12/20/30/40. The eraser has three sizes (10/20/40)
+- Stays open while you pick several things; tap outside or the close button to dismiss it
+- Everything is remembered between sessions. **Reset saved tools** restores the default presets
+
+Built from core KOReader widgets only. It does not exist while you draw: it's created when opened and freed when closed, nothing in the pen path knows about it, and while open only the panel repaints, not the page.
 
 ## Questions or Issues with the Plugin
 

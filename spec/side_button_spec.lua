@@ -53,7 +53,7 @@ local loaders = package.loaders or package.searchers
 
 local function load_pencil()
     table.insert(loaders, 2, function(name)
-        if name == "lib/geometry" then return nil end
+        if name == "lib/geometry" or name == "lib/toolset" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
