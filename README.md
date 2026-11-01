@@ -119,39 +119,45 @@ When enabled, the plugin automatically groups your pencil strokes into logical a
 
 ### Save annotations to PDF
 
-Writes the **current page's** pencil strokes into the PDF file as native ink annotations
-(`/Subtype /Ink`), so they travel with the file and are visible/removable in any PDF reader —
-not just re-drawn by this plugin. **PDF documents only.**
+Writes pencil strokes into the PDF file as native ink annotations (`/Subtype /Ink`), so they
+travel with the file and are visible/removable in any PDF reader, not just re-drawn by this
+plugin. **PDF documents only.**
 
 **To use, two ways:**
 - **Manual, this page:** Pencil menu > Experimental > Save annotations to PDF (this page).
-  Embeds the current page's pencil strokes **and** text highlights, then asks whether to
-  remove the plugin's overlay copies so the embedded ink isn't drawn twice.
+  Adds the current page's pencil strokes **and** text highlights. Highlights already in the
+  file are skipped, and when KOReader's "Write highlights into PDF" is on they're left to
+  KOReader entirely.
 - **Automatic on close:** Pencil menu > Experimental > *Auto-save pencil ink to PDF on close*.
   When enabled, every pencil stroke you've drawn (across all pages) is written into the PDF
-  when you close the document. It runs once per session and only adds strokes that aren't
-  already in the file, so re-opening never duplicates them. Erasing an embedded stroke removes
-  its annotation from the PDF too.
+  when you close the document. Only strokes that aren't already in the file are added, so
+  re-opening never duplicates them.
 
-**Text highlights** are handled by KOReader itself, not this plugin's auto-save — KOReader
+Either way, the file itself is written **once, when you close the book**. Until then the ink
+is only in the open document, and the plugin doesn't record a stroke as saved until that
+write has succeeded. If KOReader is killed before a clean close, nothing is lost: the strokes
+are still drawn by the plugin and get saved on the next close.
+
+**Text highlights** are handled by KOReader itself, not this plugin's auto-save. KOReader
 draws its own copy of a highlight, so a plugin-embedded one would show doubled. To get text
 highlights into the PDF, enable KOReader's built-in feature: **top menu > Highlights > "Write
 highlights into PDF" > On** (long-press *On* to make it the default for all books). Use **"Write
-all highlights into PDF file"** in that same menu to push highlights you've already made. (The
-manual *Save annotations to PDF (this page)* action can still embed highlights on demand.)
+all highlights into PDF file"** in that same menu to push highlights you've already made.
 
 **Notes and limitations:**
-- **Fixed zoom.** Conversion uses KOReader's live on-screen page transform. Keep a consistent
-  (fixed) zoom — resizing after drawing will misplace annotations. The manual action is
-  current-page only; auto-save-on-close covers all pages under this same fixed-layout
-  assumption.
-- **Embedded strokes are drawn by the PDF, not the overlay.** Once a stroke is written into
-  the PDF (via auto-save), the plugin stops drawing its own overlay copy — the PDF's baked-in
-  ink is what you see (and it rotates correctly).
-- **The eraser still works on embedded ink.** Erasing an embedded stroke removes its
-  annotation from the PDF too (matched via a small tag stored in the annotation's `/Contents`)
-  and re-saves the file; undo brings the stroke back as a normal overlay stroke. Each erase
-  that touches embedded ink writes the file once.
+- **Placement.** Each stroke remembers where it sits on its page when you draw it, so
+  embedding is correct on every page, including PDFs with mixed page sizes and when you zoom
+  or pan between drawing and closing. Strokes drawn with an older version of the plugin learn
+  their page position the first time their page is shown.
+- **Embedded strokes are drawn by the PDF, not the overlay.** Once a stroke is in the PDF,
+  the plugin stops drawing its own copy. The PDF's baked-in ink is what you see (and it
+  rotates correctly).
+- **Erase, undo and clear work on embedded ink.** Erasing an embedded stroke, undoing it, or
+  using Clear page / Clear all removes its annotation from the PDF too (matched via a small tag
+  stored in the annotation's `/Contents`). Undoing an erase or a clear brings the strokes back
+  as normal overlay strokes, which are saved again on the next close.
+- **Ink from elsewhere is left alone.** The plugin only ever deletes the annotations of its
+  own strokes. Ink added in other apps, or by Pencil on another device, is never removed.
 - **Requires KOReader 2026.07 or newer.** Writing ink needs MuPDF ink symbols that
   koreader-base only exports since
   [koreader-base#2444](https://github.com/koreader/koreader-base/pull/2444), shipped in
