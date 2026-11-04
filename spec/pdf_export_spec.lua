@@ -52,16 +52,25 @@ function W.mupdf_pdf_create_annot(_, page, annot_type)
     table.insert(page.annots, annot)
     return annot
 end
+-- Like the 2026.07 wrappers, setters return a bool. Name a setter in
+-- W.failing to make it return false.
+W.failing = {}
+local function ok_unless(name) return not W.failing[name] end
 function W.mupdf_pdf_set_annot_ink_list(_, annot, n, counts, vertices)
     local pts = {}
     for i = 0, counts[0] - 1 do pts[#pts + 1] = { x = vertices[i].x, y = vertices[i].y } end
     annot.ink = pts
+    return ok_unless("ink_list")
 end
-function W.mupdf_pdf_set_annot_contents(_, annot, s) annot.contents = s end
-function W.mupdf_pdf_set_annot_border_width(_, annot, w) annot.width = w end
-function W.mupdf_pdf_set_annot_color() end
-function W.mupdf_pdf_set_annot_opacity() end
-function W.mupdf_pdf_update_annot() end
+function W.mupdf_pdf_set_annot_contents(_, annot, s)
+    if W.failing.contents then return false end
+    annot.contents = s
+    return true
+end
+function W.mupdf_pdf_set_annot_border_width(_, annot, w) annot.width = w; return ok_unless("border_width") end
+function W.mupdf_pdf_set_annot_color() return ok_unless("color") end
+function W.mupdf_pdf_set_annot_opacity() return ok_unless("opacity") end
+function W.mupdf_pdf_update_annot() return ok_unless("update") end
 
 local fake_ffi = {
     cdef = function() end,
@@ -144,6 +153,9 @@ local function new_doc(opts)
         pages = pages,
         writes = 0,
         highlights_saved = 0,
+        opens = 0,
+        tile_resets = 0,
+        configurable = { text_wrap = opts.reflow and 1 or 0 },
     }
     local function page(n)
         pages[n] = pages[n] or { annots = {} }
@@ -151,6 +163,10 @@ local function new_doc(opts)
     end
     doc._document = {
         openPage = function(_, n)
+            -- A non-.pdf MuPDF page isn't an annotation list: walking it as
+            -- one would crash for real, so fail the test loudly instead.
+            assert(not opts.not_pdf_file, "opened a page of a non-.pdf document")
+            doc.opens = doc.opens + 1
             local p = page(n)
             return {
                 ctx = {},
@@ -164,14 +180,26 @@ local function new_doc(opts)
             }
         end,
     }
-    function doc:_checkIfWritable() return opts.read_only and "read-only" or true end
-    function doc:resetTileCacheValidity() end
+    function doc:_checkIfWritable()
+        if opts.not_pdf_file then return nil end  -- XPS, CBZ, FB2, ... (not a .pdf)
+        if opts.read_only then return false end
+        return true
+    end
+    function doc:resetTileCacheValidity() self.tile_resets = self.tile_resets + 1 end
     function doc:writeDocument()
         if opts.write_fails then error("disk full") end
         self.writes = self.writes + 1
     end
-    function doc:saveHighlight(pageno)
+    function doc:saveHighlight(pageno, item)
         self.is_edited = true
+        self.saved_parts = self.saved_parts or {}
+        table.insert(self.saved_parts, { page = pageno, item = item })
+        -- MuPDF may adjust the quads; KOReader writes them back to item.pboxes.
+        local adjusted = {}
+        for i, b in ipairs(item.pboxes) do
+            adjusted[i] = { x = b.x, y = b.y, w = b.w, h = b.h, adjusted = true }
+        end
+        item.pboxes = adjusted
         table.insert(page(pageno).annots, { page = page(pageno), type = PDF_ANNOT_HIGHLIGHT })
         self.highlights_saved = self.highlights_saved + 1
     end
@@ -264,7 +292,7 @@ local function draw(p, page, points, extra)
     for k, v in pairs(extra or {}) do stroke[k] = v end
     table.insert(p.strokes, stroke)
     p:indexStroke(#p.strokes, page)
-    p:capturePagePoints(stroke)
+    p:recordPagePoints(stroke)
     return stroke
 end
 
@@ -654,5 +682,142 @@ describe("PDF export: erasing a highlight (real main.lua)", function()
         assert.is_true(p:eraseHighlightAtScreenPos(5, 5))
         assert.equals(0, #doc.page(1).annots)
         assert.equals(1, doc.highlights_deleted)
+    end)
+end)
+
+describe("PDF export: only real .pdf files (real main.lua)", function()
+    before_each(function()
+        for i = #shown, 1, -1 do shown[i] = nil end
+    end)
+
+    -- XPS, CBZ, FB2, ... open with PdfDocument too, so is_pdf is true.
+    local function xps_pencil(extra)
+        local opts = { doc = new_doc({ not_pdf_file = true }) }
+        for k, v in pairs(extra or {}) do opts[k] = v end
+        return new_pencil(opts)
+    end
+
+    it("doesn't treat other MuPDF formats as PDFs", function()
+        local p = xps_pencil()
+        assert.is_false(p:isPdfDocument())
+        p:saveCurrentPageToPdf()
+        assert.equals("Saving annotations to the file is only supported for PDF documents.", shown[1].text)
+    end)
+
+    it("never walks a non-PDF page when a highlight is erased", function()
+        local item = { page = 1, drawer = "lighten", pboxes = { { x = 1, y = 2, w = 3, h = 4 } } }
+        local annotation = { annotations = { item } }
+        local p = xps_pencil({
+            annotation = annotation,
+            highlight = { deleteHighlight = function() table.remove(annotation.annotations, 1) end },
+        })
+        p.findHighlightAtScreenPos = function() return 1 end
+        assert.is_true(p:eraseHighlightAtScreenPos(5, 5))
+        assert.equals(0, p.ui.document.opens)
+    end)
+
+    it("records no page coordinates outside an exportable PDF", function()
+        local s = draw(xps_pencil(), 1, { { x = 1, y = 1 } })
+        assert.is_nil(s.page_points)
+    end)
+end)
+
+describe("PDF export: failed MuPDF setters (real main.lua)", function()
+    after_each(function() W.failing = {} end)
+
+    for _, setter in ipairs({ "ink_list", "color", "border_width", "opacity", "contents", "update" }) do
+        it("keeps the stroke as overlay ink when " .. setter .. " fails", function()
+            W.failing[setter] = true
+            local p, doc = new_pencil()
+            local s = draw(p, 1, { { x = 1, y = 1 } })
+            assert.equals(0, p:autoSaveInkToPdf())
+            assert.is_nil(s.staged)
+            assert.is_nil(s.annot_id)
+            assert.equals(0, #doc.page(1).annots)  -- the half-built one is gone
+        end)
+    end
+end)
+
+describe("PDF export: reflow (real main.lua)", function()
+    it("doesn't record page coordinates for ink drawn while reflowed", function()
+        local doc = new_doc({ reflow = true })
+        local p = new_pencil({ doc = doc })
+        local s = draw(p, 1, { { x = 1, y = 1 } })
+        assert.is_false(s.page_points)
+        -- Not later either, once reflow is off.
+        doc.configurable.text_wrap = 0
+        assert.is_false(p:capturePagePoints(s))
+        assert.equals(0, p:autoSaveInkToPdf())
+    end)
+
+    it("remembers that through the sidecar", function()
+        local p = new_pencil({ doc = new_doc({ reflow = true }) })
+        local s = draw(p, 1, { { x = 1, y = 1 } })
+        local back = p:strokeFromSaved(p:strokeToSaveable(s))
+        assert.is_false(back.page_points)
+    end)
+
+    it("waits to backfill an older stroke until reflow is off", function()
+        local doc = new_doc({ reflow = true })
+        local p = new_pencil({ doc = doc })
+        local legacy = { page = 1, points = { { x = 1, y = 1 } } }
+        assert.is_false(p:capturePagePoints(legacy))
+        assert.is_nil(legacy.page_points)
+        doc.configurable.text_wrap = 0
+        assert.is_true(p:capturePagePoints(legacy))
+    end)
+end)
+
+describe("PDF export: batched per page (real main.lua)", function()
+    it("opens each page once and resets the tile cache once", function()
+        local p, doc = new_pencil()
+        for i = 1, 3 do draw(p, 1, { { x = i, y = i } }) end
+        p.view = single_page_view(2, 1, 0)
+        p.ui.view = p.view
+        for i = 1, 2 do draw(p, 2, { { x = i, y = i } }) end
+        assert.equals(5, p:autoSaveInkToPdf())
+        assert.equals(2, doc.opens)
+        assert.equals(1, doc.tile_resets)
+        assert.equals(3, #ink_tags(doc, 1))
+        assert.equals(2, #ink_tags(doc, 2))
+    end)
+end)
+
+describe("PDF export: multi-page highlights (real main.lua)", function()
+    local function spanning_highlight()
+        return {
+            page = 1, drawer = "lighten", pos0 = { page = 1 }, pos1 = { page = 2 },
+            ext = {
+                [1] = { pboxes = { { x = 1, y = 2, w = 3, h = 4 } } },
+                [2] = { pboxes = { { x = 5, y = 6, w = 7, h = 8 } } },
+            },
+        }
+    end
+
+    it("saves the part on the current page and keeps MuPDF's adjusted boxes", function()
+        local item = spanning_highlight()
+        local p, doc = new_pencil({ annotation = { annotations = { item } } })
+        p.getCurrentPage = function() return 2 end
+        p:saveCurrentPageToPdf()
+        assert.equals(1, #doc.saved_parts)
+        assert.equals(2, doc.saved_parts[1].page)
+        assert.is_true(item.ext[2].pboxes[1].adjusted)
+        assert.is_nil(item.ext[1].pboxes[1].adjusted)
+    end)
+
+    it("erases the highlight's copy on every page it spans", function()
+        local item = spanning_highlight()
+        local annotation = { annotations = { item } }
+        local p, doc = new_pencil({
+            annotation = annotation,
+            highlight = { deleteHighlight = function() table.remove(annotation.annotations, 1) end },
+        })
+        for pg = 1, 2 do
+            table.insert(doc.page(pg).annots, { page = doc.page(pg), type = PDF_ANNOT_HIGHLIGHT })
+        end
+        p.findHighlightAtScreenPos = function() return 1 end
+        assert.is_true(p:eraseHighlightAtScreenPos(5, 5))
+        assert.equals(0, #doc.page(1).annots)
+        assert.equals(0, #doc.page(2).annots)
     end)
 end)

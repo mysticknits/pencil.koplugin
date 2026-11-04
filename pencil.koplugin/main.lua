@@ -45,28 +45,24 @@ local TOOL_PEN = "pen"
 local TOOL_HIGHLIGHTER = "highlighter"
 local TOOL_ERASER = "eraser"
 
+-- Forward declaration; defined with the PDF export code below.
+local highlightPartOnPage
+
 -- Native PDF ink-annotation support (issue #63).
 --
 -- We call koreader-base's MuPDF wrapper directly, so this feature patches NO
 -- core KOReader files. Everything we need comes from require("ffi/mupdf"):
 -- koreader-base exports the ink setters as of koreader/koreader-base#2444,
--- shipped in KOReader 2026.07. The local cdefs below are a fallback for builds
--- whose stock ffi/mupdf_h.lua predates that -- on 2026.07+ ffi/mupdf declares
--- these symbols first and LuaJIT rejects our (pcall'd) redefinition, which is
--- fine: the stock declarations are the ones we then call.
+-- shipped in KOReader 2026.07.
 --
 -- InkAnnot is nil when the symbols are absent, so on older KOReader builds the
 -- feature degrades gracefully instead of erroring.
 local InkAnnot = (function()
     local ok, ffi = pcall(require, "ffi")
     if not ok then return nil end
-    -- Pulls in fz_point / pdf_annot / pdf_page / PDF_ANNOT_INK and loads the lib.
+    -- Loads mupdf_h.lua, which on 2026.07+ declares the ink setters
+    -- (koreader/koreader-base#2444); the probe below fails on older builds.
     if not pcall(require, "ffi/mupdf") then return nil end
-    pcall(ffi.cdef, [[
-        void *mupdf_pdf_set_annot_ink_list(fz_context *, pdf_annot *, int, const int *, const fz_point *);
-        void *mupdf_pdf_set_annot_border_width(fz_context *, pdf_annot *, float);
-        void *mupdf_pdf_update_annot(fz_context *, pdf_annot *);
-    ]])
     local W_ok, W = pcall(ffi.loadlib, "wrap-mupdf")
     if not W_ok or not W then return nil end
     -- Probe: the symbol resolves lazily and errors if the lib lacks it.
@@ -776,7 +772,7 @@ function Pencil:endRawStroke()
     if self.current_stroke and #self.current_stroke.points >= 1 then
         table.insert(self.strokes, self.current_stroke)
         self:indexStroke(#self.strokes, self.current_stroke.page)
-        self:capturePagePoints(self.current_stroke)
+        self:recordPagePoints(self.current_stroke)
         table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
         self:assignStrokeToGroup(#self.strokes)
         self:scheduleDeferredWork()
@@ -1038,16 +1034,30 @@ function Pencil:eraseHighlightAtScreenPos(screen_x, screen_y)
     return ok
 end
 
--- Delete a text highlight's markup annotation from the PDF, if the file holds
--- one with its exact quad points. Returns true if one was deleted.
+-- Delete a text highlight's markup annotations from the PDF, on every page it
+-- spans, wherever the file holds one with its exact quad points. Only runs on
+-- a writable .pdf (see isPdfDocument: walking a non-PDF page would crash).
+-- Returns the number deleted.
 function Pencil:deleteHighlightFromPdf(item)
-    if not (item and item.page and item.pboxes and #item.pboxes > 0) then return false end
-    if not (InkAnnot and self:isPdfDocument()) then return false end
-    if not self:pdfHasHighlight(item.page, item) then return false end
+    if not (item and self:canExportInk()) then return 0 end
     local doc = self.ui.document
-    if doc:deleteHighlight(item.page, item) ~= nil then return false end  -- not writable
-    doc:resetTileCacheValidity()
-    return true
+    if doc:_checkIfWritable() ~= true then return 0 end
+    local pages = {}
+    if item.ext then
+        for pageno in pairs(item.ext) do pages[#pages + 1] = pageno end
+    elseif item.page then
+        pages[1] = item.page
+    end
+    local deleted = 0
+    for _, pageno in ipairs(pages) do
+        local part = highlightPartOnPage(item, pageno)
+        if part and self:pdfHasHighlight(pageno, part) then
+            doc:deleteHighlight(pageno, part)
+            deleted = deleted + 1
+        end
+    end
+    if deleted > 0 then doc:resetTileCacheValidity() end
+    return deleted
 end
 
 -- Get the path to the plugin's log file
@@ -2801,7 +2811,7 @@ function Pencil:onDrawTap(ges)
 
     table.insert(self.strokes, stroke)
     self:indexStroke(#self.strokes, page)
-    self:capturePagePoints(stroke)
+    self:recordPagePoints(stroke)
     self:saveStrokes()
 
     -- Add to undo stack
@@ -2957,7 +2967,7 @@ function Pencil:onDrawPanRelease(ges)
         -- Finalize the stroke
         table.insert(self.strokes, self.current_stroke)
         self:indexStroke(#self.strokes, self.current_stroke.page)
-        self:capturePagePoints(self.current_stroke)
+        self:recordPagePoints(self.current_stroke)
         self:saveStrokes()
 
         -- Add to undo stack
@@ -3972,11 +3982,24 @@ end
 -- action explains what's missing.
 -- ===================================================================
 
--- True when the open document is a PDF (MuPDF can only write annotations into
--- PDFs; DjVu, CBZ and images are also "paging" documents but aren't writable).
+-- True when the open document is an actual .pdf file. `is_pdf` alone isn't
+-- enough: PdfDocument is the provider for every MuPDF format (XPS, CBZ, FB2,
+-- MOBI, DOCX, ...) and sets it on the class. Walking a non-PDF page as a
+-- pdf_page* reads memory that isn't an annotation list (likely a segfault
+-- pcall can't catch), so everything that touches MuPDF annotations gates on
+-- this. _checkIfWritable() returns nil for anything that isn't a .pdf, and
+-- true/false for a writable or read-only .pdf.
 function Pencil:isPdfDocument()
     local doc = self.ui and self.ui.document
-    return doc ~= nil and doc.is_pdf == true
+    if not (doc and doc.is_pdf == true and doc._checkIfWritable) then return false end
+    return doc:_checkIfWritable() ~= nil
+end
+
+-- True when this document's ink can be exported: a real .pdf on a KOReader
+-- build with the ink setters. Page coordinates are only worth recording then;
+-- for everything else they'd just double what saveStrokes writes per stroke.
+function Pencil:canExportInk()
+    return InkAnnot ~= nil and self:isPdfDocument()
 end
 
 -- Round a page coordinate to 1/100 of a point: far below any visible
@@ -3985,20 +4008,33 @@ local function roundPageCoord(v)
     return math.floor(v * 100 + 0.5) / 100
 end
 
+-- Whether the document is shown reflowed (text_wrap). Then screenToPageTransform
+-- maps to the reflowed page, not the original one, so its coordinates can't be
+-- used for the PDF.
+function Pencil:isReflowed()
+    local doc = self.ui and self.ui.document
+    return doc ~= nil and type(doc.configurable) == "table" and doc.configurable.text_wrap == 1
+end
+
 -- Record a stroke's points in native page coordinates, plus the zoom it was
 -- drawn at. Called when a stroke is committed (its page is the one on screen,
 -- so the live ReaderView transform is the one the stroke was drawn under) and,
 -- for strokes saved before this existed, the first time their page is painted.
 -- Embedding then uses these instead of whatever page happens to be on screen
--- at close, so mixed page sizes, later zoom/pan and scroll mode can't misplace
--- the ink. Every point must map to the stroke's own page; if any doesn't (e.g.
--- the page already changed, or scroll mode put it on a neighbour/off-screen),
--- nothing is recorded and the stroke simply isn't embedded.
+-- at close, so mixed page sizes and later zoom/pan can't misplace the ink.
+-- Every point must map to the stroke's own page; if any doesn't (e.g. scroll
+-- mode put it on a neighbour or off-screen), nothing is recorded and the
+-- stroke isn't embedded.
+-- Nothing is recorded while the document is reflowed (see isReflowed).
 -- transform_fn is injectable for testing. Returns true if points were recorded.
 function Pencil:capturePagePoints(stroke, transform_fn)
     if stroke.page_points then return true end
+    if stroke.page_points == false then return false end
     if not transform_fn then
-        if not (self.ui and self.ui.paging and self.view) then return false end
+        if not (self.ui and self.ui.paging and self.view and self:canExportInk()) then
+            return false
+        end
+        if self:isReflowed() then return false end
         transform_fn = function(pt)
             return self.view:screenToPageTransform({ x = pt.x, y = pt.y })
         end
@@ -4016,6 +4052,18 @@ function Pencil:capturePagePoints(stroke, transform_fn)
     stroke.page_points = points
     stroke.page_zoom = zoom
     return true
+end
+
+-- capturePagePoints for a stroke that has just been drawn. A stroke drawn
+-- while reflowed is marked page_points = false (persisted): its screen
+-- coordinates belong to the reflowed layout, so no later backfill may map
+-- them once reflow is off. It stays overlay ink.
+function Pencil:recordPagePoints(stroke)
+    if self:canExportInk() and self:isReflowed() then
+        stroke.page_points = false
+        return false
+    end
+    return self:capturePagePoints(stroke)
 end
 
 -- A stroke's points in native page coordinates, ready for MuPDF, or nil when
@@ -4081,98 +4129,43 @@ function Pencil:_deleteTaggedInk(ctx, pdf_page, tags)
     return deleted
 end
 
--- Create one native ink annotation on `pageno` from `strokes` (an array of
--- point-lists in native page coordinates) with the given color/width/opacity.
--- Talks to the MuPDF wrapper directly because stock addInkAnnotation doesn't
--- return the annotation handle, so we couldn't tag it for the eraser.
--- Any annotation already carrying opts.annot_id is replaced, so re-staging a
--- stroke whose earlier write did reach the file can't leave a duplicate.
--- Returns true on success, or the _checkIfWritable() reason for a read-only file.
-function Pencil:writeInkAnnotation(pageno, strokes, opts)
-    local doc = self.ui.document
-    local can_write = doc:_checkIfWritable()
-    if can_write ~= true then return can_write end
-
-    local n = #strokes
-    if n == 0 then return true end
+-- Build one tagged ink annotation on an already-open pdf_page from `points`
+-- (native page coordinates). Talks to the MuPDF wrapper directly because
+-- stock addInkAnnotation doesn't return the annotation handle, so we couldn't
+-- tag it for the eraser. Every setter's result is checked, like stock
+-- addMarkupAnnotation does: an annotation missing its ink, tag or /AP would be
+-- invisible or unerasable, so on any failure the half-built annotation is
+-- deleted and false returned (the stroke then stays overlay ink).
+local function buildInkAnnot(ctx, pdf_page, points, opts)
     local ffi = InkAnnot.ffi
     local W = InkAnnot.W
-
-    -- counts[i] = points in stroke i; vertices = flattened fz_point[].
-    local counts = ffi.new("int[?]", n)
-    local total = 0
+    local n = #points
+    local counts = ffi.new("int[1]")
+    counts[0] = n
+    local vertices = ffi.new("fz_point[?]", n)
     for i = 1, n do
-        counts[i - 1] = #strokes[i]
-        total = total + #strokes[i]
+        vertices[i - 1].x = points[i].x
+        vertices[i - 1].y = points[i].y
     end
-    if total == 0 then return true end
-    local vertices = ffi.new("fz_point[?]", total)
-    local k = 0
-    for i = 1, n do
-        for j = 1, #strokes[i] do
-            vertices[k].x = strokes[i][j].x
-            vertices[k].y = strokes[i][j].y
-            k = k + 1
-        end
-    end
+    local color = ffi.new("float[3]")
+    color[0] = opts.color.r / 255
+    color[1] = opts.color.g / 255
+    color[2] = opts.color.b / 255
 
-    doc.is_edited = true
-    local page = doc._document:openPage(pageno)
-    local ctx = page.ctx
-    local pdf_page = ffi.cast("pdf_page*", page.page)
-    if opts.annot_id then
-        self:_deleteTaggedInk(ctx, pdf_page, { [opts.annot_id] = true })
-    end
     local annot = W.mupdf_pdf_create_annot(ctx, pdf_page, InkAnnot.PDF_ANNOT_INK)
-    if annot ~= nil then
-        W.mupdf_pdf_set_annot_ink_list(ctx, annot, n, counts, vertices)
-        local color = ffi.new("float[3]")
-        color[0] = opts.color.r / 255
-        color[1] = opts.color.g / 255
-        color[2] = opts.color.b / 255
-        W.mupdf_pdf_set_annot_color(ctx, annot, 3, color)
-        W.mupdf_pdf_set_annot_border_width(ctx, annot, opts.width or 1.0)
-        W.mupdf_pdf_set_annot_opacity(ctx, annot, opts.opacity or 1.0)
-        -- Tag the annotation (in /Contents) so the eraser, undo and clear can
-        -- find and delete this exact stroke's annotation later.
-        if opts.annot_id then
-            W.mupdf_pdf_set_annot_contents(ctx, annot, opts.annot_id)
-        end
+    if annot == nil then return false end
+    local ok = W.mupdf_pdf_set_annot_ink_list(ctx, annot, 1, counts, vertices)
+        and W.mupdf_pdf_set_annot_color(ctx, annot, 3, color)
+        and W.mupdf_pdf_set_annot_border_width(ctx, annot, opts.width or 1.0)
+        and W.mupdf_pdf_set_annot_opacity(ctx, annot, opts.opacity or 1.0)
+        -- The tag in /Contents is how erase, undo and clear find it later.
+        and W.mupdf_pdf_set_annot_contents(ctx, annot, opts.annot_id)
         -- Synthesize the /Rect and /AP appearance stream, so the annotation
         -- renders in any PDF viewer (not just KOReader's geometry renderer).
-        W.mupdf_pdf_update_annot(ctx, annot)
-    end
-    page:close()
-    if annot ~= nil then self._pdf_dirty = true end
-    doc:resetTileCacheValidity()
-    return annot ~= nil
-end
-
--- Stage one stroke's ink into the in-memory document. The stroke is marked
--- `staged` (in memory only, never persisted) rather than `embedded`: the file
--- isn't written until flushPdfEdits() on close, and the sidecar must not claim
--- the ink is in the file before it is. settleStagedStrokes() promotes it to
--- `embedded` once the write succeeds, or un-stages it so it's retried.
--- Returns true when staged, nil when the stroke can't be embedded (no page
--- coordinates, or MuPDF errored), or the _checkIfWritable() reason.
-function Pencil:stageStrokeInk(stroke)
-    local points = self:strokeToPagePoints(stroke)
-    if not points then return nil end
-    local opts = self:strokeToInkOpts(stroke)
-    opts.annot_id = stroke.annot_id or self:nextAnnotId()
-    local ok, res = pcall(self.writeInkAnnotation, self, stroke.page, { points }, opts)
+        and W.mupdf_pdf_update_annot(ctx, annot)
     if not ok then
-        logger.warn("Pencil: writeInkAnnotation failed:", res)
-        return nil
-    end
-    if res ~= true then return res end
-    -- Keep the tag even if the write later fails: a retry reuses it, and
-    -- writeInkAnnotation replaces any copy that did reach the file.
-    stroke.annot_id = opts.annot_id
-    if not stroke.staged then
-        stroke.staged = true
-        self._staged_strokes = self._staged_strokes or {}
-        table.insert(self._staged_strokes, stroke)
+        W.mupdf_pdf_delete_annot(ctx, pdf_page, annot)
+        return false
     end
     return true
 end
@@ -4180,6 +4173,79 @@ end
 -- Whether a stroke still needs embedding (neither in the file nor staged).
 local function needsEmbedding(stroke)
     return stroke.page ~= nil and not stroke.embedded and not stroke.staged
+end
+
+-- Stage the given strokes' ink into the in-memory document. Staged strokes
+-- are marked `staged` (in memory only, never persisted) rather than
+-- `embedded`: the file isn't written until flushPdfEdits() on close, and the
+-- sidecar must not claim the ink is in the file before it is.
+-- settleStagedStrokes() promotes them to `embedded` once the write succeeds,
+-- or un-stages them so they're retried.
+--
+-- Work is grouped by page: each page is opened once, any earlier copies of
+-- these strokes' own tags are removed in a single walk (so re-staging after a
+-- failed close can't duplicate), all new annotations are built, and the tile
+-- cache is reset once at the end. Strokes without page coordinates, or whose
+-- annotation MuPDF couldn't build, are skipped and stay overlay ink.
+-- Returns the number staged and the _checkIfWritable() reason, if any.
+function Pencil:stageStrokesInk(strokes)
+    if not self:canExportInk() then return 0 end
+    local doc = self.ui.document
+    local can_write = doc:_checkIfWritable()
+    if can_write ~= true then return 0, can_write end
+
+    local by_page, pages = {}, {}
+    for _, stroke in ipairs(strokes) do
+        local points = needsEmbedding(stroke) and self:strokeToPagePoints(stroke)
+        if points then
+            if not by_page[stroke.page] then
+                by_page[stroke.page] = {}
+                pages[#pages + 1] = stroke.page
+            end
+            table.insert(by_page[stroke.page], { stroke = stroke, points = points })
+        end
+    end
+
+    local ffi = InkAnnot.ffi
+    local staged = 0
+    for _, pageno in ipairs(pages) do
+        local entries = by_page[pageno]
+        local old_tags = {}
+        for _, e in ipairs(entries) do
+            if e.stroke.annot_id then old_tags[e.stroke.annot_id] = true end
+        end
+        local page
+        local ok, err = pcall(function()
+            page = doc._document:openPage(pageno)
+            local ctx = page.ctx
+            local pdf_page = ffi.cast("pdf_page*", page.page)
+            self:_deleteTaggedInk(ctx, pdf_page, old_tags)
+            for _, e in ipairs(entries) do
+                local opts = self:strokeToInkOpts(e.stroke)
+                opts.annot_id = e.stroke.annot_id or self:nextAnnotId()
+                if buildInkAnnot(ctx, pdf_page, e.points, opts) then
+                    -- Keep the tag even if the write later fails: a retry
+                    -- reuses it and replaces any copy that did reach the file.
+                    e.stroke.annot_id = opts.annot_id
+                    e.stroke.staged = true
+                    self._staged_strokes = self._staged_strokes or {}
+                    table.insert(self._staged_strokes, e.stroke)
+                    staged = staged + 1
+                else
+                    logger.warn("Pencil: could not build ink annotation on page", pageno)
+                end
+            end
+        end)
+        if page then page:close() end
+        if not ok then logger.warn("Pencil: staging ink failed on page", pageno, err) end
+    end
+
+    if staged > 0 then
+        doc.is_edited = true
+        self._pdf_dirty = true
+        doc:resetTileCacheValidity()
+    end
+    return staged
 end
 
 -- Resolve every stroke staged this session once the close flush has run:
@@ -4196,33 +4262,53 @@ function Pencil:settleStagedStrokes(written)
     self._staged_strokes = nil
 end
 
+-- The part of a KOReader text highlight that lies on `pageno`, shaped the way
+-- PdfDocument:saveHighlight/deleteHighlight expect, or nil. A single-page
+-- highlight is its own part. A multi-page PDF highlight has no top-level
+-- pboxes; each page's boxes live in item.ext[page] (as in
+-- ReaderHighlight:writePdfAnnotation), so we build a part for that page.
+-- `commit` copies MuPDF's adjusted boxes back after a save.
+highlightPartOnPage = function(item, pageno)
+    if not item.drawer then return nil end
+    if item.ext then
+        local ext = item.ext[pageno]
+        if not (ext and ext.pboxes and #ext.pboxes > 0) then return nil end
+        local part = { page = pageno, drawer = item.drawer, color = item.color, pboxes = ext.pboxes }
+        return part, function() ext.pboxes = part.pboxes end
+    end
+    if item.page == pageno and item.pboxes and #item.pboxes > 0 then
+        return item, function() end
+    end
+    return nil
+end
+
 -- Collect this page's KOReader text highlights (text selections made with a
 -- finger or the text-mode highlighter, stored in the sidecar) so they can be
 -- embedded into the PDF as native markup annotations alongside the ink.
+-- Returns a list of { part = <saveHighlight-shaped item>, commit = fn }.
 function Pencil:getPageTextHighlights(pageno)
     local result = {}
     local annotation = self.ui and self.ui.annotation
     if not (annotation and annotation.annotations) then return result end
     for _, item in ipairs(annotation.annotations) do
-        -- A drawable text highlight has page boxes and a drawer style.
-        if item.pboxes and #item.pboxes > 0 and item.drawer and item.page == pageno then
-            result[#result + 1] = item
-        end
+        local part, commit = highlightPartOnPage(item, pageno)
+        if part then result[#result + 1] = { part = part, commit = commit } end
     end
     return result
 end
 
 -- Whether the PDF page already holds a markup annotation with this
--- highlight's exact quad points (the same match KOReader's deleteHighlight
--- uses), so re-running the manual save never stacks duplicates.
-function Pencil:pdfHasHighlight(pageno, item)
+-- highlight part's exact quad points (the same match KOReader's
+-- deleteHighlight uses), so re-running the manual save never stacks
+-- duplicates. Callers must have checked canExportInk().
+function Pencil:pdfHasHighlight(pageno, part)
     local ffi = InkAnnot.ffi
-    local n = #item.pboxes
+    local n = #part.pboxes
     -- pboxes {x,y,w,h} -> fz_quad[], same mapping as KOReader's
     -- _quadpointsFromPboxes (which isn't exported).
     local quads = ffi.new("fz_quad[?]", n)
     for i = 1, n do
-        local b = item.pboxes[i]
+        local b = part.pboxes[i]
         local q = quads[i - 1]
         q.ll.x = b.x;             q.ll.y = b.y + b.h - 1
         q.lr.x = b.x + b.w - 1;   q.lr.y = b.y + b.h - 1
@@ -4237,30 +4323,30 @@ end
 
 -- Write this page's text highlights into the PDF with KOReader's own
 -- saveHighlight (same quads, type, colour and /AP as "write highlights into
--- PDF", and it stores MuPDF's adjusted quads back on the item so
--- deleteHighlight can find the annotation later). Skipped entirely when
--- KOReader's "write highlights into PDF" is on, since it has already written
--- them; highlights already present in the file are skipped too.
+-- PDF", and it stores MuPDF's adjusted quads back so deleteHighlight can find
+-- the annotation later). Highlights already present in the file are skipped.
 -- Returns the number written and the _checkIfWritable() reason, if any.
 function Pencil:saveTextHighlightsToPdf(pageno, highlights)
+    if #highlights == 0 or not self:canExportInk() then return 0 end
     local doc = self.ui.document
-    local saved, writable_fail = 0, nil
-    for _, item in ipairs(highlights) do
+    local can_write = doc:_checkIfWritable()
+    if can_write ~= true then return 0, can_write end
+    local saved = 0
+    for _, h in ipairs(highlights) do
         local ok, res = pcall(function()
-            if self:pdfHasHighlight(pageno, item) then return false end
-            return doc:saveHighlight(pageno, item)
+            if self:pdfHasHighlight(pageno, h.part) then return false end
+            return doc:saveHighlight(pageno, h.part)
         end)
         if not ok then
             logger.warn("Pencil: saveHighlight failed:", res)
         elseif res == nil then
             -- PdfDocument:saveHighlight returns nothing on success.
+            h.commit()
             saved = saved + 1
-        elseif res ~= false then
-            writable_fail = res
         end
     end
     if saved > 0 then self._pdf_dirty = true end
-    return saved, writable_fail
+    return saved
 end
 
 -- Persist the plugin's in-memory PDF edits (ink/highlights created or deleted
@@ -4272,6 +4358,15 @@ end
 -- stacked incremental saves corrupt the xref (MuPDF: "cannot find object").
 -- That single write also captures any in-memory highlight edits KOReader made
 -- (e.g. via "write highlights into PDF"), so nothing is lost.
+--
+-- We write here, rather than leaving it to PdfDocument:close, because settling
+-- the staged strokes needs the write's result before the sidecar is saved,
+-- and KOReader's own write only happens after our CloseDocument handler. Two
+-- side effects of doing it ourselves:
+--   * this write skips PdfDocument:close's DocumentRegistry reference-count
+--     check (KOReader only writes when it holds the last reference);
+--   * anything that edits the document after our CloseDocument handler runs
+--     is not written, since is_edited is already cleared.
 -- Returns true if a write happened.
 function Pencil:flushPdfEdits()
     if not self._pdf_dirty then return false end
@@ -4327,18 +4422,8 @@ function Pencil:saveCurrentPageToPdf()
         return
     end
 
-    local saved_ink = 0
-    local writable_fail = nil
-
     -- Pencil strokes -> ink annotations (one per stroke, keeping color/width).
-    for _, stroke in ipairs(strokes) do
-        local res = self:stageStrokeInk(stroke)
-        if res == true then
-            saved_ink = saved_ink + 1
-        elseif res ~= nil then
-            writable_fail = res  -- read-only file
-        end
-    end
+    local saved_ink, writable_fail = self:stageStrokesInk(strokes)
 
     -- Text highlights -> native markup annotations (with appearance streams).
     local saved_hl, hl_fail = self:saveTextHighlightsToPdf(page, highlights)
@@ -4519,19 +4604,7 @@ end
 -- copy from the sidecar, which would double a baked-in /Highlight); those stay
 -- on the manual per-page action. Returns the number of strokes staged.
 function Pencil:autoSaveInkToPdf()
-    if not (InkAnnot and self:isPdfDocument()) then return 0 end
-
-    local doc = self.ui.document
-    if not (doc._checkIfWritable and doc:_checkIfWritable() == true) then
-        return 0
-    end
-
-    local staged = 0
-    for _, stroke in ipairs(self.strokes) do
-        if needsEmbedding(stroke) and self:stageStrokeInk(stroke) == true then
-            staged = staged + 1
-        end
-    end
+    local staged = self:stageStrokesInk(self.strokes)
     if staged > 0 then
         logger.info("Pencil: staged", staged, "stroke(s) for embedding on close")
     end
@@ -4812,7 +4885,8 @@ function Pencil:paintTo(bb, x, y)
                 -- them now, under the same transform the overlay is drawn
                 -- with. Tried once per session so a stroke that can't be
                 -- mapped doesn't cost a transform on every repaint.
-                if not stroke.page_points and not stroke._page_points_tried then
+                if stroke.page_points == nil and not stroke._page_points_tried
+                        and not self:isReflowed() then
                     stroke._page_points_tried = true
                     self:capturePagePoints(stroke)
                 end
@@ -5010,6 +5084,20 @@ function Pencil:loadStrokes()
 end
 
 -- Convert stroke for saving (remove non-serializable values)
+-- Sidecar form of stroke.page_points: a packed string, false for a stroke
+-- drawn while reflowed (never to be mapped, see recordPagePoints), or nil.
+local function packPagePoints(points)
+    if points == false then return false end
+    if points and #points > 0 then return PencilGeometry.packPoints(points) end
+    return nil
+end
+
+local function unpackPagePoints(pp)
+    if pp == false then return false end
+    if type(pp) == "string" and pp ~= "" then return PencilGeometry.unpackPoints(pp) end
+    return nil
+end
+
 function Pencil:strokeToSaveable(stroke)
     return {
         page = stroke.page,
@@ -5025,7 +5113,7 @@ function Pencil:strokeToSaveable(stroke)
         -- the zoom they were drawn at, so embedding doesn't depend on the
         -- page on screen at close. `embedded` is only set once the ink has
         -- actually been written to the file (never while merely staged).
-        pp = stroke.page_points and PencilGeometry.packPoints(stroke.page_points) or nil,
+        pp = packPagePoints(stroke.page_points),
         pz = stroke.page_zoom,
         embedded = stroke.embedded,
         annot_id = stroke.annot_id,      -- tag of its PDF annotation (for the eraser)
@@ -5067,7 +5155,7 @@ function Pencil:strokeFromSaved(saved)
         alpha = saved.alpha or tool_settings.alpha,
         datetime = saved.datetime,
         points = points,
-        page_points = (saved.pp and saved.pp ~= "") and PencilGeometry.unpackPoints(saved.pp) or nil,
+        page_points = unpackPagePoints(saved.pp),
         page_zoom = saved.pz,
         embedded = saved.embedded,
         annot_id = saved.annot_id,
@@ -5159,7 +5247,7 @@ function Pencil:onCloseDocument()
         logger.info("Pencil: saving in-progress stroke before close")
         table.insert(self.strokes, self.current_stroke)
         self:indexStroke(#self.strokes, self.current_stroke.page)
-        self:capturePagePoints(self.current_stroke)
+        self:recordPagePoints(self.current_stroke)
         self.current_stroke = nil
     end
 
@@ -5283,7 +5371,9 @@ function Pencil:onPageUpdate(pageno)
         self:cancelPendingSave()
         table.insert(self.strokes, self.current_stroke)
         self:indexStroke(#self.strokes, self.current_stroke.page)
-        self:capturePagePoints(self.current_stroke)
+        -- No capturePagePoints here: the view has already moved, so the live
+        -- transform no longer matches where the stroke was drawn. Its page
+        -- coordinates are recorded when its page is next painted.
         table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
         self:flushDirtyGroups()
         self:saveStrokes()
@@ -5308,7 +5398,9 @@ function Pencil:onUpdatePos()
         self:cancelPendingSave()
         table.insert(self.strokes, self.current_stroke)
         self:indexStroke(#self.strokes, self.current_stroke.page)
-        self:capturePagePoints(self.current_stroke)
+        -- No capturePagePoints here: the view has already moved, so the live
+        -- transform no longer matches where the stroke was drawn. Its page
+        -- coordinates are recorded when its page is next painted.
         table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
         self:flushDirtyGroups()
         self:saveStrokes()

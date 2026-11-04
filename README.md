@@ -125,7 +125,8 @@ plugin. **PDF documents only.**
 
 **To use, two ways:**
 - **Manual, this page:** Pencil menu > Experimental > Save annotations to PDF (this page).
-  Adds the current page's pencil strokes **and** text highlights. Highlights already in the
+  Adds the current page's pencil strokes **and** text highlights (including the part of a
+  multi-page highlight that is on this page). Highlights already in the
   file are skipped, and when KOReader's "Write highlights into PDF" is on they're left to
   KOReader entirely.
 - **Automatic on close:** Pencil menu > Experimental > *Auto-save pencil ink to PDF on close*.
@@ -148,7 +149,9 @@ all highlights into PDF file"** in that same menu to push highlights you've alre
 - **Placement.** Each stroke remembers where it sits on its page when you draw it, so
   embedding is correct on every page, including PDFs with mixed page sizes and when you zoom
   or pan between drawing and closing. Strokes drawn with an older version of the plugin learn
-  their page position the first time their page is shown.
+  their page position the first time their page is shown. Ink drawn while the page is
+  **reflowed** stays plugin-drawn only and isn't embedded, because reflowed coordinates don't
+  match the original page.
 - **Embedded strokes are drawn by the PDF, not the overlay.** Once a stroke is in the PDF,
   the plugin stops drawing its own copy. The PDF's baked-in ink is what you see (and it
   rotates correctly).
