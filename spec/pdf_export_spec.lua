@@ -46,6 +46,7 @@ function W.mupdf_pdf_annot_type(_, annot) return annot.type end
 function W.mupdf_pdf_annot_contents(_, annot) return annot.contents end
 function W.mupdf_pdf_delete_annot(_, page, annot)
     table.remove(page.annots, annot_index(annot))
+    return true
 end
 function W.mupdf_pdf_create_annot(_, page, annot_type)
     local annot = { page = page, type = annot_type }
@@ -172,6 +173,9 @@ local function new_doc(opts)
                 ctx = {},
                 page = p,
                 close = function() end,
+                deleteAnnotation = function(self, annot)
+                    W.mupdf_pdf_delete_annot(self.ctx, p, annot)
+                end,
                 getMarkupAnnotation = function()
                     for _, a in ipairs(p.annots) do
                         if a.type == PDF_ANNOT_HIGHLIGHT then return a end
@@ -263,9 +267,9 @@ local function new_pencil(opts)
         -- (truthy) stub, so state the plugin reads lazily is set explicitly.
         _annot_seq = 0,
         _pdf_dirty = false,
-        _staged_strokes = false,
         input_debug_mode = false,
         pending_ink_deletes = {},
+        _unapplied_ink_deletes = false,
         current_stroke = false,
         eraser_deleted = false,
         eraser_button_deleted = false,
@@ -566,14 +570,33 @@ describe("PDF export: manual save (real main.lua)", function()
     end)
 end)
 
+-- A deletion queued by a session that ended before its close write, as
+-- loadStrokes would restore it.
+local function leftover(p, tag, page)
+    p.pending_ink_deletes[tag] = page
+    p._unapplied_ink_deletes = p._unapplied_ink_deletes or {}
+    p._unapplied_ink_deletes[tag] = page
+end
+
 describe("PDF export: deletions survive a crash (real main.lua)", function()
+    it("doesn't revisit pages this session already cleaned when closing", function()
+        local p, doc = new_pencil()
+        local s = draw(p, 1, { { x = 1, y = 1 } }, { embedded = true, annot_id = "kop-ink-mine" })
+        add_ink(doc, 1, "kop-ink-mine")
+        table.remove(p.strokes, 1)
+        p:commitErase({ s })
+        local opens = doc.opens
+        p:onCloseDocument()
+        assert.equals(opens, doc.opens)
+    end)
+
     it("queues an erased stroke's tag until the close write", function()
         local p, doc = new_pencil()
         local s = draw(p, 1, { { x = 1, y = 1 } }, { embedded = true, annot_id = "kop-ink-mine" })
         add_ink(doc, 1, "kop-ink-mine")
         table.remove(p.strokes, 1)
         p:commitErase({ s })
-        assert.same({ { page = 1, tag = "kop-ink-mine" } }, p.pending_ink_deletes)
+        assert.same({ ["kop-ink-mine"] = 1 }, p.pending_ink_deletes)
         p:onCloseDocument()
         assert.equals(1, doc.writes)
         assert.same({}, p.pending_ink_deletes)
@@ -584,7 +607,7 @@ describe("PDF export: deletions survive a crash (real main.lua)", function()
         add_ink(doc, 1, "kop-ink-erased-before-crash")
         add_ink(doc, 1, "kop-ink-from-device-a")
         local p = new_pencil({ doc = doc })
-        p.pending_ink_deletes = { { page = 1, tag = "kop-ink-erased-before-crash" } }
+        leftover(p, "kop-ink-erased-before-crash", 1)
         assert.equals(1, p:applyPendingInkDeletes())
         assert.same({ "kop-ink-from-device-a" }, ink_tags(doc, 1))
         p:onCloseDocument()
@@ -596,21 +619,21 @@ describe("PDF export: deletions survive a crash (real main.lua)", function()
         local doc = new_doc({ write_fails = true })
         add_ink(doc, 1, "kop-ink-x")
         local p = new_pencil({ doc = doc })
-        p.pending_ink_deletes = { { page = 1, tag = "kop-ink-x" } }
+        leftover(p, "kop-ink-x", 1)
         p:onCloseDocument()
-        assert.equals(1, #p.pending_ink_deletes)
+        assert.same({ ["kop-ink-x"] = 1 }, p.pending_ink_deletes)
     end)
 
     it("keeps the queue when the file can't be written at all", function()
         local p = new_pencil({ doc = new_doc({ read_only = true }) })
-        p.pending_ink_deletes = { { page = 1, tag = "kop-ink-x" } }
+        leftover(p, "kop-ink-x", 1)
         p:onCloseDocument()
-        assert.equals(1, #p.pending_ink_deletes)
+        assert.same({ ["kop-ink-x"] = 1 }, p.pending_ink_deletes)
     end)
 
     it("clears a queued tag that is no longer in the file", function()
         local p, doc = new_pencil()
-        p.pending_ink_deletes = { { page = 1, tag = "kop-ink-gone" } }
+        leftover(p, "kop-ink-gone", 1)
         p:onCloseDocument()
         assert.equals(0, doc.writes)
         assert.same({}, p.pending_ink_deletes)
@@ -624,7 +647,7 @@ describe("PDF export: deletions survive a crash (real main.lua)", function()
         p.strokes_file_too_new = false
         p.strokes_loaded = true
         draw(p, 1, { { x = 1, y = 1 } })
-        p.pending_ink_deletes = { { page = 2, tag = "kop-ink-a" } }
+        p.pending_ink_deletes = { ["kop-ink-a"] = 2 }
         -- saveStrokes requires these at call time, after the stub loader is gone.
         local real_util, real_dump = package.loaded["util"], package.loaded["dump"]
         package.loaded["util"] = { makePath = function() return true end }
@@ -636,7 +659,9 @@ describe("PDF export: deletions survive a crash (real main.lua)", function()
         q.strokes_file_too_new = false
         q:loadStrokes()
         os.remove(path)
-        assert.same({ { page = 2, tag = "kop-ink-a" } }, q.pending_ink_deletes)
+        assert.same({ ["kop-ink-a"] = 2 }, q.pending_ink_deletes)
+        -- Loaded deletions haven't been applied to this session's document yet.
+        assert.same({ ["kop-ink-a"] = 2 }, q._unapplied_ink_deletes)
         assert.equals(1, #q.strokes)
     end)
 
@@ -794,15 +819,36 @@ describe("PDF export: multi-page highlights (real main.lua)", function()
         }
     end
 
+    -- Mirrors ReaderHighlight:getSavedExtendedHighlightPage.
+    local function stock_highlight(extra)
+        local rh = {
+            view = { highlight = { saved_color = "yellow" } },
+            getSavedExtendedHighlightPage = function(self, highlight, page)
+                return {
+                    drawer = highlight.drawer,
+                    color = highlight.color or self.view.highlight.saved_color,
+                    page = highlight.page,
+                    pos0 = highlight.ext[page].pos0,
+                    pos1 = highlight.ext[page].pos1,
+                    pboxes = highlight.ext[page].pboxes,
+                }
+            end,
+        }
+        for k, v in pairs(extra or {}) do rh[k] = v end
+        return rh
+    end
+
     it("saves the part on the current page and keeps MuPDF's adjusted boxes", function()
         local item = spanning_highlight()
-        local p, doc = new_pencil({ annotation = { annotations = { item } } })
+        local p, doc = new_pencil({ annotation = { annotations = { item } }, highlight = stock_highlight() })
         p.getCurrentPage = function() return 2 end
         p:saveCurrentPageToPdf()
         assert.equals(1, #doc.saved_parts)
         assert.equals(2, doc.saved_parts[1].page)
         assert.is_true(item.ext[2].pboxes[1].adjusted)
         assert.is_nil(item.ext[1].pboxes[1].adjusted)
+        -- KOReader's saved highlight colour, not MuPDF's default.
+        assert.equals("yellow", doc.saved_parts[1].item.color)
     end)
 
     it("erases the highlight's copy on every page it spans", function()
@@ -810,7 +856,7 @@ describe("PDF export: multi-page highlights (real main.lua)", function()
         local annotation = { annotations = { item } }
         local p, doc = new_pencil({
             annotation = annotation,
-            highlight = { deleteHighlight = function() table.remove(annotation.annotations, 1) end },
+            highlight = stock_highlight({ deleteHighlight = function() table.remove(annotation.annotations, 1) end }),
         })
         for pg = 1, 2 do
             table.insert(doc.page(pg).annots, { page = doc.page(pg), type = PDF_ANNOT_HIGHLIGHT })
