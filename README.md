@@ -9,7 +9,7 @@
 This has been tested on:
 
 - Kobo Libra Colour/Kobo Stylus 2/Epub format
-- Android (experimental): Boox Note Max, KOReader nightly 2026.07.2-280, Boox pen, EPUB in portrait, PDF in portrait and landscape. See [Installing on Android](#installing-on-android) for what works and what doesn't yet.
+- Android (experimental): Boox Note Max, KOReader nightly 2026.07.2-280, Boox pen, EPUB and PDF, portrait and landscape. See [Installing on Android](#installing-on-android) for what works and what doesn't yet.
 
 **Kobo is the supported platform. Android support is experimental; other Android e-readers and tablets with a stylus (Boox, Samsung S Pen, ...) will be listed as people report back.**
 
@@ -61,12 +61,12 @@ Android support is experimental. The plugin's own code is the same on every devi
 
 **Boox unzip quirk.** Boox's built-in file manager flattens the zip when extracting, dropping the `lib/` folder so `geometry.lua` ends up next to `main.lua`. The plugin tolerates that layout, so extracting with the Boox file manager is fine. Any other unzip app keeps the folder structure.
 
-**What works and what doesn't.** Tested so far on a Boox Note Max (13.3", monochrome) with the Boox pen, KOReader nightly 2026.07.2-280, an EPUB in portrait and a PDF in portrait and landscape:
+**What works and what doesn't.** Tested so far on a Boox Note Max (13.3", monochrome) with the Boox pen, KOReader nightly 2026.07.2-280, an EPUB and a PDF, each in portrait and landscape:
 
-- Pen tip draws and strokes are saved and restored, in both orientations on the PDF and in portrait on the EPUB. With the normal refresh the ink shows about a second behind the pen: KOReader draws it in software and every update goes through Android's window compositor and an e-ink waveform. With [Android fast refresh](#android-fast-refresh) on, the timing readout puts each screen update at about 25 ms, so the ink trails the pen by well under a tenth of a second.
+- Pen tip draws and strokes are saved and restored, in both orientations, on both formats. With the normal refresh the ink shows about a second behind the pen: KOReader draws it in software and every update goes through Android's window compositor and an e-ink waveform. With [Android fast refresh](#android-fast-refresh) on, the timing readout puts each screen update at about 25 ms, so the ink trails the pen by well under a tenth of a second.
 - Rotating: strokes written in the other orientation collapse to a badge, as documented above. Seen on the Note Max: once you write something in the new orientation, the badges on that page are dropped and the other orientation's strokes are drawn as-is, in the wrong place, until you rotate back. That comes from the shared paint code, not the Android module, and has not been checked on a Kobo.
 - The stylus side button is invisible to KOReader on the Note Max: the Android input layer passes only the pen and eraser tool types, never button events, and the Boox pen reports the button as neither. So the side-button highlighter and the pen-to-eraser toggle do not work there.
-- Not tested yet: the eraser end (the Boox pen has none, so no pen with one has been tried), EPUB in landscape, colour panels, other devices.
+- Not tested yet: the eraser end (the Boox pen has none, so no pen with one has been tried), colour panels, other devices.
 
 If you try it on another Android device, please report the device, the KOReader version and what you saw in [issue #15](https://github.com/mysticknits/pencil.koplugin/issues/15).
 
