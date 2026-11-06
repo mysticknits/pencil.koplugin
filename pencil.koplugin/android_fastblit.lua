@@ -38,6 +38,10 @@ local M = {}
 M.INTERVAL_PLAIN_MS = 100
 M.INTERVAL_REGION_MS = 40
 
+-- After this many failed strokes in a row the region path stays off
+-- until the option is toggled; below it, the next stroke tries again.
+M.MAX_REGION_FAILURES = 3
+
 -- Counters shown by the timing readout; reset at stroke start.
 M.stats = { refresh_n = 0, blit_n = 0, blit_us = 0, eink_us = 0, cb_n = 0, cb_us = 0 }
 -- How often the region path asks the e-ink controller to repaint:
@@ -151,17 +155,12 @@ function M.setup(plugin)
     M.fast_waveform = not (Device.hasColorScreen and Device:hasColorScreen())
     M.eink_every = plugin.android_eink_every or 1
     M.region_refresh = nil
+    M.region_error = nil
+    M.region_failures = 0
     plugin.refresh_interval_ms = M.INTERVAL_PLAIN_MS
 
     if plugin.experimental_android_fast_refresh then
-        local ok, fn, why = pcall(M.install)
-        if ok and fn then
-            M.region_refresh = fn
-            plugin.refresh_interval_ms = M.INTERVAL_REGION_MS
-            logger.info("Pencil: Android region refresh enabled")
-        else
-            logger.warn("Pencil: Android region refresh unavailable:", tostring(ok and why or fn))
-        end
+        M.enableRegion(plugin)
     end
 
     plugin.stroke_refresh = function(self, x, y, w, h)
@@ -171,7 +170,18 @@ function M.setup(plugin)
             if ok then return end
             logger.warn("Pencil: Android region refresh failed, using plain refresh:", tostring(err))
             M.region_refresh = nil
+            M.region_error = tostring(err)
+            M.region_failures = M.region_failures + 1
             self.refresh_interval_ms = M.INTERVAL_PLAIN_MS
+            if M.region_failures >= M.MAX_REGION_FAILURES then
+                -- Say so: a silent fallback reads as "the pen got slower"
+                -- with no way to tell why. Toggling the option retries.
+                local Notification = require("ui/widget/notification")
+                UIManager:show(Notification:new{
+                    text = _("Android fast refresh stopped, using the normal refresh. Toggle it in Pencil > Experimental to retry."),
+                    timeout = 6,
+                })
+            end
         end
         if M.fast_waveform then
             Screen:refreshFast(x, y, w, h)
@@ -195,7 +205,28 @@ function M.handleSlot(plugin, input, slot)
     return r
 end
 
+-- Install the region path, or record why it is unavailable.
+function M.enableRegion(plugin)
+    local ok, fn, why = pcall(M.install)
+    if ok and fn then
+        M.region_refresh = fn
+        plugin.refresh_interval_ms = M.INTERVAL_REGION_MS
+        logger.info("Pencil: Android region refresh enabled")
+        return true
+    end
+    M.region_error = tostring(ok and why or fn)
+    logger.warn("Pencil: Android region refresh unavailable:", M.region_error)
+    return false
+end
+
 function M.strokeStart(plugin)
+    -- A refresh that threw mid-stroke (a window being rebuilt during a
+    -- rotation, say) need not cost the fast path for the whole session:
+    -- try again on the next stroke, up to MAX_REGION_FAILURES in a row.
+    if plugin.experimental_android_fast_refresh and not M.region_refresh
+            and M.region_failures > 0 and M.region_failures < M.MAX_REGION_FAILURES then
+        M.enableRegion(plugin)
+    end
     if not plugin.show_timing then return end
     local st = M.stats
     st.refresh_n, st.blit_n, st.blit_us, st.eink_us, st.cb_n, st.cb_us = 0, 0, 0, 0, 0, 0
@@ -204,12 +235,18 @@ end
 
 -- Called from endRawStroke() while plugin.current_stroke is still set.
 function M.strokeEnd(plugin)
+    if M.region_refresh and M.region_failures > 0 then
+        -- A whole stroke on the region path after a failure: forgiven.
+        M.region_failures = 0
+        M.region_error = nil
+    end
     if not plugin.show_timing then return end
     local st = M.stats
     local pts = plugin.current_stroke and #plugin.current_stroke.points or 0
     local cb_avg = st.cb_n > 0 and (st.cb_us / st.cb_n / 1000) or 0
     local total_ms = M.timing_t0 and time.to_ms(time.now() - M.timing_t0) or 0
     local path = M.region_refresh and "region" or (M.fast_waveform and "fast" or "ui")
+    if M.region_error then path = path .. " (fallback: " .. M.region_error .. ")" end
     local blit = ""
     if st.blit_n > 0 then
         blit = string.format(" blit %.1fms eink %.1fms x%d eink/%d",
@@ -236,7 +273,7 @@ function M.menuItems(plugin)
     return {
         {
             text = _("Android fast refresh"),
-            help_text = _("While drawing, update only the stroke's rectangle of the screen instead of the whole screen buffer. Cuts pen lag on large panels. Uses KOReader internals that may change between releases; if it fails, Pencil silently falls back to the normal refresh."),
+            help_text = _("While drawing, update only the stroke's rectangle of the screen instead of the whole screen buffer. Cuts pen lag on large panels. Uses KOReader internals that may change between releases; if it fails, Pencil retries on the next stroke and, after three failures in a row, says so and uses the normal refresh until you toggle it again."),
             checked_func = function()
                 return plugin.experimental_android_fast_refresh
             end,

@@ -124,7 +124,7 @@ When enabled, holding the stylus side button while dragging across words creates
 
 ### Android fast refresh
 
-Android only. While drawing, Pencil updates only the stroke's rectangle of the screen instead of copying the whole screen buffer to Android's window on every refresh, which is what makes the ink lag on large panels. It uses KOReader internals that may change between releases, so it is off by default; if it is unavailable or fails, Pencil falls back to the normal refresh on its own. The same submenu lets you choose how often the e-ink controller repaints during a stroke, and has a timing readout that shows after each stroke how long input handling and screen updates took, for lag and rotation bug reports.
+Android only. While drawing, Pencil updates only the stroke's rectangle of the screen instead of copying the whole screen buffer to Android's window on every refresh, which is what makes the ink lag on large panels. It uses KOReader internals that may change between releases, so it is off by default; if it fails mid-session, Pencil retries on the next stroke; after three failures in a row it shows a notice and uses the normal refresh until you toggle the option again, and the timing readout names the reason. The same submenu lets you choose how often the e-ink controller repaints during a stroke, and has a timing readout that shows after each stroke how long input handling and screen updates took, for lag and rotation bug reports.
 
 **To enable:** Pencil menu > Experimental > Android fast refresh
 
