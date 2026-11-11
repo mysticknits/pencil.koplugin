@@ -43,7 +43,6 @@ end
 local function new_plugin(opts)
     return {
         experimental_android_fast_refresh = opts.fast_refresh or false,
-        android_eink_every = opts.eink_every,
         refresh_interval_ms = 16,
         saveSettings = function() end,
         handleStylusSlot = function() return true end,
@@ -147,10 +146,25 @@ describe("android_fastblit", function()
         assert.is_nil(android.region_error)
     end)
 
-    it("keeps the saved e-ink cadence", function()
-        local p = new_plugin({ eink_every = 4 })
+    it("shows the end of a stroke at pen lift, not at the delayed refresh", function()
+        local p = new_plugin({})
         android.setup(p)
-        assert.are.equal(4, android.eink_every)
+        -- What was drawn since the last paced refresh, partly off screen.
+        p.dirty_region = { x = -3.5, y = 150.2, w = 20, h = 80 }
+        android.strokeEnd(p)
+        assert.are.same({ { "fast", 0, 150, 20, 50 } }, calls)
+        assert.is_nil(p.dirty_region)
+    end)
+
+    it("refreshes nothing at pen lift when the stroke is already shown", function()
+        local p = new_plugin({})
+        android.setup(p)
+        android.strokeEnd(p)
+        assert.are.same({}, calls)
+        p.dirty_region = { x = 300, y = 10, w = 5, h = 5 }
+        android.strokeEnd(p)
+        assert.are.same({}, calls)
+        assert.is_nil(p.dirty_region)
     end)
 
     it("passes stylus slots through to the plugin", function()
@@ -168,5 +182,7 @@ describe("android_fastblit", function()
         local items = android.menuItems(p)
         assert.are.equal("Android fast refresh", items[1].text)
         assert.is_false(items[1].checked_func())
+        assert.are.equal("Show drawing timing on screen", items[2].text)
+        assert.are.equal(2, #items)
     end)
 end)

@@ -44,11 +44,6 @@ M.MAX_REGION_FAILURES = 3
 
 -- Counters shown by the timing readout; reset at stroke start.
 M.stats = { refresh_n = 0, blit_n = 0, blit_us = 0, eink_us = 0, cb_n = 0, cb_us = 0 }
--- How often the region path asks the e-ink controller to repaint:
--- 1 = after every window update, N = every Nth, 0 = never while drawing
--- (the plugin's delayed refresh at stroke end still runs).
-M.eink_every = 1
-local eink_counter = 0
 
 -- Builds the region-limited refresh function, or returns nil (with a
 -- reason) when something it needs is missing on this KOReader build.
@@ -130,12 +125,8 @@ function M.install()
         android.lib.ANativeWindow_unlockAndPost(window)
         local t1 = time.now()
 
-        if eink_full and M.eink_every > 0 then
-            eink_counter = eink_counter + 1
-            if eink_counter >= M.eink_every then
-                eink_counter = 0
-                Screen:_updatePartial(fast, delay_fast, x, y, w, h)
-            end
+        if eink_full then
+            Screen:_updatePartial(fast, delay_fast, x, y, w, h)
         end
         local t2 = time.now()
         local st = M.stats
@@ -153,7 +144,6 @@ end
 function M.setup(plugin)
     plugin.android = M
     M.fast_waveform = not (Device.hasColorScreen and Device:hasColorScreen())
-    M.eink_every = plugin.android_eink_every or 1
     M.region_refresh = nil
     M.region_error = nil
     M.region_failures = 0
@@ -235,6 +225,20 @@ end
 
 -- Called from endRawStroke() while plugin.current_stroke is still set.
 function M.strokeEnd(plugin)
+    -- Show what was drawn since the last paced refresh. Without this the
+    -- end of every stroke (up to one interval of ink, most of a short
+    -- stroke) waits for the delayed refresh after writing stops.
+    local r = plugin.dirty_region
+    if r and plugin.stroke_refresh then
+        plugin.dirty_region = nil
+        local rx = math.max(0, math.floor(r.x))
+        local ry = math.max(0, math.floor(r.y))
+        local rw = math.min(Screen:getWidth() - rx, math.ceil(r.w))
+        local rh = math.min(Screen:getHeight() - ry, math.ceil(r.h))
+        if rw > 0 and rh > 0 then
+            plugin:stroke_refresh(rx, ry, rw, rh)
+        end
+    end
     if M.region_refresh and M.region_failures > 0 then
         -- A whole stroke on the region path after a failure: forgiven.
         M.region_failures = 0
@@ -249,8 +253,8 @@ function M.strokeEnd(plugin)
     if M.region_error then path = path .. " (fallback: " .. M.region_error .. ")" end
     local blit = ""
     if st.blit_n > 0 then
-        blit = string.format(" blit %.1fms eink %.1fms x%d eink/%d",
-            st.blit_us / st.blit_n / 1000, st.eink_us / st.blit_n / 1000, st.blit_n, M.eink_every)
+        blit = string.format(" blit %.1fms eink %.1fms x%d",
+            st.blit_us / st.blit_n / 1000, st.eink_us / st.blit_n / 1000, st.blit_n)
     end
     local touch_rot = Screen.getTouchRotation and Screen:getTouchRotation() or -1
     local msg = string.format("%d pts %dms | input %.2fms x%d | %s every %dms x%d%s | rot %d touch %d %dx%d",
@@ -259,12 +263,6 @@ function M.strokeEnd(plugin)
     logger.info("Pencil timing:", msg)
     local Notification = require("ui/widget/notification")
     UIManager:show(Notification:new{ text = msg, timeout = 6 })
-end
-
-local function setEinkEvery(plugin, n)
-    plugin.android_eink_every = n
-    M.eink_every = n
-    plugin:saveSettings()
 end
 
 -- Entries appended to Pencil > Experimental on Android.
@@ -289,22 +287,6 @@ function M.menuItems(plugin)
                     timeout = 3,
                 })
             end,
-        },
-        {
-            text = _("Android: e-ink update while drawing"),
-            help_text = _("With fast refresh on: how often the e-ink controller is asked to repaint during a stroke. Fewer updates can cut lag; the stroke is always fully drawn when the pen lifts."),
-            enabled_func = function() return M.region_refresh ~= nil end,
-            sub_item_table = {
-                { text = _("After every window update"), radio = true,
-                  checked_func = function() return plugin.android_eink_every == 1 end,
-                  callback = function() setEinkEvery(plugin, 1) end },
-                { text = _("Every 4th update"), radio = true,
-                  checked_func = function() return plugin.android_eink_every == 4 end,
-                  callback = function() setEinkEvery(plugin, 4) end },
-                { text = _("Never while drawing (system decides)"), radio = true,
-                  checked_func = function() return plugin.android_eink_every == 0 end,
-                  callback = function() setEinkEvery(plugin, 0) end },
-            },
         },
         {
             text = _("Show drawing timing on screen"),

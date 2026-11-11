@@ -1093,7 +1093,6 @@ function Pencil:loadSettings()
     self.experimental_text_highlight = settings.experimental_text_highlight or false
     -- Android only (see android_fastblit.lua); harmless elsewhere
     self.experimental_android_fast_refresh = settings.experimental_android_fast_refresh or false
-    self.android_eink_every = settings.android_eink_every or 1
     -- Load pen color by name and look up the actual color value
     local color_name = settings.pen_color_name
     if color_name then
@@ -1128,7 +1127,6 @@ function Pencil:saveSettings()
         experimental_color_picker = self.experimental_color_picker,
         experimental_text_highlight = self.experimental_text_highlight,
         experimental_android_fast_refresh = self.experimental_android_fast_refresh,
-        android_eink_every = self.android_eink_every,
         pen_color_name = self.tool_settings[TOOL_PEN].color_name,
         swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
         pen_width = self.tool_settings[TOOL_PEN].width,
