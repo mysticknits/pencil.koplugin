@@ -19,6 +19,10 @@ local scheduled -- tasks passed to UIManager:scheduleIn, run by hand
 
 local function loadPencil()
     local stubbed = {
+        -- Modules the (modular) main.lua also loads
+        "ui/widget/buttondialog", "ui/widget/imageviewer", "ui/widget/multiinputdialog",
+        "ui/widget/textviewer", "ui/widget/textwidget", "ui/widget/notification", "ui/font",
+        "ui/network/manager", "ffi/mupdf", "lib/myscript",
         "ffi/blitbuffer", "ui/widget/container/centercontainer", "datastorage",
         "device", "dispatcher", "ui/widget/container/framecontainer", "ui/geometry",
         "ui/gesturerange", "ui/widget/horizontalgroup", "ui/widget/horizontalspan",
@@ -51,6 +55,8 @@ local function loadPencil()
 end
 
 local Pencil = loadPencil()
+local PencilTool = require("lib/penciltool")
+local make_tool = dofile("spec/helpers/make_tool.lua")
 
 -- Minimal fake of ReaderBookmark + ReaderView: the corner shows when the
 -- current page has a non-highlight bookmark, like KOReader's own lookup.
@@ -76,10 +82,11 @@ local function makePencil(annotations, current_page)
     local pencil = setmetatable({
         ui = ui,
         view = view,
-        undo_stack = {},
+        tool = make_tool(PencilTool),
         experimental_bookmark_sync = true,
         saves = 0,
     }, { __index = Pencil })
+    pencil:initStrokeStore()
     function pencil:saveStrokes() self.saves = self.saves + 1 end
     return pencil
 end
@@ -149,9 +156,9 @@ describe("commitErase", function()
 
         pencil:commitErase(erased)
 
-        assert.equals(1, #pencil.undo_stack)
-        assert.equals("delete", pencil.undo_stack[1].type)
-        assert.equals(erased, pencil.undo_stack[1].strokes)
+        assert.equals(1, #pencil.store.undo_stack)
+        assert.equals("delete", pencil.store.undo_stack[1].type)
+        assert.equals(erased, pencil.store.undo_stack[1].strokes)
         assert.same({ "pencil_b" }, synced)
         assert.is_nil(pencil.dirty_groups)
         assert.is_false(pencil.view.dogear_visible)
@@ -165,7 +172,7 @@ describe("commitErase", function()
         pencil:commitErase({})
         pencil:commitErase(nil)
 
-        assert.equals(0, #pencil.undo_stack)
+        assert.equals(0, #pencil.store.undo_stack)
         assert.equals(0, pencil.saves)
         assert.is_true(pencil.view.dogear_visible)
     end)

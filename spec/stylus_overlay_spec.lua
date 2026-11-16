@@ -16,6 +16,10 @@ end
 
 local function loadPencil()
     local stubbed = {
+        -- Modules the (modular) main.lua also loads
+        "ui/widget/buttondialog", "ui/widget/imageviewer", "ui/widget/multiinputdialog",
+        "ui/widget/textviewer", "ui/widget/textwidget", "ui/widget/notification", "ui/font",
+        "ui/network/manager", "ffi/mupdf", "lib/myscript",
         "ffi/blitbuffer", "ui/widget/container/centercontainer", "datastorage",
         "device", "dispatcher", "ui/widget/container/framecontainer", "ui/geometry",
         "ui/gesturerange", "ui/widget/horizontalgroup", "ui/widget/horizontalspan",
@@ -39,6 +43,8 @@ local function loadPencil()
 end
 
 local Pencil = loadPencil()
+local PencilTool = require("lib/penciltool")
+local make_tool = dofile("spec/helpers/make_tool.lua")
 
 local TOOL_TYPE_PEN = 1
 local TOOL_TYPE_ERASER = 2
@@ -47,7 +53,7 @@ local TOOL_TYPE_ERASER = 2
 -- close by hand.
 local function makePencil()
     local pencil = setmetatable({
-        current_tool = "pen",
+        tool = make_tool(PencilTool),
         overlay = false,
         started = 0,
         points = 0,
@@ -117,9 +123,10 @@ describe("stylus callback and overlays", function()
         down(pencil, 100, 100)
         pencil.overlay = true
 
+        local before = pencil.points  -- the touch-down point itself is recorded
         assert.is_true(down(pencil, 160, 100))
         assert.is_true(down(pencil, 220, 100))
-        assert.equals(0, pencil.points)
+        assert.equals(before, pencil.points)
 
         assert.is_true(lift(pencil, 220, 100))
         assert.equals(1, pencil.ended)

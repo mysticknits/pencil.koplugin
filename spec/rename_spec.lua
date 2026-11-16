@@ -19,6 +19,10 @@ end
 
 local function loadPencil()
     local stubbed = {
+        -- Modules the (modular) main.lua also loads
+        "ui/widget/buttondialog", "ui/widget/imageviewer", "ui/widget/multiinputdialog",
+        "ui/widget/textviewer", "ui/widget/textwidget", "ui/widget/notification", "ui/font",
+        "ui/network/manager", "ffi/mupdf", "lib/myscript",
         "ffi/blitbuffer", "ui/widget/container/centercontainer", "datastorage",
         "device", "dispatcher", "ui/widget/container/framecontainer", "ui/geometry",
         "ui/gesturerange", "ui/widget/horizontalgroup", "ui/widget/horizontalspan",
@@ -43,6 +47,7 @@ local function loadPencil()
 end
 
 local Pencil = loadPencil()
+local PencilStrokes = require("lib/pencilstrokes")
 
 local function write(path, text)
     local f = assert(io.open(path, "w"))
@@ -95,7 +100,7 @@ describe("moving ink after a rename", function()
     it("moves the strokes file and the preview pictures, then removes the old sidecar", function()
         local pencil = makePencil(new_sidecar, old_sidecar .. "/pencil_strokes.lua")
 
-        local path = pencil:migrateStrokesFileIfNeeded()
+        local path = PencilStrokes.migrateFileIfNeeded(pencil.ui.doc_settings)
 
         assert.equals(new_sidecar .. "/pencil_strokes.lua", path)
         assert.equals("return { strokes = {} }", read(path))
@@ -109,7 +114,7 @@ describe("moving ink after a rename", function()
         write(new_sidecar .. "/pencil_images/pencil_b.jpg", "jpeg b")
         local pencil = makePencil(new_sidecar, old_sidecar .. "/pencil_strokes.lua")
 
-        pencil:migrateStrokesFileIfNeeded()
+        PencilStrokes.migrateFileIfNeeded(pencil.ui.doc_settings)
 
         assert.equals("jpeg b", read(new_sidecar .. "/pencil_images/pencil_b.jpg"))
         assert.is_nil(exists(new_sidecar .. "/pencil_images/pencil_a.jpg"))
@@ -121,7 +126,7 @@ describe("moving ink after a rename", function()
         os.execute("rm -rf '" .. old_sidecar .. "/pencil_images'")
         local pencil = makePencil(new_sidecar, old_sidecar .. "/pencil_strokes.lua")
 
-        pencil:migrateStrokesFileIfNeeded()
+        PencilStrokes.migrateFileIfNeeded(pencil.ui.doc_settings)
 
         assert.truthy(read(new_sidecar .. "/pencil_strokes.lua"))
         assert.is_nil(exists(new_sidecar .. "/pencil_images"))
@@ -131,7 +136,7 @@ describe("moving ink after a rename", function()
     it("leaves things alone when the book wasn't renamed", function()
         local pencil = makePencil(old_sidecar, old_sidecar .. "/pencil_strokes.lua")
 
-        local path = pencil:migrateStrokesFileIfNeeded()
+        local path = PencilStrokes.migrateFileIfNeeded(pencil.ui.doc_settings)
 
         assert.equals(old_sidecar .. "/pencil_strokes.lua", path)
         assert.equals("jpeg a", read(old_sidecar .. "/pencil_images/pencil_a.jpg"))

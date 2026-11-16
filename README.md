@@ -33,6 +33,15 @@ Rotating the device is handled: annotations written in the other orientation sho
 - **Per-document storage**: Annotations are saved with each book
 - **Annotation previews**: A picture of each annotation is saved, so it can be shown after rotating the device or from the Bookmarks menu. The Pencil menu shows how much space they use and can clear them for the current book
 - **Input debug mode**: Log raw stylus events to help diagnose detection issues
+- **Redo**: Redo what was undone (also from the hold-still menu below)
+- **Hold-still tool menu**: Hold the pen still on the page to open a menu with Undo, Redo, Lasso and Note (plus colors and widths when those options are on)
+- **Lasso**: Circle strokes to select them, then drag to move them or delete them
+- **Notes**: Write a note on a full-screen canvas from the hold-still menu; tap its marker on the page to reopen it
+- **Highlighter color and opacity**: Choose them in the Pencil menu under Highlighter (the default is the usual light gray)
+- **Ignore touch while writing**: Optionally ignore finger and palm contacts while the pen is near the screen
+- **Handwriting recognition**: Turn annotations into text with MyScript (needs your own MyScript keys, set in the Pencil menu > Handwriting recognition)
+- **Highlight by holding at line end**: Draw a line under text and rest the pen at its end: the ink becomes a native KOReader highlight on the words above (optionally a blue underline instead, see the Experimental menu)
+- **Eraser click switches pen/eraser**: Optional, off by default. See [Eraser click mode](#eraser-click-mode)
 
 ## Instructions for Installation
 
@@ -71,6 +80,14 @@ If you can't update KOReader, use [release 0.5.0](https://github.com/mysticknits
    - **Pencil: select pencil** — switch to pencil
    - **Pencil: select eraser** — switch to eraser
    - **Pencil: undo** — undo last stroke or eraser action
+   - **Pencil: redo** — redo what was undone
+
+### Eraser click mode
+
+By default the eraser end erases whatever it touches, and a quick tap of the side button switches between pencil and eraser. If you prefer the stylus buttons the other way round, tick **Eraser click switches pen/eraser** in the Pencil menu:
+
+- **Eraser end**: a touch that stays put switches between pencil and eraser and erases nothing; dragging erases without changing the tool
+- **Side button**: only highlights; a quick tap does nothing
 
 ## Questions or Issues with the Plugin
 
@@ -95,7 +112,7 @@ When enabled, the picker also shows pen width options (3, 5, 7, 9), rendered as 
 
 ### Text highlight (side button)
 
-When enabled, holding the stylus side button while dragging across words creates a KOReader text highlight, like long-pressing and choosing Highlight. When disabled, the side button draws a freehand highlighter stroke instead.
+When enabled, holding the stylus side button while dragging across words creates a KOReader text highlight, like long-pressing and choosing Highlight. Where there is no text under the pen, a freehand highlighter stroke is drawn instead. When disabled, the side button always draws a freehand highlighter stroke.
 
 **To enable:** Pencil menu > Experimental > Text highlight (side button)
 
@@ -117,10 +134,69 @@ When enabled, the plugin automatically groups your pencil strokes into logical a
 - Your pencil strokes and drawings are not affected — only the bookmarks are removed
 - Annotation groups are still tracked internally, so you won't lose any grouping data if you turn it back on
 
+### Save annotations to PDF
+
+Writes pencil strokes into the PDF file as native ink annotations (`/Subtype /Ink`), so they
+travel with the file and are visible/removable in any PDF reader, not just re-drawn by this
+plugin. **PDF documents only.**
+
+**To use, two ways:**
+- **Manual, this page:** Pencil menu > Experimental > Save annotations to PDF (this page).
+  Adds the current page's pencil strokes **and** text highlights (including the part of a
+  multi-page highlight that is on this page). Highlights already in the
+  file are skipped, and when KOReader's "Write highlights into PDF" is on they're left to
+  KOReader entirely.
+- **Automatic on close:** Pencil menu > Experimental > *Auto-save pencil ink to PDF on close*.
+  When enabled, every pencil stroke you've drawn (across all pages) is written into the PDF
+  when you close the document. Only strokes that aren't already in the file are added, so
+  re-opening never duplicates them.
+
+Either way, the file itself is written **once, when you close the book**. Until then the ink
+is only in the open document, and the plugin doesn't record a stroke as saved until that
+write has succeeded. If KOReader is killed before a clean close, nothing is lost: the strokes
+are still drawn by the plugin and get saved on the next close.
+
+**Text highlights** are handled by KOReader itself, not this plugin's auto-save. KOReader
+draws its own copy of a highlight, so a plugin-embedded one would show doubled. To get text
+highlights into the PDF, enable KOReader's built-in feature: **top menu > Highlights > "Write
+highlights into PDF" > On** (long-press *On* to make it the default for all books). Use **"Write
+all highlights into PDF file"** in that same menu to push highlights you've already made.
+
+**Notes and limitations:**
+- **Placement.** Each stroke remembers where it sits on its page when you draw it, so
+  embedding is correct on every page, including PDFs with mixed page sizes and when you zoom
+  or pan between drawing and closing. Strokes drawn with an older version of the plugin learn
+  their page position the first time their page is shown. Ink drawn while the page is
+  **reflowed** stays plugin-drawn only and isn't embedded, because reflowed coordinates don't
+  match the original page.
+- **Embedded strokes are drawn by the PDF, not the overlay.** Once a stroke is in the PDF,
+  the plugin stops drawing its own copy. The PDF's baked-in ink is what you see (and it
+  rotates correctly).
+- **Erase, undo and clear work on embedded ink.** Erasing an embedded stroke, undoing it, or
+  using Clear page / Clear all removes its annotation from the PDF too (matched via a small tag
+  stored in the annotation's `/Contents`). Undoing an erase or a clear brings the strokes back
+  as normal overlay strokes, which are saved again on the next close. If KOReader stops before
+  the close write, the pending removals are remembered and finished the next time you open
+  the book. Erasing a text highlight also removes the copy the manual action saved into the
+  PDF.
+- **Ink from elsewhere is left alone.** The plugin only ever deletes the annotations of its
+  own strokes. Ink added in other apps, or by Pencil on another device, is never removed.
+- **Requires KOReader 2026.07 or newer.** Writing ink needs MuPDF ink symbols that
+  koreader-base only exports since
+  [koreader-base#2444](https://github.com/koreader/koreader-base/pull/2444), shipped in
+  KOReader 2026.07. Nothing extra to install on those builds, and the plugin patches **no
+  core KOReader files**. On older builds the feature degrades gracefully: the menu item
+  explains what's missing and does nothing to your file.
+
+### Live black preview
+
+When enabled, colored pen strokes are drawn in black while you write, for faster feedback on color screens, and repainted in their color when you stop.
+
+**To enable:** Pencil menu > Experimental > Live black preview
+
 ## Features In the Pipeline
 
-1. Export of annotations
-2. Keeping annotations in place when the font size or margins change
+1. Keeping annotations in place when the font size or margins change
 
 ## Contributing
 
@@ -174,5 +250,7 @@ Every coffee helps keep Pencil growing. And if donating isn't your thing, starri
 ## Acknowledgements
 
 Eraser end detection based on techniques from [eraser.koplugin](https://github.com/SimonLiu423/eraser.koplugin) by SimonLiu.
+
+Lasso, notes, palm rejection, the hold-still menu, native PDF ink export and handwriting recognition come from forks of this plugin; see the commit history for their authors.
 
 xoxo

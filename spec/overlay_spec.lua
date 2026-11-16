@@ -19,6 +19,10 @@ function UIManager:show(widget) table.insert(self.shown, widget) end
 
 local function loadPencil()
     local stubbed = {
+        -- Modules the (modular) main.lua also loads
+        "ui/widget/buttondialog", "ui/widget/imageviewer", "ui/widget/multiinputdialog",
+        "ui/widget/textviewer", "ui/widget/textwidget", "ui/widget/notification", "ui/font",
+        "ui/network/manager", "ffi/mupdf", "lib/myscript",
         "ffi/blitbuffer", "ui/widget/container/centercontainer", "datastorage",
         "device", "dispatcher", "ui/widget/container/framecontainer", "ui/geometry",
         "ui/gesturerange", "ui/widget/horizontalgroup", "ui/widget/horizontalspan",

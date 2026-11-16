@@ -34,6 +34,10 @@ end
 
 local function loadPencil()
     local stubbed = {
+        -- Modules the (modular) main.lua also loads
+        "ui/widget/buttondialog", "ui/widget/imageviewer", "ui/widget/multiinputdialog",
+        "ui/widget/textviewer", "ui/widget/textwidget", "ui/widget/notification", "ui/font",
+        "ui/network/manager", "ffi/mupdf", "lib/myscript",
         "ffi/blitbuffer", "ui/widget/container/centercontainer", "datastorage",
         "device", "dispatcher", "ui/widget/container/framecontainer", "ui/geometry",
         "ui/gesturerange", "ui/widget/horizontalgroup", "ui/widget/horizontalspan",
@@ -73,16 +77,21 @@ local function read(path)
     return text
 end
 
+local PencilTool = require("lib/penciltool")
+local make_tool = dofile("spec/helpers/make_tool.lua")
+
 local function makePencil(sidecar)
     local settings = { values = {}, doc_sidecar_dir = sidecar }
     function settings:readSetting(key) return self.values[key] end
     function settings:saveSetting(key, value) self.values[key] = value end
-    return setmetatable({
+    local p = setmetatable({
         ui = { doc_settings = settings },
+        tool = make_tool(PencilTool),
         available_colors = {},
-        strokes = {},
         annotation_groups = {},
     }, { __index = Pencil })
+    p:initStrokeStore()
+    return p
 end
 
 local GROUP = '{ { id = "g1", page = 1, stroke_indices = { 1 }, bbox = { x0 = 1, y0 = 2, x1 = 3, y1 = 4 } } }'
@@ -105,17 +114,17 @@ describe("pencil_strokes.lua versions", function()
         write(file, 'return { version = 3, annotation_groups = ' .. GROUP .. ', strokes = { { page = 1, tool = "pen", points = { { x = 1, y = 2 }, { x = 3, y = 4 } } } } }')
         local pencil = makePencil(root)
         pencil:loadStrokes()
-        assert.equals(1, #pencil.strokes)
-        assert.equals(2, #pencil.strokes[1].points)
-        assert.equals(3, pencil.strokes[1].points[2].x)
+        assert.equals(1, #pencil.store.strokes)
+        assert.equals(2, #pencil.store.strokes[1].points)
+        assert.equals(3, pencil.store.strokes[1].points[2].x)
     end)
 
     it("loads a v4 file with packed points", function()
         write(file, 'return { version = 4, annotation_groups = ' .. GROUP .. ', strokes = { { page = 1, tool = "pen", p = "1 2 3 4" } } }')
         local pencil = makePencil(root)
         pencil:loadStrokes()
-        assert.equals(1, #pencil.strokes)
-        assert.equals(4, pencil.strokes[1].points[2].y)
+        assert.equals(1, #pencil.store.strokes)
+        assert.equals(4, pencil.store.strokes[1].points[2].y)
     end)
 
     it("leaves a file from a newer Pencil alone and never saves over it", function()
@@ -125,10 +134,10 @@ describe("pencil_strokes.lua versions", function()
 
         pencil:loadStrokes()
         assert.is_true(pencil.strokes_file_too_new)
-        assert.equals(0, #pencil.strokes)
+        assert.equals(0, #pencil.store.strokes)
 
         -- Even with new ink drawn, the file must not be overwritten.
-        table.insert(pencil.strokes, { page = 1, tool = "pen", points = { { x = 5, y = 6 } } })
+        table.insert(pencil.store.strokes, { page = 1, tool = "pen", points = { { x = 5, y = 6 } } })
         pencil:saveStrokes()
         assert.equals(newer, read(file))
     end)

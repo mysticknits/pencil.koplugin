@@ -18,6 +18,10 @@ end
 
 local function loadPencil()
     local stubbed = {
+        -- Modules the (modular) main.lua also loads
+        "ui/widget/buttondialog", "ui/widget/imageviewer", "ui/widget/multiinputdialog",
+        "ui/widget/textviewer", "ui/widget/textwidget", "ui/widget/notification", "ui/font",
+        "ui/network/manager", "ffi/mupdf", "lib/myscript",
         "ffi/blitbuffer", "ui/widget/container/centercontainer", "datastorage",
         "device", "dispatcher", "ui/widget/container/framecontainer", "ui/geometry",
         "ui/gesturerange", "ui/widget/horizontalgroup", "ui/widget/horizontalspan",
@@ -51,15 +55,21 @@ end
 
 local Pencil = loadPencil()
 
+local PencilTool = require("lib/penciltool")
+local make_tool = dofile("spec/helpers/make_tool.lua")
+
 local function makePencil(sidecar, strokes)
     local settings = { values = {}, doc_sidecar_dir = sidecar }
     function settings:saveSetting(key, value) self.values[key] = value end
-    return setmetatable({
+    local p = setmetatable({
         ui = { doc_settings = settings },
-        strokes = strokes,
+        tool = make_tool(PencilTool),
         annotation_groups = {},
-        strokes_loaded = true,
     }, { __index = Pencil })
+    p:initStrokeStore()
+    p.store.strokes = strokes
+    p.store.loaded = true
+    return p
 end
 
 local INK = { { page = 1, tool = "pen", points = { { x = 1, y = 2 } } } }
