@@ -87,7 +87,7 @@ If you can't update KOReader, use [release 0.5.0](https://github.com/mysticknits
 By default the eraser end erases whatever it touches, and a quick tap of the side button switches between pencil and eraser. If you prefer the stylus buttons the other way round, tick **Eraser click switches pen/eraser** in the Pencil menu:
 
 - **Eraser end**: a touch that stays put switches between pencil and eraser and erases nothing; dragging erases without changing the tool
-- **Side button**: only highlights (a KOReader text highlight with the experimental text highlight option, a freehand highlighter stroke where there is no text); a quick tap does nothing
+- **Side button**: only highlights; a quick tap does nothing
 
 ## Questions or Issues with the Plugin
 
@@ -112,7 +112,7 @@ When enabled, the picker also shows pen width options (3, 5, 7, 9), rendered as 
 
 ### Text highlight (side button)
 
-When enabled, holding the stylus side button while dragging across words creates a KOReader text highlight, like long-pressing and choosing Highlight. When disabled, the side button draws a freehand highlighter stroke instead. (With [Eraser click mode](#eraser-click-mode) on, a freehand stroke is also drawn where there is no text under the pen.)
+When enabled, holding the stylus side button while dragging across words creates a KOReader text highlight, like long-pressing and choosing Highlight. Where there is no text under the pen, a freehand highlighter stroke is drawn instead. When disabled, the side button always draws a freehand highlighter stroke.
 
 **To enable:** Pencil menu > Experimental > Text highlight (side button)
 

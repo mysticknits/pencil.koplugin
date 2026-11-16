@@ -146,3 +146,60 @@ describe("stroke capture (real main.lua)", function()
         assert.is_nil(p.dirty_region)
     end)
 end)
+
+describe("freehand highlighter stroke (real main.lua)", function()
+    -- Pixel blending needs a real Blitbuffer; what matters here is which stroke is created.
+    local real_live
+    setup(function()
+        real_live = PencilStrokes.drawLiveHighlighter
+        PencilStrokes.drawLiveHighlighter = function(live) return live or {} end
+    end)
+    teardown(function() PencilStrokes.drawLiveHighlighter = real_live end)
+
+    local function stroke_with(p, tool_type, side_down)
+        -- (the stubbed Blitbuffer has no real colors: give the highlighter the same fake one)
+        p.tool.tool_settings.highlighter.color = {
+            getColor8 = function() return { a = 0 } end,
+            getColorRGB32 = function() return { r = 0xDD, g = 0xDD, b = 0xDD, a = 0xFF } end,
+        }
+        p.side_button_down = side_down or false
+        p:handleStylusSlot(nil, { id = 1, x = 10, y = 10, tool = tool_type })
+        p:handleStylusSlot(nil, { id = 1, x = 60, y = 12, tool = tool_type })
+        p:handleStylusSlot(nil, { id = 1, x = 120, y = 10, tool = tool_type })
+        p:handleStylusSlot(nil, { id = -1, tool = tool_type })
+        return p.store.strokes[1]
+    end
+
+    for _, click_mode in ipairs({ false, true }) do
+        local mode = click_mode and "eraser click mode" or "default mode"
+
+        it("draws with the side button held (" .. mode .. ")", function()
+            local p = new_pencil()
+            p.tool.eraser_click_mode = click_mode
+            local s = stroke_with(p, 1, true)
+            assert.is_not_nil(s)
+            assert.are.equal("highlighter", s.tool)
+        end)
+
+        it("draws when the digitizer reports the highlighter tool type (" .. mode .. ")", function()
+            local p = new_pencil()
+            p.tool.eraser_click_mode = click_mode
+            local s = stroke_with(p, 3, false)
+            assert.is_not_nil(s)
+            assert.are.equal("highlighter", s.tool)
+        end)
+
+        it("draws away from text with the Text highlight option on (" .. mode .. ")", function()
+            local p = new_pencil()
+            p.tool.eraser_click_mode = click_mode
+            p.tool.experimental_text_highlight = true
+            p.startTextHighlight = function() return false end  -- no word below the pen
+            p.extendTextHighlight = function() end
+            p.finishTextHighlight = function() end
+            local s = stroke_with(p, 3, false)
+            -- No word below the pen: a freehand highlighter stroke, in both modes
+            assert.is_not_nil(s)
+            assert.are.equal("highlighter", s.tool)
+        end)
+    end
+end)

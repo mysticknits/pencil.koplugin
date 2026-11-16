@@ -116,7 +116,7 @@ function M.addToMainMenu(self, menu_items)
             },
             {
                 text = _("Eraser click switches pen/eraser"),
-                help_text = _("Off: the eraser erases whatever it touches, and a quick press of the side button switches between pen and eraser. On: a click of the eraser (a touch that stays put) switches between pen and eraser and a drag erases; the side button only highlights, with a freehand highlighter stroke where there is no text to highlight."),
+                help_text = _("Off: the eraser erases whatever it touches, and a quick press of the side button switches between pen and eraser. On: a click of the eraser (a touch that stays put) switches between pen and eraser and a drag erases; the side button only highlights and a quick press of it does nothing."),
                 checked_func = function()
                     return self.tool:isEraserClickMode()
                 end,
@@ -335,7 +335,7 @@ function M.addToMainMenu(self, menu_items)
                     },
                     {
                         text = _("Text highlight (side button)"),
-                        help_text = _("When enabled, holding the stylus side button during a pen drag creates a native KOReader text highlight on the words under the pen, like a long-press \xe2\x86\x92 Highlight. When disabled, the side button draws a highlighter stroke. (With \"Eraser click switches pen/eraser\" on, a highlighter stroke is also drawn where there is no text under the pen.) Off by default because this is a new integration and has edge cases. Requires a stylus that sends BTN_STYLUS2."),
+                        help_text = _("When enabled, holding the stylus side button during a pen drag creates a native KOReader text highlight on the words under the pen, like a long-press \xe2\x86\x92 Highlight. Where there is no text under the pen, a highlighter stroke is drawn instead. When disabled, the side button always draws a highlighter stroke. Off by default because this is a new integration and has edge cases. Requires a stylus that sends BTN_STYLUS2."),
                         checked_func = function()
                             return self.tool:isExperimentalTextHighlight()
                         end,
@@ -344,9 +344,7 @@ function M.addToMainMenu(self, menu_items)
                             self:saveSettings()
                             if self.tool:isExperimentalTextHighlight() then
                                 UIManager:show(InfoMessage:new{
-                                    text = self.tool:isEraserClickMode()
-                                        and _("Text highlight enabled. Hold the side button while dragging the pen across words; away from text it draws a highlighter stroke.")
-                                        or _("Text highlight enabled. Hold the side button while dragging the pen across words."),
+                                    text = _("Text highlight enabled. Hold the side button while dragging the pen across words; away from text it draws a highlighter stroke."),
                                     timeout = 3,
                                 })
                             else

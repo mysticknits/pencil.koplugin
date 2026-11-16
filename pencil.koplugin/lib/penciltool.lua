@@ -303,13 +303,12 @@ end
 --     * eraser end/button: erases whatever it touches or passes over;
 --     * side button: a quick press (nothing drawn while held) switches between
 --       pen and eraser; held, it draws a highlighter stroke, or with the "Text
---       highlight" option highlights the text below the pen (and draws nothing
---       where there is no text);
+--       highlight" option highlights the text below the pen (and draws a
+--       highlighter stroke where there is no text);
 --   on:
 --     * eraser end/button: a click (touch that stays put) switches between pen
 --       and eraser and erases nothing, a drag erases what it passes over;
---     * side button: only highlights (text below the pen, or a freehand
---       highlighter stroke where there is no text); a quick press does nothing.
+--     * side button: only highlights; a quick press does nothing.
 function PencilTool:isEraserClickMode() return self.eraser_click_mode end
 function PencilTool:toggleEraserClickMode()
     self.eraser_click_mode = not self.eraser_click_mode

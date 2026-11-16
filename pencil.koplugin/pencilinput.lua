@@ -327,15 +327,9 @@ function M.routeStylusSlot(self, input, slot)
             self:beginPickerTracking(hx, hy, TOOL_HIGHLIGHTER)
             return true
         end
-        if self.tool:isEraserClickMode() then
-            -- No text below the pen: this contact draws a freehand highlighter
-            -- stroke (handled below, effective tool is the highlighter)
-            self.tool.highlight_freehand = true
-        else
-            -- No word below the pen (yet): nothing is drawn; a word found
-            -- later in the drag starts the highlight then.
-            return true
-        end
+        -- No text below the pen: this contact draws a freehand highlighter
+        -- stroke (handled below, effective tool is the highlighter)
+        self.tool.highlight_freehand = true
     end
 
     if not self:isEnabled() then return false end

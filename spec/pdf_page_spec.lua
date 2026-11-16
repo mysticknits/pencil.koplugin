@@ -231,7 +231,10 @@ describe("PDF page-anchored strokes (real main.lua)", function()
         local p = new_pencil(view)
         draw(p, { { 300, 250 }, { 500, 250 } })
         local saved = PencilStrokes.toSaveable(p.store.strokes[1])
-        assert.are.equal("100.0 100.0 200.0 100.0", saved.pp)
+        -- packed as "x y x y ..." (how a whole number prints, 100 or 100.0, depends on the Lua version)
+        local packed = {}
+        for n in saved.pp:gmatch("%S+") do packed[#packed + 1] = tonumber(n) end
+        assert.are.same({ 100, 100, 200, 100 }, packed)
         local loaded = load_saved(p, saved)
         assert.are.same({ { x = 100, y = 100 }, { x = 200, y = 100 } }, loaded.page_points)
     end)
