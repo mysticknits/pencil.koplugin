@@ -9,8 +9,9 @@
 This has been tested on:
 
 - Kobo Libra Colour/Kobo Stylus 2/Epub format
+- Android (experimental): Boox Note Max, KOReader nightly 2026.07.2-280, Boox pen, EPUB and PDF, portrait and landscape. See [Installing on Android](#installing-on-android) for what works and what doesn't yet.
 
-**This will currently only work on Kobo devices! I will attempt to add other device support by request and at a later date**
+**Kobo is the supported platform. Android support is experimental; other Android e-readers and tablets with a stylus (Boox, Samsung S Pen, ...) will be listed as people report back.**
 
 If you change the font size or margins after writing, your annotations will be WONKY. This is something I will eventually address but for now, get your book set before you start writing.
 
@@ -43,9 +44,34 @@ Rotating the device is handled: annotations written in the other orientation sho
 3. Unzip it. You'll get a `pencil.koplugin` folder.
 4. Copy the `pencil.koplugin` folder into KOReader's `plugins` folder:
    - Kobo: `.adds/koreader/plugins/pencil.koplugin/`
+   - Android: `koreader/plugins/pencil.koplugin/` in the device's shared storage (`/sdcard/koreader/plugins/`). See [Installing on Android](#installing-on-android).
 5. Restart KOReader, then turn Pencil on (see below).
 
 What changed in each version is on the [releases page](https://github.com/mysticknits/pencil.koplugin/releases).
+
+### Installing on Android
+
+Android support is experimental. The plugin's own code is the same on every device; a small Android-only module (`android_fastblit.lua`) loads only there.
+
+**KOReader version.** The stable 2026.07.1 Android build does not tell the plugin whether a touch came from the pen, a finger or the eraser, so Pencil cannot work on it. You need an Android **nightly** from 2026.07.2-280 or later ([build.koreader.rocks/download/nightly](https://build.koreader.rocks/download/nightly/)), which includes [koreader-base#2501](https://github.com/koreader/koreader-base/pull/2501). Check Help > About in KOReader.
+
+**Plugin folder.** KOReader on Android reads user plugins from `koreader/plugins/` in shared storage, which is `/sdcard/koreader/plugins/` on most devices. Copy the `pencil.koplugin` folder there, so you end up with `/sdcard/koreader/plugins/pencil.koplugin/main.lua`.
+
+**Over adb.** With USB or wireless debugging enabled, `./install-android.sh` from a checkout of this repository pushes the plugin folder for you and prints the installed KOReader version first. Pass an adb serial or `host:port` as the only argument if more than one device is connected.
+
+**Boox unzip quirk.** Boox's built-in file manager flattens the zip when extracting, dropping the `lib/` folder so `geometry.lua` ends up next to `main.lua`. The plugin tolerates that layout, so extracting with the Boox file manager is fine. Any other unzip app keeps the folder structure.
+
+**What works and what doesn't.** Tested so far on a Boox Note Max (13.3", monochrome) with the Boox pen, KOReader nightly 2026.07.2-280, an EPUB and a PDF, each in portrait and landscape:
+
+- Pen tip draws and strokes are saved and restored, in both orientations, on both formats. With the normal refresh the ink shows about a second behind the pen: KOReader draws it in software and every update goes through Android's window compositor and an e-ink waveform. With [Android fast refresh](#android-fast-refresh) on, the timing readout puts each screen update at about 25 ms, so the ink trails the pen by well under a tenth of a second.
+- Rotating: strokes written in the other orientation collapse to a badge, as documented above. Seen on the Note Max: once you write something in the new orientation, the badges on that page are dropped and the other orientation's strokes are drawn as-is, in the wrong place, until you rotate back. That comes from the shared paint code, not the Android module, and has not been checked on a Kobo.
+- With Android fast refresh on, whole strokes show as they are written, a little behind the pen. The ink drawn since the last paced update is pushed to the screen when the pen lifts.
+- EPUB and other reflowable books: after rotating and rotating back, ink could show on a different page from the one it was written on, or be missing from its page. Seen on the Note Max. It comes from the shared code, which files strokes under page numbers that KOReader keeps provisional while it re-renders after a rotation; it is not Android-specific and has not been checked on a Kobo. PDFs are not affected.
+- The stylus side button does nothing on the Note Max: KOReader's Android input layer passes only the pen and eraser tool types and never asks Android for the pen's button state. So the side-button highlighter and the pen-to-eraser toggle do not work there.
+- Regular (non-e-ink) tablet screen: a Samsung Galaxy tablet with the S Pen (Android 16, KOReader nightly 2026.07.2-337) was tried with an EPUB, using a development build made of this branch plus fixes that are not in it yet. Ink landed under the pen in portrait and in landscape. Writing was quick with the normal refresh, and Android fast refresh made no visible difference there (not measured). The branch exactly as it stands has not been run on that tablet.
+- Not tested yet: the eraser end (the Boox pen has none, so no pen with one has been tried), colour e-ink panels, a PDF on a regular tablet screen, scroll view, two-column view, split screen, other devices.
+
+If you try it on another Android device, please report the device, the KOReader version and what you saw in [issue #15](https://github.com/mysticknits/pencil.koplugin/issues/15).
 
 ### Trying a pre-release
 
@@ -98,6 +124,12 @@ When enabled, the picker also shows pen width options (3, 5, 7, 9), rendered as 
 When enabled, holding the stylus side button while dragging across words creates a KOReader text highlight, like long-pressing and choosing Highlight. When disabled, the side button draws a freehand highlighter stroke instead.
 
 **To enable:** Pencil menu > Experimental > Text highlight (side button)
+
+### Android fast refresh
+
+Android only, and meant for e-ink screens: on the one regular tablet screen tried, writing was already quick without it. While drawing, Pencil updates only the stroke's rectangle of the screen instead of copying the whole screen buffer to Android's window on every refresh, which is what makes the ink lag on large panels. It uses KOReader internals that may change between releases, so it is off by default; if it fails mid-session, Pencil retries on the next stroke; after three failures in a row it shows a notice and uses the normal refresh until you toggle the option again, and the timing readout names the reason. The same submenu has a timing readout that shows after each stroke how long input handling and screen updates took, for lag and rotation bug reports.
+
+**To enable:** Pencil menu > Experimental > Android fast refresh
 
 ### Bookmark Sync
 
