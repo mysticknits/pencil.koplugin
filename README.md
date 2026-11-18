@@ -68,7 +68,8 @@ Android support is experimental. The plugin's own code is the same on every devi
 - With Android fast refresh on, whole strokes show as they are written, a little behind the pen. The ink drawn since the last paced update is pushed to the screen when the pen lifts.
 - EPUB and other reflowable books: after rotating and rotating back, ink could show on a different page from the one it was written on, or be missing from its page. Seen on the Note Max. It comes from the shared code, which files strokes under page numbers that KOReader keeps provisional while it re-renders after a rotation; it is not Android-specific and has not been checked on a Kobo. PDFs are not affected.
 - The stylus side button does nothing on the Note Max: KOReader's Android input layer passes only the pen and eraser tool types and never asks Android for the pen's button state. So the side-button highlighter and the pen-to-eraser toggle do not work there.
-- Not tested yet: the eraser end (the Boox pen has none, so no pen with one has been tried), colour panels, non-e-ink screens, scroll view, two-column view, split screen, other devices.
+- Regular (non-e-ink) tablet screen: a Samsung Galaxy tablet with the S Pen (Android 16, KOReader nightly 2026.07.2-337) was tried with an EPUB, using a development build made of this branch plus fixes that are not in it yet. Ink landed under the pen in portrait and in landscape. Writing was quick with the normal refresh, and Android fast refresh made no visible difference there (not measured). The branch exactly as it stands has not been run on that tablet.
+- Not tested yet: the eraser end (the Boox pen has none, so no pen with one has been tried), colour e-ink panels, a PDF on a regular tablet screen, scroll view, two-column view, split screen, other devices.
 
 If you try it on another Android device, please report the device, the KOReader version and what you saw in [issue #15](https://github.com/mysticknits/pencil.koplugin/issues/15).
 
@@ -126,7 +127,7 @@ When enabled, holding the stylus side button while dragging across words creates
 
 ### Android fast refresh
 
-Android only. While drawing, Pencil updates only the stroke's rectangle of the screen instead of copying the whole screen buffer to Android's window on every refresh, which is what makes the ink lag on large panels. It uses KOReader internals that may change between releases, so it is off by default; if it fails mid-session, Pencil retries on the next stroke; after three failures in a row it shows a notice and uses the normal refresh until you toggle the option again, and the timing readout names the reason. The same submenu has a timing readout that shows after each stroke how long input handling and screen updates took, for lag and rotation bug reports.
+Android only, and meant for e-ink screens: on the one regular tablet screen tried, writing was already quick without it. While drawing, Pencil updates only the stroke's rectangle of the screen instead of copying the whole screen buffer to Android's window on every refresh, which is what makes the ink lag on large panels. It uses KOReader internals that may change between releases, so it is off by default; if it fails mid-session, Pencil retries on the next stroke; after three failures in a row it shows a notice and uses the normal refresh until you toggle the option again, and the timing readout names the reason. The same submenu has a timing readout that shows after each stroke how long input handling and screen updates took, for lag and rotation bug reports.
 
 **To enable:** Pencil menu > Experimental > Android fast refresh
 
