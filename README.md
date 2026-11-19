@@ -22,10 +22,11 @@ Rotating the device is handled: annotations written in the other orientation sho
 
 ## Features
 
-- **Pen tip**: Draw annotations on your ebooks
-- **Eraser end**: Flip your stylus over to erase strokes instantly. It also removes KOReader text highlights it touches
-- **Highlighter**: Hold the stylus side button and drag to draw a highlighter stroke (or a KOReader text highlight, with the experimental option below); tap the side button to toggle pencil/eraser
-- **Swap Eraser/Highlighter**: Reassign which side button acts as eraser vs. highlighter from the menu
+- **Pen tip**: draws, or erases if the eraser is the selected tool
+- **Eraser end**: with the normal mapping, click it (touch without moving) to switch the pen tip between pen and eraser, or drag it to erase. With **Swap Eraser/Highlighter** enabled, it highlights instead
+- **Side button click**: press and release without dragging to switch the pen tip between pen and eraser. This action is unchanged by **Swap Eraser/Highlighter**
+- **Highlighter** (side button): hold it and drag to highlight the text under the pen; where there is no text under the pen it draws a highlighter stroke instead. Choose its color and opacity in the Pencil menu under **Highlighter**; the stroke is blended into the page, so the text underneath stays readable. With the color picker option on, **hold the highlighter still** (over text or not) to open the same picker box as for the pen: a row of colors and a row of opacities. The text highlight needs the "Text highlight" option; without it the side button always draws the stroke
+- **Swap Eraser/Highlighter**: exchanges only the drag roles: the side button then erases and the eraser end highlights. A side-button click still switches the pen tip between pen and eraser
 - **Undo**: Undo your last stroke or eraser action
 - **Clear strokes**: Clear annotations for the current page or the entire document
 - **Annotation grouping**: Strokes are automatically grouped into logical annotations based on timing and proximity
@@ -64,7 +65,7 @@ If you can't update KOReader, use [release 0.5.0](https://github.com/mysticknits
 ## Configuring the Pencil Plugin
 
 1. Enable the plugin from the Pencil menu (Top menu > More tools > Pencil > Enabled)
-2. If your stylus's side button mapping is reversed, toggle **Swap Eraser and Highlighter** in the Pencil menu
+2. If your stylus's side button mapping is reversed, toggle **Swap Eraser and Highlighter** in the Pencil menu. This swaps the drag roles only; clicking the side button always switches the pen tip between pen and eraser
 3. Optionally map actions to gestures in Gesture Manager:
    - **Pencil: toggle on/off** — enable or disable the plugin
    - **Pencil: toggle pencil/eraser** — switch between tools
