@@ -795,26 +795,103 @@ function Pencil:cancelUnderlineHold()
     end
 end
 
--- Fired after the pen rested UNDERLINE_HOLD_MS: if the stroke so far is a
--- roughly horizontal line under text, turn it into a native underline.
+-- Only horizontal pen strokes can participate in a hold-to-underline group.
+function Pencil:getUnderlineBbox(stroke)
+    if not stroke or stroke.tool ~= TOOL_PEN
+            or not stroke.points or #stroke.points < 2 then return end
+    local bbox = PencilGeometry.computeStrokeBbox(stroke)
+    if not bbox then return end
+    local w, h = bbox.x1 - bbox.x0, bbox.y1 - bbox.y0
+    if w >= UNDERLINE_MIN_LENGTH and h <= w * UNDERLINE_MAX_SLOPE then
+        return bbox
+    end
+end
+
+-- Match the same first eligible group as assignStrokeToGroup, without adding
+-- the live stroke to persistent ink before the native annotation is saved.
+function Pencil:getUnderlineStrokeGroup(stroke, bbox)
+    local lines = { { bbox = bbox } }
+    for _, group in ipairs(self.annotation_groups or {}) do
+        if group.page == stroke.page and group.bbox
+                and math.abs((stroke.datetime or 0)
+                    - (group.datetime_last or group.datetime or 0)) <= GROUP_TIME_THRESHOLD_S
+                and PencilGeometry.bboxDistance(bbox, group.bbox) <= GROUP_SPATIAL_THRESHOLD then
+            -- Never consume stale-rotation ink or a mixed handwriting group.
+            if group.image_rotation ~= nil
+                    and group.image_rotation ~= Screen:getRotationMode() then break end
+            for _, index in ipairs(group.stroke_indices or {}) do
+                local previous = self.strokes[index]
+                local previous_bbox = self:getUnderlineBbox(previous)
+                if not previous_bbox or previous.page ~= stroke.page
+                        or previous.color_name ~= stroke.color_name then
+                    return { { bbox = bbox } }
+                end
+                lines[#lines + 1] = { bbox = previous_bbox, index = index }
+            end
+            break
+        end
+    end
+    -- Screen reading order for the existing left-to-right underline gesture.
+    table.sort(lines, function(a, b)
+        if a.bbox.y0 == b.bbox.y0 then return a.bbox.x0 < b.bbox.x0 end
+        return a.bbox.y0 < b.bbox.y0
+    end)
+    return lines
+end
+
+-- Fired after resting at the final line: save one native text range covering
+-- the group's first through last line, then remove only its gesture ink.
 function Pencil:checkUnderlineHold()
     local stroke = self.current_stroke
     if not (self.pen_down and stroke and not self.highlighting) then return end
-    if stroke.tool ~= TOOL_PEN or #stroke.points < 2 then return end
-    local bbox = PencilGeometry.computeStrokeBbox(stroke)
-    local w, h = bbox.x1 - bbox.x0, bbox.y1 - bbox.y0
-    if w < UNDERLINE_MIN_LENGTH or h > w * UNDERLINE_MAX_SLOPE then return end
-    if not self:underlineTextAbove(bbox) then return end
+    local bbox = self:getUnderlineBbox(stroke)
+    if not bbox then return end
+    local lines = self:getUnderlineStrokeGroup(stroke, bbox)
+    -- Resolve every line before saving; failed text lookup must leave ink intact.
+    for _, line in ipairs(lines) do
+        local start_pos, end_pos = self:getUnderlineTextPositions(line.bbox)
+        if not (start_pos and end_pos) then return end
+        line.start_pos, line.end_pos = start_pos, end_pos
+    end
+    if not self:underlineTextAbove(lines[1].bbox, lines[#lines].bbox,
+            lines[1].start_pos, lines[#lines].end_pos) then return end
 
-    -- The ink was only a gesture: drop it and repaint where it was.
     self.current_stroke = nil
     self.dirty_region = nil
-    self.view:paintTo(Screen.bb, 0, 0)
-    self:paintTo(Screen.bb, 0, 0)
-    local pad = (stroke.width or 3) + 4
-    local sw, sh = Screen:getWidth(), Screen:getHeight()
-    local rx, ry = math.max(0, bbox.x0 - pad), math.max(0, bbox.y0 - pad)
-    Screen:refreshUI(rx, ry, math.min(sw - rx, w + 2 * pad), math.min(sh - ry, h + 2 * pad))
+    self:cancelUnderlineHold()
+    local removed = {}
+    for _, line in ipairs(lines) do
+        if line.index then removed[line.index] = true end
+    end
+    if next(removed) then
+        self:cancelPendingSave()
+        local retained, remap = {}, {}
+        for index, saved_stroke in ipairs(self.strokes) do
+            if not removed[index] then
+                retained[#retained + 1] = saved_stroke
+                remap[index] = #retained
+            end
+        end
+        self.strokes = retained
+        -- Keep undo entries for unrelated ink pointing at their new indices.
+        local undo = {}
+        for _, action in ipairs(self.undo_stack) do
+            if action.type ~= "add" then
+                undo[#undo + 1] = action
+            elseif remap[action.stroke_idx] then
+                action.stroke_idx = remap[action.stroke_idx]
+                undo[#undo + 1] = action
+            end
+        end
+        self.undo_stack = undo
+        self:rebuildPageIndex()
+        self:rebuildAnnotationGroups()
+        self:flushDirtyGroups()
+        self:refreshDogear()
+        self:saveStrokes()
+    end
+    -- Earlier lines and their bookmarks may lie outside the live stroke bbox.
+    UIManager:setDirty(self.ui.dialog or self.view, "ui")
 end
 
 -- Find the page position of the text just above a screen point, looking
@@ -831,17 +908,32 @@ function Pencil:findTextAbove(x, y)
     end
 end
 
--- Save a native KOReader underline over the text above a stroke bbox.
--- @return true if a highlight was saved
-function Pencil:underlineTextAbove(bbox)
+-- Resolve one line independently: each underline can have a different offset.
+function Pencil:getUnderlineTextPositions(bbox)
+    if not (self.ui and self.ui.view and self.ui.document) then return end
+    local start_pos, dy = self:findTextAbove(bbox.x0 + 2, bbox.y0)
+    if not start_pos then return end
+    local end_pos = self.ui.view:screenToPageTransform({
+        x = bbox.x1 - 2, y = bbox.y0 - dy,
+    })
+    if not end_pos then return end
+    local ok, selected = pcall(self.ui.document.getTextFromPositions,
+        self.ui.document, start_pos, end_pos)
+    if not (ok and selected and selected.pos0 and selected.pos1) then return end
+    return start_pos, end_pos
+end
+
+-- Save one native underline from the first line through the last line.
+function Pencil:underlineTextAbove(bbox, last_bbox, start_pos, end_pos)
     if not (self.ui and self.ui.highlight and self.ui.view and self.ui.document) then
         return false
     end
-    local start_pos, dy = self:findTextAbove(bbox.x0 + 2, bbox.y0)
-    if not start_pos then return false end
-    -- Use the same text line for the end point.
-    local end_pos = self.ui.view:screenToPageTransform({ x = bbox.x1 - 2, y = bbox.y0 - dy })
-    if not end_pos then return false end
+    if not start_pos then start_pos = self:getUnderlineTextPositions(bbox) end
+    if not end_pos then
+        local first_pos
+        first_pos, end_pos = self:getUnderlineTextPositions(last_bbox or bbox)
+    end
+    if not (start_pos and end_pos) then return false end
 
     local ok, selected = pcall(self.ui.document.getTextFromPositions,
                                self.ui.document, start_pos, end_pos)
@@ -862,6 +954,7 @@ function Pencil:underlineTextAbove(bbox)
     if highlight then highlight.saved_color = selected.color end
     local saved, err = pcall(rh.saveHighlight, rh, false)
     if highlight then highlight.saved_color = previous_color end
+    saved = saved and err ~= false
     if not saved then
         logger.warn("Pencil: saving underline failed:", tostring(err))
     end
@@ -1464,7 +1557,7 @@ function Pencil:addToMainMenu(menu_items)
                     },
                     {
                         text = _("Underline by holding at line end"),
-                        help_text = _("Draw a line under text and rest the pen at the end for a moment: the ink is replaced by a native KOReader underline on the words above it."),
+                        help_text = _("Draw a line under text and rest the pen at the end for a moment: the stroke group is replaced by one native KOReader underline spanning the first through last line, in the pen color."),
                         checked_func = function()
                             return self.underline_hold
                         end,
