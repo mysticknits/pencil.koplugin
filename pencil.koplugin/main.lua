@@ -847,10 +847,21 @@ function Pencil:underlineTextAbove(bbox)
                                self.ui.document, start_pos, end_pos)
     if not (ok and selected and selected.pos0 and selected.pos1) then return false end
     selected.drawer = "underscore"
+    -- Use the gesture's pen color, not the reader's default highlight color.
+    local stroke = self.current_stroke
+    local color_name = stroke and stroke.color_name
+        or self.tool_settings[TOOL_PEN].color_name or "Black"
+    selected.color = string.lower(color_name)
 
     local rh = self.ui.highlight
     rh.selected_text = selected
+    -- ReaderHighlight versions that use the view default when saving also
+    -- need this temporary override. Restore it even when saving raises.
+    local highlight = self.ui.view.highlight
+    local previous_color = highlight and highlight.saved_color
+    if highlight then highlight.saved_color = selected.color end
     local saved, err = pcall(rh.saveHighlight, rh, false)
+    if highlight then highlight.saved_color = previous_color end
     if not saved then
         logger.warn("Pencil: saving underline failed:", tostring(err))
     end
