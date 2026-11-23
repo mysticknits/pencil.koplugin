@@ -23,6 +23,12 @@ local ok_geom, PencilGeometry = pcall(require, "lib/geometry")
 if not ok_geom then
     PencilGeometry = require("geometry")
 end
+-- Pure tool-set logic (presets, validation, box placement). Small, loaded up
+-- front; the tool box widget itself is loaded the first time it is opened.
+local ok_toolset, Toolset = pcall(require, "lib/toolset")
+if not ok_toolset then
+    Toolset = require("toolset")
+end
 local Screen = Device.screen
 local Size = require("ui/size")
 local InfoMessage = require("ui/widget/infomessage")
@@ -44,6 +50,19 @@ end
 local TOOL_PEN = "pen"
 local TOOL_HIGHLIGHTER = "highlighter"
 local TOOL_ERASER = "eraser"
+
+-- Human-readable tool name for toasts and menus.
+local function toolDisplayName(tool)
+    if tool == TOOL_ERASER then
+        return _("eraser")
+    elseif tool == TOOL_HIGHLIGHTER then
+        return _("highlighter")
+    end
+    return _("pencil")
+end
+
+-- Color of highlighter strokes saved before highlighter colors had names.
+local LEGACY_HIGHLIGHT_GRAY = 0xDD
 
 -- Color picker trigger settings
 local COLOR_PICKER_DELAY_MS = 500  -- How long pen must be held still (milliseconds)
@@ -162,7 +181,8 @@ function Pencil:init()
     self.undo_stack = {}
 
     -- Initialize highlighter color (yellow)
-    self.tool_settings[TOOL_HIGHLIGHTER].color = Blitbuffer.Color8(0xDD)  -- Light gray for e-ink
+    self.tool_settings[TOOL_HIGHLIGHTER].color = Blitbuffer.Color8(LEGACY_HIGHLIGHT_GRAY)  -- Light gray for e-ink
+    self.tool_settings[TOOL_HIGHLIGHTER].color_name = "Highlight"
 
     -- Calculate gray value from highlight_lighten_factor setting
     local lighten_factor = G_reader_settings:readSetting("highlight_lighten_factor") or 0.2
@@ -181,6 +201,18 @@ function Pencil:init()
         { name = "Purple", color = Blitbuffer.ColorRGB32(0xEE, 0x00, 0xFF, 0xFF) },
         { name = "Gray", color = Blitbuffer.Color8(gray_value) },
     }
+
+    -- Colors offered for the highlighter ("Marker") in the tool box: the light
+    -- ones from the pen palette, plus the classic light gray it always used.
+    self.highlight_colors = { { name = "Highlight", color = Blitbuffer.Color8(LEGACY_HIGHLIGHT_GRAY) } }
+    for _, wanted in ipairs({ "Yellow", "Orange", "Olive", "Cyan" }) do
+        for _, info in ipairs(self.available_colors) do
+            if info.name == wanted then
+                table.insert(self.highlight_colors, info)
+                break
+            end
+        end
+    end
 
     -- Available pen widths for the optional experimental width picker.
     -- Gated by self.experimental_pen_width; see loadSettings().
@@ -246,6 +278,24 @@ function Pencil:init()
         title = _("Pencil: select eraser"),
         reader = true,
     })
+    Dispatcher:registerAction("pencil_select_highlighter", {
+        category = "none",
+        event = "PencilSelectHighlighter",
+        title = _("Pencil: select highlighter"),
+        reader = true,
+    })
+    Dispatcher:registerAction("pencil_swap_tool", {
+        category = "none",
+        event = "PencilSwapTool",
+        title = _("Pencil: swap to previous tool"),
+        reader = true,
+    })
+    Dispatcher:registerAction("pencil_open_toolbox", {
+        category = "none",
+        event = "PencilOpenToolBox",
+        title = _("Pencil: open tool box"),
+        reader = true,
+    })
     Dispatcher:registerAction("pencil_undo", {
         category = "none",
         event = "PencilUndo",
@@ -268,19 +318,14 @@ end
 
 -- Dispatcher event handlers (for custom gesture mapping)
 function Pencil:onPencilToggleTool()
-    if self.current_tool == TOOL_ERASER then
-        self.current_tool = TOOL_PEN
-    else
-        self.current_tool = TOOL_ERASER
-    end
-    local display_name = self.current_tool == TOOL_PEN and _("pencil") or _("eraser")
-    self:showToast(T(_("Tool: %1"), display_name), true)
+    self:togglePenEraser(true)
     return true
 end
 
 function Pencil:onPencilToggleEnabled()
     local enabled = self:isEnabled()
     self:setEnabled(not enabled)
+    self:closeToolBox()
     if self:isEnabled() then
         self:setupPenInput()
         UIManager:show(InfoMessage:new{
@@ -298,14 +343,44 @@ function Pencil:onPencilToggleEnabled()
 end
 
 function Pencil:onPencilSelectPen()
-    self.current_tool = TOOL_PEN
+    self:switchTool({ tool = TOOL_PEN })
     self:showToast(_("Pencil tool: pencil"), true)
     return true
 end
 
 function Pencil:onPencilSelectEraser()
-    self.current_tool = TOOL_ERASER
+    self:switchTool({ tool = TOOL_ERASER })
     self:showToast(_("Eraser selected"), true)
+    return true
+end
+
+function Pencil:onPencilSelectHighlighter()
+    self:switchTool({ tool = TOOL_HIGHLIGHTER })
+    self:showToast(_("Tool: highlighter"), true)
+    return true
+end
+
+-- Flip between the tool in hand and the one before it (pen <-> marker, a red
+-- pen <-> a black pen, ...): one gesture, no menu.
+function Pencil:onPencilSwapTool()
+    if not self.prev_tool_state then
+        self:showToast(_("No previous tool yet"), true)
+        return true
+    end
+    local new, prev = Toolset.swap(self:getToolState(), self.prev_tool_state)
+    self:applyToolState(new)
+    self.prev_tool_state = prev
+    self:saveSettings()
+    self:showToast(T(_("Tool: %1"), toolDisplayName(self.current_tool)), true)
+    return true
+end
+
+function Pencil:onPencilOpenToolBox()
+    if not self:isEnabled() then
+        self:showToast(_("Enable Pencil first"), true)
+        return true
+    end
+    self:showToolBox()
     return true
 end
 
@@ -573,7 +648,7 @@ function Pencil:routeStylusSlot(input, slot)
             -- avoids an UIManager:scheduleIn closure allocation on every
             -- pen-down — real GC pressure on the A53 during multi-second
             -- strokes.
-            if self.experimental_color_picker or self.experimental_pen_width then
+            if self.experimental_color_picker or self.experimental_pen_width or self.tool_box_hold then
                 self.color_picker_start_x = x
                 self.color_picker_start_y = y
                 self.color_picker_start_time = time.now()
@@ -1073,14 +1148,31 @@ function Pencil:loadSettings()
     -- Load pen width if previously chosen via the experimental width picker.
     -- Validated against available_widths so a malformed settings file can't
     -- inject arbitrary widths.
+    -- Whole pixels within sane bounds, so a malformed settings file can't
+    -- inject an arbitrary width. (Saved presets can use widths outside the
+    -- picker's four, so this is a range check, not a list lookup.)
     local saved_width = settings.pen_width
-    if saved_width then
-        for _, w in ipairs(self.available_widths) do
-            if w.width == saved_width then
-                self.tool_settings[TOOL_PEN].width = saved_width
-                break
-            end
-        end
+    if Toolset.isValidWidth(saved_width) then
+        self.tool_settings[TOOL_PEN].width = saved_width
+    end
+
+    -- Quick tool box
+    self.valid_color_names = {}
+    for _, info in ipairs(self.available_colors) do self.valid_color_names[info.name] = true end
+    for _, info in ipairs(self.highlight_colors) do self.valid_color_names[info.name] = true end
+    self.tool_box_hold = settings.tool_box_hold or false
+    self.tool_presets = Toolset.normalize(settings.tool_presets, self.valid_color_names)
+    local hl_color = settings.highlighter_color_name
+        and self:findColor(TOOL_HIGHLIGHTER, settings.highlighter_color_name)
+    if hl_color then
+        self.tool_settings[TOOL_HIGHLIGHTER].color = hl_color
+        self.tool_settings[TOOL_HIGHLIGHTER].color_name = settings.highlighter_color_name
+    end
+    if Toolset.isValidWidth(settings.highlighter_width) then
+        self.tool_settings[TOOL_HIGHLIGHTER].width = settings.highlighter_width
+    end
+    if Toolset.isValidWidth(settings.eraser_width) then
+        self.tool_settings[TOOL_ERASER].width = settings.eraser_width
     end
 end
 
@@ -1095,17 +1187,20 @@ function Pencil:saveSettings()
         pen_color_name = self.tool_settings[TOOL_PEN].color_name,
         swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
         pen_width = self.tool_settings[TOOL_PEN].width,
+        tool_box_hold = self.tool_box_hold,
+        tool_presets = self.tool_presets,
+        highlighter_color_name = self.tool_settings[TOOL_HIGHLIGHTER].color_name,
+        highlighter_width = self.tool_settings[TOOL_HIGHLIGHTER].width,
+        eraser_width = self.tool_settings[TOOL_ERASER].width,
     })
 end
 
 -- Set current tool
 function Pencil:setTool(tool)
-    self.current_tool = tool
-    self:saveSettings()
+    self:switchTool({ tool = tool })
     -- Show visual feedback with proper display name
-    local display_name = tool == TOOL_PEN and _("pencil") or _("eraser")
     UIManager:show(InfoMessage:new{
-        text = T(_("Tool: %1"), display_name),
+        text = T(_("Tool: %1"), toolDisplayName(tool)),
         timeout = 1,
     })
 end
@@ -1177,7 +1272,7 @@ function Pencil:addToMainMenu(menu_items)
             },
             {
                 text = _("Tool"),
-                help_text = _("Select pencil or eraser."),
+                help_text = _("Select pencil, highlighter or eraser."),
                 sub_item_table = {
                     {
                         text = _("Pencil"),
@@ -1189,12 +1284,56 @@ function Pencil:addToMainMenu(menu_items)
                         end,
                     },
                     {
+                        text = _("Highlighter"),
+                        checked_func = function()
+                            return self.current_tool == TOOL_HIGHLIGHTER
+                        end,
+                        callback = function()
+                            self:setTool(TOOL_HIGHLIGHTER)
+                        end,
+                    },
+                    {
                         text = _("Eraser"),
                         checked_func = function()
                             return self.current_tool == TOOL_ERASER
                         end,
                         callback = function()
                             self:setTool(TOOL_ERASER)
+                        end,
+                    },
+                },
+            },
+            {
+                text = _("Tool box"),
+                help_text = _("A small panel to switch tool, preset, color, width and eraser size without leaving the page."),
+                sub_item_table = {
+                    {
+                        text = _("Open tool box"),
+                        callback = function()
+                            -- after the menu has closed, so it isn't painted over
+                            UIManager:scheduleIn(0.2, function() self:onPencilOpenToolBox() end)
+                        end,
+                        enabled_func = function()
+                            return self:isEnabled()
+                        end,
+                    },
+                    {
+                        text = _("Open by holding the pen still"),
+                        help_text = _("Hold the pen still on the page for half a second to open the tool box. Takes the place of the experimental color picker. Off by default, so pausing while you write doesn't open it."),
+                        checked_func = function()
+                            return self.tool_box_hold
+                        end,
+                        callback = function()
+                            self.tool_box_hold = not self.tool_box_hold
+                            self:saveSettings()
+                        end,
+                    },
+                    {
+                        text = _("Reset saved tools"),
+                        help_text = _("Put the preset row back to the default pens and markers."),
+                        callback = function()
+                            self.tool_presets = Toolset.normalize(nil, self.valid_color_names)
+                            self:saveSettings()
                         end,
                     },
                 },
@@ -1490,22 +1629,23 @@ function Pencil:onStylusButtonRelease()
 end
 
 -- Toggle between pen and eraser
-function Pencil:togglePenEraser()
+-- Coming back from the eraser returns to the drawing tool it was picked from
+-- (pencil or highlighter), not always the pencil.
+function Pencil:togglePenEraser(from_gesture)
     local old_tool = self.current_tool
     local new_tool
     if self.current_tool == TOOL_ERASER then
-        new_tool = TOOL_PEN
+        new_tool = self.tool_before_eraser or TOOL_PEN
     else
+        self.tool_before_eraser = self.current_tool
         new_tool = TOOL_ERASER
     end
 
-    self.current_tool = new_tool
-    self:saveSettings()
+    self:switchTool({ tool = new_tool })
     logger.dbg("Pencil: toggled from", old_tool, "to", new_tool)
 
     -- Show brief visual feedback
-    local display_name = new_tool == TOOL_PEN and _("pencil") or _("eraser")
-    self:showToast(T(_("Tool: %1"), display_name))
+    self:showToast(T(_("Tool: %1"), toolDisplayName(new_tool)), from_gesture)
 end
 
 -- Handle stylus button and tool events
@@ -1964,14 +2104,19 @@ function Pencil:checkColorPickerTrigger()
     -- Gated behind the two experimental flags. At least one must be on for
     -- the hold-pen-still gesture to produce anything; otherwise the pen
     -- stays on its last-saved color/width.
-    if not (self.experimental_color_picker or self.experimental_pen_width) then return end
+    if not (self.experimental_color_picker or self.experimental_pen_width or self.tool_box_hold) then return end
     if not self.color_picker_start_time then return end
     if self.color_picker_showing then return end
 
     local elapsed_ms = time.to_ms(time.now() - self.color_picker_start_time)
     if elapsed_ms >= COLOR_PICKER_DELAY_MS then
-        -- Time elapsed without moving too far - show color picker
-        self:showColorPicker(self.pen_x, self.pen_y)
+        -- Time elapsed without moving too far - show the tool box (if it is
+        -- the chosen hold-still action) or the color picker
+        if self.tool_box_hold then
+            self:showToolBox(self.pen_x, self.pen_y)
+        else
+            self:showColorPicker(self.pen_x, self.pen_y)
+        end
         self:resetColorPickerTracking()
     end
 end
@@ -2403,13 +2548,7 @@ function Pencil:showColorPicker(x, y)
 
     -- Discard any current stroke that was made while holding still
     -- The user was holding still to trigger color picker, not intentionally drawing
-    if self.current_stroke then
-        self.current_stroke = nil
-        -- Repaint to remove the stroke from screen immediately
-        self.view:paintTo(Screen.bb, 0, 0)
-        self:paintTo(Screen.bb, 0, 0)
-        Screen:refreshUI(0, 0, Screen:getWidth(), Screen:getHeight())
-    end
+    self:discardCurrentStroke()
 
     self.color_picker_showing = true
 
@@ -2528,6 +2667,195 @@ function Pencil:setPenWidth(width)
     self.tool_settings[TOOL_PEN].width = width
     logger.info("Pencil: setPenWidth - width =", width)
     self:saveSettings()
+end
+
+------------------------------------------------------------------------------
+-- Tools and the quick tool box (widget: lib/toolbox.lua)
+--
+-- Nothing in this section runs while the pen is drawing. The stylus callback
+-- only reads tool_settings, exactly as before; the tool box is created when
+-- asked for and freed when closed.
+------------------------------------------------------------------------------
+
+-- Color by name in the palette a tool uses ("Highlight" only exists for the
+-- highlighter). Returns a Blitbuffer color or nil.
+function Pencil:findColor(tool, name)
+    local list = tool == TOOL_HIGHLIGHTER and self.highlight_colors or self.available_colors
+    for _, info in ipairs(list) do
+        if info.name == name then return info.color end
+    end
+    return nil
+end
+
+-- Color by name in either palette, for strokes loaded from disk.
+function Pencil:findColorByName(name)
+    return self:findColor(TOOL_PEN, name) or self:findColor(TOOL_HIGHLIGHTER, name)
+end
+
+-- The tool in hand as a plain table: { tool, color_name, width, eraser_width }.
+-- For the eraser, `width` is its size.
+function Pencil:getToolState()
+    local tool = self.current_tool
+    local eraser_width = self.tool_settings[TOOL_ERASER].width
+    if tool == TOOL_ERASER then
+        return { tool = tool, width = eraser_width, eraser_width = eraser_width }
+    end
+    local ts = self.tool_settings[tool] or self.tool_settings[TOOL_PEN]
+    return { tool = tool, color_name = ts.color_name, width = ts.width, eraser_width = eraser_width }
+end
+
+-- Make `st` the tool in hand. Only the fields it carries change: { tool = "pen" }
+-- picks the pen as it was last set, a preset also sets color and width. Does
+-- not save or announce anything.
+function Pencil:applyToolState(st)
+    if st.tool == TOOL_ERASER then
+        if Toolset.isValidWidth(st.width) then
+            self.tool_settings[TOOL_ERASER].width = st.width
+        end
+        self.current_tool = TOOL_ERASER
+        return
+    end
+    local ts = self.tool_settings[st.tool]
+    if not ts then return end
+    local color = st.color_name and self:findColor(st.tool, st.color_name)
+    if color then
+        ts.color, ts.color_name = color, st.color_name
+    end
+    if Toolset.isValidWidth(st.width) then
+        ts.width = st.width
+    end
+    self.current_tool = st.tool
+end
+
+-- Change tool, remembering the one before for "swap to previous tool".
+function Pencil:switchTool(st)
+    local before = self:getToolState()
+    self:applyToolState(st)
+    local after = self:getToolState()
+    self.prev_tool_state = Toolset.remember(before, after, self.prev_tool_state)
+    if not Toolset.same(before, after) then
+        self:saveSettings()
+    end
+end
+
+-- The plugin side of the tool box: everything the widget needs, nothing more.
+function Pencil:makeToolBoxProvider()
+    local plugin = self
+    return {
+        getState = function() return plugin:getToolState() end,
+        getPresets = function() return plugin.tool_presets end,
+        colorsFor = function(tool)
+            return tool == TOOL_HIGHLIGHTER and plugin.highlight_colors or plugin.available_colors
+        end,
+        colorFor = function(tool, name) return plugin:findColor(tool, name) end,
+        setTool = function(tool) plugin:switchTool({ tool = tool }) end,
+        setColor = function(name)
+            local tool = plugin.current_tool
+            if tool ~= TOOL_ERASER then
+                plugin:applyToolState({ tool = tool, color_name = name })
+                plugin:saveSettings()
+            end
+        end,
+        setWidth = function(width)
+            local tool = plugin.current_tool
+            if tool ~= TOOL_ERASER then
+                plugin:applyToolState({ tool = tool, width = width })
+                plugin:saveSettings()
+            end
+        end,
+        setEraserWidth = function(width)
+            if Toolset.isValidWidth(width) then
+                plugin.tool_settings[TOOL_ERASER].width = width
+                plugin:saveSettings()
+            end
+        end,
+        selectPreset = function(idx)
+            local p = plugin.tool_presets[idx]
+            if p then
+                plugin:switchTool({ tool = p.tool, color_name = p.color_name, width = p.width })
+            end
+        end,
+        -- store the tool in hand in slot idx (one past the end adds a slot)
+        savePreset = function(idx)
+            local st = plugin:getToolState()
+            if st.tool == TOOL_ERASER then return end
+            local stored = Toolset.store(plugin.tool_presets, idx,
+                { tool = st.tool, color_name = st.color_name, width = st.width },
+                plugin.valid_color_names)
+            if stored then plugin:saveSettings() end
+        end,
+        undo = function() plugin:undoLastStroke() end,
+        canUndo = function() return #plugin.undo_stack > 0 end,
+    }
+end
+
+-- The tool box widget class, loaded on first use. A failure to load it (say, a
+-- KOReader too old for a widget it uses) only loses the box, never the pen.
+function Pencil:loadToolBoxClass()
+    if self._ToolBoxClass == nil then
+        local ok, mod = pcall(require, "lib/toolbox")
+        if not ok then
+            local err = mod
+            ok, mod = pcall(require, "toolbox")
+            if not ok then logger.err("Pencil: tool box failed to load:", err) end
+        end
+        self._ToolBoxClass = ok and mod or false
+    end
+    return self._ToolBoxClass or nil
+end
+
+-- Take the dot a held-still pen left out of the in-progress stroke and off the
+-- screen. Repaints the page into the framebuffer, but refreshes only the dot.
+function Pencil:discardCurrentStroke()
+    local stroke = self.current_stroke
+    if not stroke then return end
+    self.current_stroke = nil
+    self.view:paintTo(Screen.bb, 0, 0)
+    self:paintTo(Screen.bb, 0, 0)
+    local bbox = PencilGeometry.computeStrokeBbox(stroke)
+    if bbox then
+        bbox = PencilGeometry.bboxExpand(bbox, math.floor((stroke.width or 3) / 2) + 4)
+        bbox = PencilGeometry.bboxClampToScreen(bbox, Screen:getWidth(), Screen:getHeight())
+        local w, h = bbox.x1 - bbox.x0, bbox.y1 - bbox.y0
+        if w > 0 and h > 0 then
+            Screen:refreshUI(bbox.x0, bbox.y0, w, h)
+            return
+        end
+    end
+    Screen:refreshUI(0, 0, Screen:getWidth(), Screen:getHeight())
+end
+
+-- Open the tool box near (x, y), or at the bottom of the screen without a point.
+function Pencil:showToolBox(x, y)
+    if self.tool_box_widget then return end
+    local ToolBox = self:loadToolBoxClass()
+    if not ToolBox then
+        self:showToast(_("The tool box could not be loaded."))
+        return
+    end
+    -- A hold-still leaves a dot in the stroke being drawn: that was not drawing
+    self:discardCurrentStroke()
+    -- Also keeps the hold-still check from opening a second box
+    self.color_picker_showing = true
+
+    local plugin = self
+    local box = ToolBox:new{
+        provider = self:makeToolBoxProvider(),
+        anchor_x = x,
+        anchor_y = y,
+        on_close = function()
+            plugin.tool_box_widget = nil
+            plugin.color_picker_showing = false
+        end,
+    }
+    self.tool_box_widget = box
+    UIManager:show(box, "ui", box.dimen)
+end
+
+function Pencil:closeToolBox()
+    if self.tool_box_widget then
+        self.tool_box_widget:close()
+    end
 end
 
 -- Handle initial touch - fires IMMEDIATELY on first contact
@@ -4329,12 +4657,11 @@ function Pencil:strokeFromSaved(saved)
     -- Look up color from color_name
     local color = tool_settings.color
     if saved.color_name then
-        for _, color_info in ipairs(self.available_colors) do
-            if color_info.name == saved.color_name then
-                color = color_info.color
-                break
-            end
-        end
+        color = self:findColorByName(saved.color_name) or color
+    elseif tool == TOOL_HIGHLIGHTER then
+        -- Saved before highlighter colors had names: always the light gray, even
+        -- if the highlighter has since been set to another color.
+        color = Blitbuffer.Color8(LEGACY_HIGHLIGHT_GRAY)
     end
 
     -- Points: v4 stores a packed "x y ..." string in `p`; v3 and earlier store
@@ -4432,6 +4759,7 @@ function Pencil:onCloseDocument()
 
     -- Cancel any pending refresh
     self:cancelPendingRefresh()
+    self:closeToolBox()
     -- Drop any scheduled debounced save - we save unconditionally below.
     self:cancelPendingSave()
     self.dirty_groups = nil
