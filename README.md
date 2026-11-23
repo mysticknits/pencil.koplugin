@@ -93,6 +93,12 @@ When enabled, the picker also shows pen width options (3, 5, 7, 9), rendered as 
 
 **To enable:** Pencil menu > Experimental > Pen width picker
 
+### Underline by holding at line end
+
+Draw horizontal lines under the text, lifting between lines, then hold at the end of the final line for about **600 ms**. Eligible strokes in the same annotation group become **one native KOReader underline in the pen color**. Hold only on the final line: already converted native underlines are not merged later.
+
+**To configure:** Pencil menu > Experimental > Underline by holding at line end. Enabled by default; independent of Bookmark sync and side-button text highlighting.
+
 ### Text highlight (side button)
 
 When enabled, holding the stylus side button while dragging across words creates a KOReader text highlight, like long-pressing and choosing Highlight. When disabled, the side button draws a freehand highlighter stroke instead.

@@ -49,6 +49,13 @@ local TOOL_ERASER = "eraser"
 local COLOR_PICKER_DELAY_MS = 500  -- How long pen must be held still (milliseconds)
 local COLOR_PICKER_TOLERANCE_PIXELS = 15  -- How many pixels pen can move while "still"
 
+-- Underline by holding the pen at the end of a horizontal stroke
+local UNDERLINE_HOLD_MS = 600          -- How long the pen must rest at the end
+local UNDERLINE_STILL_PIXELS = 10      -- Movement allowed while resting
+local UNDERLINE_MIN_LENGTH = 40        -- Shorter strokes are never underlines
+local UNDERLINE_MAX_SLOPE = 0.25       -- Max stroke height / width
+local UNDERLINE_SEARCH_PIXELS = 48     -- How far above the stroke to look for text
+
 -- Annotation grouping constants
 local GROUP_TIME_THRESHOLD_S = 10   -- seconds between strokes to be grouped
 local GROUP_SPATIAL_THRESHOLD = 200 -- pixels between bboxes to be grouped
@@ -561,6 +568,7 @@ function Pencil:routeStylusSlot(input, slot)
             self:cancelPendingRefresh()
             self:cancelColorPickerTimer()
             self:startRawStroke()
+            self:cancelUnderlineHold()
             -- Record initial position and timestamp for color picker trigger
             local raw_x = slot.x or 0
             local raw_y = slot.y or 0
@@ -589,17 +597,21 @@ function Pencil:routeStylusSlot(input, slot)
             local raw_y = slot.y or self.pen_y
             local x, y = self:transformCoordinates(raw_x, raw_y)
             if x ~= self.pen_x or y ~= self.pen_y then
-                -- Check if pen moved more than tolerance from start position
-                if self.color_picker_start_x and self.color_picker_start_y then
-                    local dx = math.abs(x - self.color_picker_start_x)
-                    local dy = math.abs(y - self.color_picker_start_y)
-                    if dx > COLOR_PICKER_TOLERANCE_PIXELS or dy > COLOR_PICKER_TOLERANCE_PIXELS then
-                        -- Pen moved too far - reset tracking (no color picker)
-                        self:resetColorPickerTracking()
-                    end
-                end
+                -- Keep consuming an owned contact after an overlay opens so its lift
+                -- cannot become an outside tap, but never draw underneath the overlay.
                 if not overlay then
+                    -- Check if pen moved more than tolerance from start position
+                    if self.color_picker_start_x and self.color_picker_start_y then
+                        local dx = math.abs(x - self.color_picker_start_x)
+                        local dy = math.abs(y - self.color_picker_start_y)
+                        if dx > COLOR_PICKER_TOLERANCE_PIXELS
+                            or dy > COLOR_PICKER_TOLERANCE_PIXELS then
+                            -- Pen moved too far - reset tracking (no color picker)
+                            self:resetColorPickerTracking()
+                        end
+                    end
                     self:addRawPoint(x, y)
+                    self:trackUnderlineHold(x, y)
                 end
                 self.pen_x = x
                 self.pen_y = y
@@ -610,6 +622,7 @@ function Pencil:routeStylusSlot(input, slot)
         if self.pen_down and not self.erasing then
             self.pen_down = false
             self:cancelColorPickerTimer()
+            self:cancelUnderlineHold()
             self:endRawStroke()
             if self.input_debug_mode then
                 self:writeDebugLog("=== PEN UP ===")
@@ -734,6 +747,219 @@ function Pencil:addRawPoint(x, y)
             self.dirty_region = nil
         end
     end
+end
+
+-- Refresh the screen area drawn since the last refresh, if any.
+function Pencil:refreshDirtyRegion()
+    local r = self.dirty_region
+    if not r then return end
+    -- Clamp to screen bounds
+    local rx = math.max(0, math.floor(r.x))
+    local ry = math.max(0, math.floor(r.y))
+    local rw = math.min(Screen:getWidth() - rx, math.ceil(r.w))
+    local rh = math.min(Screen:getHeight() - ry, math.ceil(r.h))
+    if self.stroke_fast_refresh then
+        -- Fast monochrome waveform: lowest e-ink latency for dark ink
+        Screen:refreshFast(rx, ry, rw, rh)
+    else
+        -- UI waveform: needed for proper shading of light/colored ink
+        Screen:refreshUI(rx, ry, rw, rh)
+    end
+    self.dirty_region = nil
+end
+
+-- Restart the underline hold timer whenever the pen moves beyond the
+-- "still" tolerance; leave it running while the pen rests.
+function Pencil:trackUnderlineHold(x, y)
+    if not self.underline_hold or self.side_button_down then return end
+    if self.underline_still_x
+            and math.abs(x - self.underline_still_x) <= UNDERLINE_STILL_PIXELS
+            and math.abs(y - self.underline_still_y) <= UNDERLINE_STILL_PIXELS then
+        return
+    end
+    self.underline_still_x = x
+    self.underline_still_y = y
+    if not self._underline_check then
+        -- One closure per plugin instance, reused for every reschedule.
+        self._underline_check = function() self:checkUnderlineHold() end
+    end
+    UIManager:unschedule(self._underline_check)
+    UIManager:scheduleIn(UNDERLINE_HOLD_MS / 1000, self._underline_check)
+end
+
+function Pencil:cancelUnderlineHold()
+    self.underline_still_x = nil
+    self.underline_still_y = nil
+    if self._underline_check then
+        UIManager:unschedule(self._underline_check)
+    end
+end
+
+-- Only horizontal pen strokes can participate in a hold-to-underline group.
+function Pencil:getUnderlineBbox(stroke)
+    if not stroke or stroke.tool ~= TOOL_PEN
+            or not stroke.points or #stroke.points < 2 then return end
+    local bbox = PencilGeometry.computeStrokeBbox(stroke)
+    if not bbox then return end
+    local w, h = bbox.x1 - bbox.x0, bbox.y1 - bbox.y0
+    if w >= UNDERLINE_MIN_LENGTH and h <= w * UNDERLINE_MAX_SLOPE then
+        return bbox
+    end
+end
+
+-- Match the same first eligible group as assignStrokeToGroup, without adding
+-- the live stroke to persistent ink before the native annotation is saved.
+function Pencil:getUnderlineStrokeGroup(stroke, bbox)
+    local lines = { { bbox = bbox } }
+    for _, group in ipairs(self.annotation_groups or {}) do
+        if group.page == stroke.page and group.bbox
+                and math.abs((stroke.datetime or 0)
+                    - (group.datetime_last or group.datetime or 0)) <= GROUP_TIME_THRESHOLD_S
+                and PencilGeometry.bboxDistance(bbox, group.bbox) <= GROUP_SPATIAL_THRESHOLD then
+            -- Never consume stale-rotation ink or a mixed handwriting group.
+            if group.image_rotation ~= nil
+                    and group.image_rotation ~= Screen:getRotationMode() then break end
+            for _, index in ipairs(group.stroke_indices or {}) do
+                local previous = self.strokes[index]
+                local previous_bbox = self:getUnderlineBbox(previous)
+                if not previous_bbox or previous.page ~= stroke.page
+                        or previous.color_name ~= stroke.color_name then
+                    return { { bbox = bbox } }
+                end
+                lines[#lines + 1] = { bbox = previous_bbox, index = index }
+            end
+            break
+        end
+    end
+    -- Screen reading order for the existing left-to-right underline gesture.
+    table.sort(lines, function(a, b)
+        if a.bbox.y0 == b.bbox.y0 then return a.bbox.x0 < b.bbox.x0 end
+        return a.bbox.y0 < b.bbox.y0
+    end)
+    return lines
+end
+
+-- Fired after resting at the final line: save one native text range covering
+-- the group's first through last line, then remove only its gesture ink.
+function Pencil:checkUnderlineHold()
+    local stroke = self.current_stroke
+    if not (self.pen_down and stroke and not self.highlighting) then return end
+    local bbox = self:getUnderlineBbox(stroke)
+    if not bbox then return end
+    local lines = self:getUnderlineStrokeGroup(stroke, bbox)
+    -- Resolve every line before saving; failed text lookup must leave ink intact.
+    for _, line in ipairs(lines) do
+        local start_pos, end_pos = self:getUnderlineTextPositions(line.bbox)
+        if not (start_pos and end_pos) then return end
+        line.start_pos, line.end_pos = start_pos, end_pos
+    end
+    if not self:underlineTextAbove(lines[1].bbox, lines[#lines].bbox,
+            lines[1].start_pos, lines[#lines].end_pos) then return end
+
+    self.current_stroke = nil
+    self.dirty_region = nil
+    self:cancelUnderlineHold()
+    local removed = {}
+    for _, line in ipairs(lines) do
+        if line.index then removed[line.index] = true end
+    end
+    if next(removed) then
+        self:cancelPendingSave()
+        local retained, remap = {}, {}
+        for index, saved_stroke in ipairs(self.strokes) do
+            if not removed[index] then
+                retained[#retained + 1] = saved_stroke
+                remap[index] = #retained
+            end
+        end
+        self.strokes = retained
+        -- Keep undo entries for unrelated ink pointing at their new indices.
+        local undo = {}
+        for _, action in ipairs(self.undo_stack) do
+            if action.type ~= "add" then
+                undo[#undo + 1] = action
+            elseif remap[action.stroke_idx] then
+                action.stroke_idx = remap[action.stroke_idx]
+                undo[#undo + 1] = action
+            end
+        end
+        self.undo_stack = undo
+        self:rebuildPageIndex()
+        self:rebuildAnnotationGroups()
+        self:flushDirtyGroups()
+        self:refreshDogear()
+        self:saveStrokes()
+    end
+    -- Earlier lines and their bookmarks may lie outside the live stroke bbox.
+    UIManager:setDirty(self.ui.dialog or self.view, "ui")
+end
+
+-- Find the page position of the text just above a screen point, looking
+-- up to UNDERLINE_SEARCH_PIXELS. Returns the page position and the offset.
+function Pencil:findTextAbove(x, y)
+    for dy = 2, UNDERLINE_SEARCH_PIXELS, 4 do
+        local page_pos = self.ui.view:screenToPageTransform({ x = x, y = y - dy })
+        if page_pos then
+            local ok, word = pcall(self.ui.document.getWordFromPosition, self.ui.document, page_pos)
+            if ok and word and word.pos0 then
+                return page_pos, dy
+            end
+        end
+    end
+end
+
+-- Resolve one line independently: each underline can have a different offset.
+function Pencil:getUnderlineTextPositions(bbox)
+    if not (self.ui and self.ui.view and self.ui.document) then return end
+    local start_pos, dy = self:findTextAbove(bbox.x0 + 2, bbox.y0)
+    if not start_pos then return end
+    local end_pos = self.ui.view:screenToPageTransform({
+        x = bbox.x1 - 2, y = bbox.y0 - dy,
+    })
+    if not end_pos then return end
+    local ok, selected = pcall(self.ui.document.getTextFromPositions,
+        self.ui.document, start_pos, end_pos)
+    if not (ok and selected and selected.pos0 and selected.pos1) then return end
+    return start_pos, end_pos
+end
+
+-- Save one native underline from the first line through the last line.
+function Pencil:underlineTextAbove(bbox, last_bbox, start_pos, end_pos)
+    if not (self.ui and self.ui.highlight and self.ui.view and self.ui.document) then
+        return false
+    end
+    if not start_pos then start_pos = self:getUnderlineTextPositions(bbox) end
+    if not end_pos then
+        local first_pos
+        first_pos, end_pos = self:getUnderlineTextPositions(last_bbox or bbox)
+    end
+    if not (start_pos and end_pos) then return false end
+
+    local ok, selected = pcall(self.ui.document.getTextFromPositions,
+                               self.ui.document, start_pos, end_pos)
+    if not (ok and selected and selected.pos0 and selected.pos1) then return false end
+    selected.drawer = "underscore"
+    -- Use the gesture's pen color, not the reader's default highlight color.
+    local stroke = self.current_stroke
+    local color_name = stroke and stroke.color_name
+        or self.tool_settings[TOOL_PEN].color_name or "Black"
+    selected.color = string.lower(color_name)
+
+    local rh = self.ui.highlight
+    rh.selected_text = selected
+    -- ReaderHighlight versions that use the view default when saving also
+    -- need this temporary override. Restore it even when saving raises.
+    local highlight = self.ui.view.highlight
+    local previous_color = highlight and highlight.saved_color
+    if highlight then highlight.saved_color = selected.color end
+    local saved, err = pcall(rh.saveHighlight, rh, false)
+    if highlight then highlight.saved_color = previous_color end
+    saved = saved and err ~= false
+    if not saved then
+        logger.warn("Pencil: saving underline failed:", tostring(err))
+    end
+    if rh.clear then pcall(rh.clear, rh) end
+    return saved
 end
 
 -- End stroke from raw input
@@ -1059,6 +1285,7 @@ function Pencil:loadSettings()
     self.experimental_pen_width = settings.experimental_pen_width or false
     self.experimental_color_picker = settings.experimental_color_picker or false
     self.experimental_text_highlight = settings.experimental_text_highlight or false
+    self.underline_hold = settings.underline_hold ~= false
     -- Load pen color by name and look up the actual color value
     local color_name = settings.pen_color_name
     if color_name then
@@ -1092,6 +1319,7 @@ function Pencil:saveSettings()
         experimental_pen_width = self.experimental_pen_width,
         experimental_color_picker = self.experimental_color_picker,
         experimental_text_highlight = self.experimental_text_highlight,
+        underline_hold = self.underline_hold,
         pen_color_name = self.tool_settings[TOOL_PEN].color_name,
         swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
         pen_width = self.tool_settings[TOOL_PEN].width,
@@ -1325,6 +1553,17 @@ function Pencil:addToMainMenu(menu_items)
                                     timeout = 2,
                                 })
                             end
+                        end,
+                    },
+                    {
+                        text = _("Underline by holding at line end"),
+                        help_text = _("Draw a line under text and rest the pen at the end for a moment: the stroke group is replaced by one native KOReader underline spanning the first through last line, in the pen color."),
+                        checked_func = function()
+                            return self.underline_hold
+                        end,
+                        callback = function()
+                            self.underline_hold = not self.underline_hold
+                            self:saveSettings()
                         end,
                     },
                     {
