@@ -114,6 +114,129 @@ function Geometry.segmentStepCount(dist, width)
     return math.max(1, math.ceil(dist / step))
 end
 
+
+--- Top-left corners of the width x width squares stamped along a segment.
+-- @return flat array { x1, y1, x2, y2, ... }
+function Geometry.segmentStamps(x1, y1, x2, y2, width)
+    local half_w = math.floor(width / 2)
+    local dx, dy = x2 - x1, y2 - y1
+    local dist = math.sqrt(dx * dx + dy * dy)
+    if dist < 1 then
+        return { math.floor(x1) - half_w, math.floor(y1) - half_w }
+    end
+    local steps = Geometry.segmentStepCount(dist, width)
+    local out = {}
+    for i = 0, steps do
+        local t = i / steps
+        out[#out + 1] = math.floor(x1 + dx * t) - half_w
+        out[#out + 1] = math.floor(y1 + dy * t) - half_w
+    end
+    return out
+end
+
+-- Coverage is stored as sorted, disjoint horizontal spans per pixel row.
+function Geometry.newCoverage()
+    return {}
+end
+
+local function addSpan(spans, a, b, new_parts)
+    local n, i, out = #spans, 1, {}
+    while i <= n and spans[i][2] < a do
+        out[#out + 1] = spans[i]
+        i = i + 1
+    end
+    local merged_a, merged_b, pos = a, b, a
+    while i <= n and spans[i][1] <= b do
+        local sp = spans[i]
+        if sp[1] > pos and new_parts then
+            new_parts[#new_parts + 1] = { pos, math.min(sp[1], b) }
+        end
+        if sp[2] > pos then pos = sp[2] end
+        if sp[1] < merged_a then merged_a = sp[1] end
+        if sp[2] > merged_b then merged_b = sp[2] end
+        i = i + 1
+    end
+    if pos < b and new_parts then new_parts[#new_parts + 1] = { pos, b } end
+    out[#out + 1] = { merged_a, merged_b }
+    while i <= n do out[#out + 1] = spans[i]; i = i + 1 end
+    return out
+end
+
+local function sameParts(p, q)
+    if #p ~= #q then return false end
+    for i = 1, #p do
+        if p[i][1] ~= q[i][1] or p[i][2] ~= q[i][2] then return false end
+    end
+    return true
+end
+
+--- Add rectangle (x, y, w, h) to a coverage.
+-- If collect is true, returns only newly covered pixels as rectangles.
+function Geometry.coverageAddRect(cov, x, y, w, h, collect)
+    if w <= 0 or h <= 0 then return collect and {} or nil end
+    local rects, open, open_parts
+    for row = y, y + h - 1 do
+        local parts = collect and {} or nil
+        cov[row] = addSpan(cov[row] or {}, x, x + w, parts)
+        if collect then
+            if #parts == 0 then
+                open, open_parts = nil, nil
+            elseif open and sameParts(parts, open_parts) then
+                for _, r in ipairs(open) do r.h = r.h + 1 end
+            else
+                open, open_parts = {}, parts
+                rects = rects or {}
+                for _, pt in ipairs(parts) do
+                    local r = { x = pt[1], y = row, w = pt[2] - pt[1], h = 1 }
+                    open[#open + 1], rects[#rects + 1] = r, r
+                end
+            end
+        end
+    end
+    return rects or (collect and {} or nil)
+end
+
+--- All covered pixels as vertically merged rectangles.
+function Geometry.coverageRects(cov)
+    local ys = {}
+    for row in pairs(cov) do ys[#ys + 1] = row end
+    table.sort(ys)
+    local rects, open, open_spans, open_row = {}, nil, nil, nil
+    for _, row in ipairs(ys) do
+        local spans = cov[row]
+        if open and open_row == row - 1 and sameParts(spans, open_spans) then
+            for _, r in ipairs(open) do r.h = r.h + 1 end
+        else
+            open, open_spans = {}, spans
+            for _, sp in ipairs(spans) do
+                local r = { x = sp[1], y = row, w = sp[2] - sp[1], h = 1 }
+                open[#open + 1], rects[#rects + 1] = r, r
+            end
+        end
+        open_row = row
+    end
+    return rects
+end
+
+--- Rectangles covered by a stroke, with every pixel represented once.
+function Geometry.strokeCoverageRects(points, width)
+    local cov = Geometry.newCoverage()
+    if not points or #points == 0 then return {} end
+    if #points == 1 then
+        local st = Geometry.segmentStamps(points[1].x, points[1].y, points[1].x, points[1].y, width)
+        Geometry.coverageAddRect(cov, st[1], st[2], width, width)
+    else
+        for i = 2, #points do
+            local p1, p2 = points[i - 1], points[i]
+            local st = Geometry.segmentStamps(p1.x, p1.y, p2.x, p2.y, width)
+            for j = 1, #st, 2 do
+                Geometry.coverageAddRect(cov, st[j], st[j + 1], width, width)
+            end
+        end
+    end
+    return Geometry.coverageRects(cov)
+end
+
 --- Compute the bounding box of a stroke from its points array.
 -- @param stroke Table with points array (each point has x, y)
 -- @return table {x0, y0, x1, y1} or nil if no points
